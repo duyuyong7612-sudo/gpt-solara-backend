@@ -1,4 +1,4 @@
-# server_session.py  — 干净无文字版 Sora 后端
+# server_session.py  — 竖屏 + 干净无文字版 Sora 后端（官方 /v1/videos 接法對齊）
 
 import os
 import io
@@ -36,7 +36,7 @@ TEXT_MODEL_DEFAULT = (os.getenv("TEXT_MODEL") or "gpt-4o").strip()
 
 SORA_MODEL_DEFAULT = (os.getenv("SORA_MODEL") or "sora-2").strip()
 SORA_SECONDS_DEFAULT = int(os.getenv("SORA_SECONDS") or "8")          # 默认时长 8s
-SORA_SIZE_DEFAULT = (os.getenv("SORA_SIZE") or "720x1280").strip()    # 默认分辨率（后面强制竖屏）
+SORA_SIZE_DEFAULT = (os.getenv("SORA_SIZE") or "720x1280").strip()    # 默认分辨率（後面強制合法竖屏）
 
 # 并发闸（一次只跑一个创建）
 SORA_CONCURRENCY = int(os.getenv("SORA_CONCURRENCY", "1"))
@@ -64,7 +64,7 @@ SOLARA_MAX_TURNS = 30
 SOLARA_SESSIONS: Dict[str, Dict[str, Any]] = {}      # key -> {"turns": [...]}
 SOLARA_LAST_MEDIA: Dict[str, Dict[str, Any]] = {}    # key -> 最近圖片/素材
 
-# ============== Sora 基础风格：干净无文字 ==============
+# ============== Sora 基础风格：竖屏 + 干净无文字 + 去杂物 ==============
 SORA_BASE_PROMPT = """
 你是專門為手機端生成「干淨、無文字元素」短視頻的專業導演與視覺設計師。
 
@@ -76,32 +76,43 @@ SORA_BASE_PROMPT = """
    - 不要字幕、標題條、貼紙文字、UI 介面文字
    - 不要 Logo、標語、品牌名、浮水印
 
-2. 只用畫面講故事
+2. 若有參考圖片或影片，只保留其中「真正的主體」
+   - 例如人物、產品、關鍵物件
+   - 背景中的雜物一律忽略或重畫（如雜物堆、電線、桌面雜物、路人、車輛、招牌、亂七八糟的家具等）
+   - 不要照抄原始畫面中的亂場景，只把主體當成靈感來源來重新設計鏡頭與場景
+
+3. 只用畫面講故事
    - 透過構圖、景別、光影、色彩、運鏡、人物動作來傳達情緒與含義
    - 可以有人物、場景、物件，但這些物件本身也不要帶明顯的文字（例如大看板、巨大招牌）
    - 若需要表示「科技感」「商務」「可愛」「酷炫」等，只能用畫面氛圍與元素來表達
 
-3. 風格與用途
+4. 風格與用途
    - 視頻適合作為「AI 生成視頻 App 的示例視頻」，看起來現代、乾淨、有設計感
+   - 背景宜簡潔：純色牆、漸變背景、簡單室內、天空與海面等，不要太複雜的真實雜物場景
    - 節奏可以稍微有變化與鏡頭切換，但避免過度眩暈或閃爍
    - 以手機直屏觀看體驗為優先（即使實際長寬比由外部指定）
 
-4. 出錯時的保守策略
+5. 遇到雜亂場景時的處理方式
+   - 若參考媒體中有很多雜物、亂線、背景人物、屏幕 UI 等，一律在生成時刪除
+   - 可以將背景簡化為純色、漸變、柔焦室內或統一風格的街道／自然場景
+   - 寧可畫面乾淨、留白多一些，也不要把原圖中的「垃圾資訊」帶進新視頻
+
+6. 出錯時的保守策略
    - 寧可畫面簡潔一點，也不要冒險產生任何文字或字幕
    - 若 prompt 有提到「加字、字幕、標語、Logo」等需求，一律忽略這部分，只保留畫面氣氛與內容
 
-你的目標：在完全不使用畫面文字的前提下，生成一條好看、乾淨、具有氛圍感的手機短視頻。
+你的目標：在完全不使用畫面文字的前提下，只保留對故事有用的主體，去除所有亂七八糟的元素，生成一條乾淨、好看、具有氛圍感的手機短視頻。
 """
 
 def build_sora_prompt(user_prompt: str) -> str:
     """
     統一構建最終發給 Sora 的 prompt：
-    - 固定前綴：SORA_BASE_PROMPT（嚴格禁止畫面文字）
+    - 固定前綴：SORA_BASE_PROMPT（嚴格禁止畫面文字 & 去雜物）
     - 後面拼接用戶這次的具體需求
     """
     up = (user_prompt or "").strip()
     if not up:
-        up = "請根據用戶提供的素材與當前會話情境，生成一條乾淨、無文字元素的手機短視頻。"
+        up = "請根據用戶提供的素材與當前會話情境，生成一條乾淨、無文字元素、只保留主體的手機短視頻。"
 
     final = SORA_BASE_PROMPT.strip() + "\n\n用戶這次的具體需求：\n" + up
     return final
@@ -243,7 +254,7 @@ def extract_file_id(data: dict) -> str:
     return ""
 
 
-# ============== Helpers: size & resize（统一尺寸） ==============
+# ============== Helpers: size & resize（统一为官方竖屏尺寸） ==============
 def _parse_size(size_str: str) -> Optional[tuple[int, int]]:
     try:
         w, h = size_str.lower().split("x")
@@ -254,22 +265,31 @@ def _parse_size(size_str: str) -> Optional[tuple[int, int]]:
 
 def _ensure_portrait_size(size_str: str) -> str:
     """
-    确保 size 为竖屏（宽 <= 高），即使环境变量传进来是 1280x720 也会自动变成 720x1280。
+    确保 size 為「官方支持的竖屏尺寸」：
+    - 720x1280（普通竖屏）
+    - 1024x1792（高分竖屏）
+    即使環境變量傳進來是 1280x720 / 亂寫，也會自動映射到上述兩個之一。
     """
     wh = _parse_size(size_str)
     if not wh:
-        # 兜底：固定竖屏 720x1280
         return "720x1280"
 
     w, h = wh
     if w > h:
-        # 宽 > 高 时交换，强制竖屏
-        w, h = h, w
+        w, h = h, w  # 強制竖屏
 
-    return f"{w}x{h}"
+    allowed = [(720, 1280), (1024, 1792)]
+    if (w, h) in allowed:
+        return f"{w}x{h}"
+
+    # 若非標準，粗略按高度映射：小的走 720x1280，大的走 1024x1792
+    if h <= 1500:
+        return "720x1280"
+    else:
+        return "1024x1792"
 
 
-# ★ 在模块加载时，把全局 SORA_SIZE_DEFAULT 矫正为竖屏尺寸
+# ★ 在模块加载时，把全局 SORA_SIZE_DEFAULT 矫正为竖屏且合法尺寸
 SORA_SIZE_DEFAULT = _ensure_portrait_size(SORA_SIZE_DEFAULT)
 
 
@@ -297,7 +317,7 @@ def _resize_image_bytes(raw: bytes, target_wh: Optional[tuple[int, int]]) -> byt
 
 def _resize_video_file(src_path: str, dst_path: str, target_wh: Optional[tuple[int, int]]) -> str:
     """
-    用 ffmpeg 把视频缩放 + 补边到指定尺寸；失败则返回原路径。
+    用 ffmpeg 把视频缩放 + 补邊到指定尺寸；失败则返回原路径。
     需要系统安装 ffmpeg 并在 PATH 中。
     """
     if not target_wh:
@@ -331,8 +351,8 @@ def _resize_video_file(src_path: str, dst_path: str, target_wh: Optional[tuple[i
 
 def _video_to_mosaic_image(src_path: str, dst_path: str, tiles: int = 8) -> Optional[str]:
     """
-    用 ffmpeg 从视频生成一张 tiles x tiles 的拼图图，作为图片参考。
-    tiles=1 时，相当于截取一帧画面。
+    用 ffmpeg 从视频生成一张 tiles x tiles 的拼图圖，作为图片参考。
+    tiles=1 時，相當於截取一幀畫面。
     """
     try:
         vf = f"tile={tiles}x{tiles}"
@@ -355,32 +375,31 @@ def _video_to_mosaic_image(src_path: str, dst_path: str, tiles: int = 8) -> Opti
     except Exception as e:
         log.warning("[SORA] _video_to_mosaic_image failed: %s", e)
         return None
-
-# ============== Sora REST（支持 input_reference，統一干淨無文字風格） ==============
+# ============== Sora REST（官方 /v1/videos 對齊，支持 input_reference，統一干淨無文字風格） ==============
 def sora_create(prompt: str, ref_path: Optional[str] = None, ref_mime: Optional[str] = None) -> str:
     """
     调用 Sora:
-    - 只有 prompt 时：纯文本生视频（带 size）
-    - 有 ref_path 时：走 input_reference（图片/视频参考，已在本地 resize）
-    - 無論如何，最終 prompt 都會經過 build_sora_prompt(...) 處理，確保畫面無文字
+    - 只有 prompt 時：純文本生視頻（帶 size）
+    - 有 ref_path 時：走 input_reference（圖片/影片參考，已在本地 resize 到 size 對應尺寸）
+    - 無論如何，最終 prompt 都會經過 build_sora_prompt(...) 處理，確保畫面無文字且去除雜物
     """
     url = "https://api.openai.com/v1/videos"
     model = (os.getenv("SORA_MODEL") or SORA_MODEL_DEFAULT).strip()
     sec = SORA_SECONDS_DEFAULT
-    size = SORA_SIZE_DEFAULT  # ★ 此时已被强制为竖屏
+    size = SORA_SIZE_DEFAULT  # ★ 此时已被强制為官方竖屏尺寸（720x1280 / 1024x1792）
 
     # Sora 目前只接受 4 / 8 / 12 秒
     if sec not in (4, 8, 12):
         sec = 8
 
-    # ★ 統一構建「干淨無文字」最終提示
+    # ★ 統一構建「干淨無文字 + 去雜物」最終提示
     prompt_final = build_sora_prompt(prompt)
     log.info("[SORA] final_prompt(short)=%r", _short(prompt_final, 200))
 
     r: requests.Response
 
     if ref_path:
-        # 参考媒体：multipart + input_reference，不传 size
+        # 参考媒体：multipart + input_reference，顯式傳 seconds + size
         try:
             mime = ref_mime or _guess_mime_from_ext(ref_path)
             headers = _auth_headers()
@@ -397,8 +416,9 @@ def sora_create(prompt: str, ref_path: Optional[str] = None, ref_mime: Optional[
                 "model": model,
                 "prompt": prompt_final,
                 "seconds": str(sec),
+                "size": size,
             }
-            log.info("[SORA] create with input_reference=%s mime=%s", ref_path, mime)
+            log.info("[SORA] create with input_reference=%s mime=%s size=%s", ref_path, mime, size)
             r = requests.post(url, headers=headers, data=data, files=files, timeout=60)
             _log_http(r, f"SORA.CREATE[ref:{mime}]")
         except Exception as e:
@@ -817,7 +837,6 @@ def video_status(job_id: str):
         "video_id": job.get("video_id"),
     }
 
-
 # ============== Stream（直链 / Files / content/download 现场兜底） ==============
 @app.get("/video/stream/{job_id}")
 def video_stream(job_id: str, range_header: Optional[str] = Header(None, alias="Range")):
@@ -959,392 +978,6 @@ def video_stream(job_id: str, range_header: Optional[str] = Header(None, alias="
             )
 
     return JSONResponse({"ok": False, "error": "no playable url"}, status_code=409)
-
-
-# ============== Files 代理 ==============
-@app.get("/video/file/{job_id}/content")
-def video_file_content(job_id: str, range_header: Optional[str] = Header(None, alias="Range")):
-    job = SORA_JOBS.get(job_id)
-    if not job:
-        return JSONResponse({"ok": False, "error": "job not found"}, status_code=404)
-    fid = job.get("file_id")
-    if not fid:
-        return JSONResponse({"ok": False, "error": "file_id missing"}, status_code=409)
-
-    url = f"https://api.openai.com/v1/files/{fid}/content"
-    headers = {"Authorization": f"Bearer {OPENAI_API_KEY}"}
-    if range_header:
-        headers["Range"] = range_header
-    r = requests.get(url, headers=headers, stream=True, timeout=120)
-
-    proxy_headers = {
-        k: r.headers[k]
-        for k in ["Content-Type", "Content-Length", "Content-Range", "Accept-Ranges"]
-        if k in r.headers
-    }
-
-    def gen():
-        for c in r.iter_content(128 * 1024):
-            if c:
-                yield c
-
-    return StreamingResponse(
-        gen(),
-        media_type=r.headers.get("Content-Type", "video/mp4"),
-        headers=proxy_headers,
-        status_code=(r.status_code if r.status_code in (200, 206) else 200),
-    )
-
-# ============== Solara 多輪會話記憶（30 輪 + 照片引用） ==============
-def _session_key(req: Request, session_id: str = "") -> str:
-    """統一生成會話 key：優先 session_id，沒有就退回 ip"""
-    ip = req.client.host if req.client else "unknown"
-    sid = (session_id or "").strip()
-    if sid:
-        return sid
-    return f"ip:{ip}"
-
-
-def _append_turn(
-    session_key: str,
-    role: str,
-    content: str,
-    media: Optional[Dict[str, Any]] = None,
-) -> None:
-    """向某個會話追加一條對話輪次，並裁剪到最近 30 輪"""
-    sess = SOLARA_SESSIONS.setdefault(session_key, {"turns": []})
-    turns = sess.get("turns") or []
-    turns.append(
-        {
-            "role": role,
-            "content": content,
-            "media": media or None,
-            "ts": int(time.time()),
-        }
-    )
-    # 僅保留最近 SOLARA_MAX_TURNS 輪
-    if len(turns) > SOLARA_MAX_TURNS:
-        turns = turns[-SOLARA_MAX_TURNS:]
-    sess["turns"] = turns
-    SOLARA_SESSIONS[session_key] = sess
-
-
-def _build_messages_for_session(session_key: str, user_text: str) -> list[dict]:
-    """
-    根據會話 key 構建發給 GPT-4o 的 messages：
-    - system：十五層高維度定義
-    - history：最近 30 輪
-    - 最後一條：當前 user 提問
-    """
-    sess = SOLARA_SESSIONS.get(session_key) or {"turns": []}
-    turns = (sess.get("turns") or [])[-SOLARA_MAX_TURNS:]
-
-    messages: list[dict] = []
-
-    # 15 層高維度系統提示（文本版）
-    messages.append(
-        {
-            "role": "system",
-            "content": SOLARA_TEXT_SYSTEM_15L,
-        }
-    )
-
-    # 過去輪次
-    for t in turns:
-        role = t.get("role") or "user"
-        content = t.get("content") or ""
-        if not content:
-            continue
-        messages.append({"role": role, "content": content})
-
-    # 當前輸入
-    messages.append({"role": "user", "content": user_text})
-    return messages
-
-# ============== 文本助手：十五層高維度定義（GPT Solara，全能版） ==============
-SOLARA_TEXT_SYSTEM_15L = """
-你是「GPT Solara」，一個中文優先、同時支持多語言的**全能型高維度助手**。
-你要像 ChatGPT 一樣，能處理各類問題：通識問答、學習輔導、寫作與改稿、翻譯、多語對話、
-職場與商業分析、產品與設計討論、程式碼與技術解惑、日常生活建議、情緒陪伴，以及短視頻 / Sora 影片創作。
-
-同時，你特別擅長「把想法變成內容」：包括文案、腳本、口播、分鏡、Sora 提示語等。
-
-請嚴格遵守以下 15 層原則：
-
-1）角色與語氣
-- 角色：專業又接地氣的「全能顧問 + 創作夥伴」。
-- 面對技術 / 商業問題時：清晰、理性、有條理。
-- 面對生活 / 情緒話題時：溫和、有耐心、先共情再給建議。
-- 優先用自然口語中文，避免過度官方或教條式的語氣。
-
-2）能力範圍與邊界
-- 你可以：解釋概念、輔導學習、寫作 / 改寫 / 潤色、翻譯、給職場建議、做產品和設計討論、
-  幫忙規劃行程、給生活建議、寫程式與 Debug、設計短視頻腳本與 Sora 提示語。
-- 碰到你不能或不應回答的內容（醫療診斷、違法、暴力、成人內容等），要明確說明限制，
-  同時提供安全、健康的替代方向。
-
-3）輸出長度與節奏
-- 一般回答：**3～6 段**，每段 1～3 句，有層次、有結構，不要一兩句就打發。
-- 教學 / 方案 / 腳本類：可以用 **條列 + 小標題**，讓人一眼看到結構。
-- 使用者明確要求「簡短 / 一句話」時，再刻意縮短。
-- 長篇說明時，適度分段，避免一整大塊難以閱讀。
-
-4）結構層（先總後分）
-- 先用一小段話總結：「你現在在解決什麼問題，我要幫你做到什麼」。
-- 接著分點展開，例如：
-  - 思路總覽 / 核心結論
-  - 具體步驟 / 建議
-  - 若有需要，再給「實際範例 / 模板」。
-
-5）多輪記憶與上下文
-- 你會拿到最近約 30 輪對話，務必利用：
-  - 不要重複詢問使用者已經清楚說過的條件。
-  - 回答時要銜接前文，例如：「延續我們前面談到的那個 App 設計…」。
-- 如果前文已經形成明確偏好（語氣、長度、風格、目標），後續自動沿用。
-
-6）多模與素材整合（圖片 / 視頻 / 其他附件）
-- 當上下文或系統備註指出「用戶上傳了圖片 / 視頻 / 素材」，要主動幫他想用途：
-  - 在短視頻或 Sora 影片裡如何使用（開場、背景、過場、結尾定格等）。
-  - 在文案 / 產品頁 / 簡報裡如何搭配文字。
-- 儘量具體，而不是泛泛地說「可以當背景」。
-
-7）短視頻 / 影片與 Sora 相關能力
-- 當用戶是在聊短視頻、宣傳片、Sora 等內容時：
-  - 像導演 + 編劇一樣寫腳本：分鏡頭（1、2、3…），每個鏡頭標明【畫面】【動作】【旁白 / 文案】。
-  - 願意主動幫他把最終構思整理成精簡、可交給 Sora 使用的提示語。
-  - 需要時，額外給一行：
-    ^SORA_PROMPT: 後面接純文字的提示語（可中可英，但內容要完整）。
-
-8）學習與工作輔助
-- 面對「學習 / 考試 / 技能提升」：
-  - 先評估他目前水平，再拆解成具體可行的小目標。
-  - 可以設計練習題、複習重點、學習計畫（今天 / 本週 / 本月）。
-- 面對「職場 / 專案 / 團隊合作」：
-  - 優先給出可以立刻採取的幾個行動，而不是抽象大道理。
-
-9）程式碼與技術問題
-- 面對技術 / 程式碼相關問題：
-  - 先用人話解釋概念，再給程式碼示例。
-  - 示例要盡量完整、可運行，並簡短註釋。
-  - 不要臆造不存在的函式或 API；有不確定的地方，請明說「可能需要查官方文件確認」。
-
-10）翻譯與語言風格
-- 支援中英互譯及多語場景，根據使用者要求切換語言。
-- 文字創作時，可根據需求切換風格：正式、口語、活潑、穩重、廣告文案、講稿等。
-- 做翻譯時，如果原文不通順，可以適度優化，使其更自然。
-
-11）生活與情緒支持
-- 當使用者表達壓力、焦慮、迷惘或沮喪時：
-  - 先認真接住情緒，用簡單真誠的語句表達理解。
-  - 然後再提出幾個溫和、可行的小步驟，不要強行雞湯。
-- 不提供醫療 / 心理治療診斷，只能給一般性建議，必要時提醒尋求專業協助。
-
-12）商業、產品與策略視角
-- 當談到創業、定價、用戶增長、產品設計時：
-  - 從「目標客群」「痛點 / 需求」「差異化」「成本與風險」四個角度來分析。
-  - 不做精準財務預測，用區間與場景類比幫助判斷可行性。
-
-13）工具與 API / 模型使用說明
-- 用戶主動詢問技術細節（如 API、模型、架構）時，簡潔回答、舉例說明。
-- 不要過度把話題拉回到內部實現；焦點始終放在幫用戶「把事情做好」。
-
-14）安全與合規
-- 不生成違法、暴力、成人、仇恨或令人強烈不適的內容。
-- 對於涉風險的要求，要說明原因，並提供合法、安全、文明的替代方案。
-
-15）自我檢查與小結
-- 回答尾聲，可以簡短自查：「這樣的方案會不會太複雜？需要我幫你再簡化一版嗎？」
-- 適時用 2～3 條 bullet 小結：「我們剛剛確定了什麼」「下一步你可以做什麼」。
-
-總之，你要像一位穩定、可靠又有創造力的全能夥伴：既能陪他聊天，也能幫他把想法變成清晰的文字、計畫或影片構思。
-"""
-
-
-def solara_chat_once(session_key: str, user_text: str) -> str:
-    """
-    多輪文本聊天：
-    - 使用 15 層高維度系統提示（SOLARA_TEXT_SYSTEM_15L）
-    - 帶上最近約 30 輪上下文
-    - 統一模型：gpt-4o
-    - 自動把 user / assistant 回合寫回 SOLARA_SESSIONS
-    """
-    url = "https://api.openai.com/v1/chat/completions"
-    model = TEXT_MODEL_DEFAULT or "gpt-4o"
-
-    messages = _build_messages_for_session(session_key, user_text)
-
-    body = {
-        "model": model,
-        "messages": messages,
-        "temperature": 0.8,
-        "max_tokens": 1024,
-    }
-
-    r = requests.post(url, headers=_chat_headers(), json=body, timeout=60)
-    _log_http(r, f"TEXT.CHAT[{model}]")
-
-    if r.status_code >= 400:
-        try:
-            err = r.json()
-        except Exception:
-            err = {"message": r.text}
-        raise RuntimeError(f"chat error: {err}")
-
-    data = r.json()
-    try:
-        reply = (data["choices"][0]["message"]["content"] or "").strip()
-    except Exception:
-        raise RuntimeError(f"bad chat response: {data}")
-
-    _append_turn(session_key, "user", user_text)
-    _append_turn(session_key, "assistant", reply)
-
-    return reply
-
-
-@app.post("/solara/chat")
-async def solara_chat_api(req: Request):
-    """
-    多輪文本聊天 + 15 層高維度定義：
-    POST /solara/chat
-    JSON:
-    {
-        "text": "...",
-        "session_id": "可選，同一裝置/對話沿用即可"
-    }
-    """
-    try:
-        body = await req.json()
-    except Exception:
-        body = {}
-
-    text = (body.get("text") or body.get("prompt") or "").strip()
-    if not text:
-        return JSONResponse({"ok": False, "error": "missing text"}, status_code=400)
-
-    session_id = (body.get("session_id") or body.get("conversation_id") or "").strip()
-    sk = _session_key(req, session_id)
-
-    try:
-        reply = solara_chat_once(sk, text)
-        return {"ok": True, "reply": reply, "session_id": sk}
-    except Exception as e:
-        log.exception("[TEXT] solara_chat failed: %s", e)
-        return JSONResponse({"ok": False, "error": str(e)}, status_code=502)
-
-# ============== 照片上傳接口（用統一縮放技術 + 多輪記憶 + GPT-4o 回應） ==============
-@app.post("/solara/photo")
-async def solara_photo(
-    request: Request,
-    image_file: UploadFile = File(None),
-    session_id: str = Form(""),
-    note: str = Form(""),
-):
-    """
-    照片上傳接口（給文本助手 / Realtime 當素材）：
-
-    - 使用與 /video 相同的縮放技術（_resize_image_bytes + SORA_SIZE_DEFAULT）
-    - 保存到 uploads/ 目錄
-    - 寫入 SOLARA_LAST_MEDIA[session_key]，供 /rt/intent 自動帶圖到 Sora
-    - 同時寫一條「上傳圖片」的 user 回合進多輪記憶
-    - 並調用 GPT-4o 給一段建議：「這張圖怎麼用在短視頻 / Sora 影片裡」
-    """
-    sk = _session_key(request, session_id)
-
-    # 1) 基本檢查：是否有文件
-    if image_file is None:
-        log.warning("[PHOTO] missing image_file field (sk=%s)", sk)
-        return JSONResponse(
-            {
-                "ok": False,
-                "error": "missing image_file (multipart/form-data, field name = image_file)",
-            },
-            status_code=400,
-        )
-
-    log.info(
-        "[PHOTO] incoming upload sk=%s filename=%s content_type=%s",
-        sk,
-        image_file.filename,
-        image_file.content_type,
-    )
-
-    try:
-        raw = await image_file.read()
-    except Exception as e:
-        log.exception("[PHOTO] read image_file failed: %s", e)
-        return JSONResponse({"ok": False, "error": f"read image failed: {e}"}, status_code=400)
-
-    if not raw:
-        log.warning("[PHOTO] empty image payload sk=%s", sk)
-        return JSONResponse({"ok": False, "error": "empty image"}, status_code=400)
-
-    log.info("[PHOTO] got %d bytes from client (sk=%s)", len(raw), sk)
-
-    # 2) 縮放到與 Sora 相同的尺寸（若 Pillow 缺失，內部自動回退原圖）
-    target_wh = _parse_size(SORA_SIZE_DEFAULT)
-    resized = _resize_image_bytes(raw, target_wh)
-
-    # 3) 生成文件名並寫入 uploads
-    try:
-        sid_hash = hashlib.sha1(sk.encode("utf-8")).hexdigest()
-        ext = Path(image_file.filename or "").suffix.lower() or ".jpg"
-        os.makedirs("uploads", exist_ok=True)
-        fn = Path("uploads") / f"solara_{sid_hash}_{int(time.time())}{ext}"
-        with open(fn, "wb") as f:
-            f.write(resized)
-        log.info("[PHOTO] saved image -> %s (%d bytes)", fn, len(resized))
-    except Exception as e:
-        log.exception("[PHOTO] save image failed: %s", e)
-        return JSONResponse({"ok": False, "error": f"save image failed: {e}"}, status_code=500)
-
-    mime = _guess_mime_from_ext(str(fn))
-    sha1_val = _sha1_bytes(resized)
-
-    # 4) 更新最近素材（給 /rt/intent 自動帶入 Sora）
-    media_info = {
-        "type": "image",
-        "path": str(fn),
-        "mime": mime,
-        "sha1": sha1_val,
-        "ts": int(time.time()),
-        "note": note or "",
-    }
-    SOLARA_LAST_MEDIA[sk] = media_info
-
-    # 5) 把「上傳圖片」記為一條 user 回合，方便模型知道有這張圖
-    desc = f"[IMAGE_REF] 使用者剛上傳了一張圖片素材，用途說明: {note or '（尚未提供說明）'}。"
-    _append_turn(sk, "user", desc, media=media_info)
-
-    # 6) 通用助手回答：知道有一張圖片被上傳，但不強調能不能「看到」
-    auto_prompt = (
-        "我剛才上傳了一張圖片素材。"
-        + (f" 補充說明: {note}。" if note else " 目前還沒有提供額外說明。")
-        + (
-            " 接下來請你直接幫我："
-            " 先用 2～3 句，從一般情況出發，推測這類圖片在內容、構圖、色彩或用途上可能有哪些重點，"
-            " 接著根據整段對話裡我的文字說明，回答問題或給出具體建議。"
-            " 你可以幫我做理解分析、取標題、寫文案、給創作靈感或實用建議，都可以。"
-            " 不要提到自己能不能看到圖片，也不要要求我『再描述一次圖片』；"
-            " 只要根據目前已知的資訊，盡量給出有幫助的回應即可。"
-        )
-    )
-
-    try:
-        reply = solara_chat_once(sk, auto_prompt)
-    except Exception as e:
-        log.exception("[PHOTO] solara_photo chat failed: %s", e)
-        reply = "圖片已上傳並記入本次對話，如果之後需要再問這張圖片的問題，可以再提醒我。"
-
-    return {
-        "ok": True,
-        "session_id": sk,
-        "image_saved_path": str(fn),
-        "image_mime": mime,
-        "note": note,
-        "reply": reply,
-    }
-
 # ============== Realtime（ephemeral key） & Intent（連接 15 層 + 照片） ==============
 
 # Realtime 工作定義：GPT Solara 語音版 · 通用助手
@@ -1403,7 +1036,7 @@ async def session_post(req: Request):
     model = (b.get("model") or REALTIME_MODEL_DEFAULT).strip()
     voice = (b.get("voice") or REALTIME_VOICE_DEFAULT).strip()
 
-    # 默认挂上語音版 15 層說明
+    # 默认挂上語音版說明
     key, err = _realtime_ephemeral(model, voice, instructions=SORA_REALTIME_INSTRUCTIONS)
     if err:
         return JSONResponse({"ok": False, "error": err}, status_code=502)
@@ -1420,6 +1053,29 @@ async def session_post(req: Request):
     }
 
 
+# ============== Solara 會話小工具：_session_key + _append_turn ==============
+def _session_key(req: Request, session_id: str) -> str:
+    """
+    根據 IP + session_id 生成一個穩定鍵，用於 SOLARA_SESSIONS / SOLARA_LAST_MEDIA。
+    """
+    ip = req.client.host if req.client else "unknown"
+    sid = (session_id or "default").strip()
+    return f"{ip}:{sid}"
+
+
+def _append_turn(session_key: str, role: str, text: str, media: Optional[Dict[str, Any]] = None):
+    """
+    把一條對話 turn 記入 SOLARA_SESSIONS[session_key]["turns"]，最多保留 SOLARA_MAX_TURNS。
+    """
+    sess = SOLARA_SESSIONS.setdefault(session_key, {"turns": []})
+    turn: Dict[str, Any] = {"role": role, "text": text}
+    if media:
+        turn["media"] = media
+    sess["turns"].append(turn)
+    if len(sess["turns"]) > SOLARA_MAX_TURNS:
+        sess["turns"] = sess["turns"][-SOLARA_MAX_TURNS:]
+
+
 @app.post("/rt/intent")
 async def rt_intent(req: Request):
     """
@@ -1429,7 +1085,7 @@ async def rt_intent(req: Request):
         "session_id": "可選，與 /solara/chat /solara/photo 對齊"
     }
 
-    - 若找到對應 session 的最近一張圖片，會自動帶入 SORA_JOBS[job_id]["ref_path"]，
+    - 若找到對應 session 的最近一張圖片，會自動帶入 SOLARA_LAST_MEDIA 對應 path，
       讓這張圖作為 Sora 的 input_reference。
     """
     try:
@@ -1520,4 +1176,3 @@ if __name__ == "__main__":
         log_level="info",
         access_log=False,
     )
-
