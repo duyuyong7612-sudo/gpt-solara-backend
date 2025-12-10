@@ -1,0 +1,15 @@
+{
+  "id": "video_692b32d957cc8191ae7e572ead227d7402e4e5a6553adab3",
+  "object": "video",
+  "created_at": 1764438745,
+  "status": "in_progress",
+  "completed_at": null,
+  "error": null,
+  "expires_at": null,
+  "model": "sora-2",
+  "progress": 90,
+  "prompt": "能在飞机内看到飞机失事的画面",
+  "remixed_from_video_id": null,
+  "seconds": "8",
+  "size": "720x1280"
+}

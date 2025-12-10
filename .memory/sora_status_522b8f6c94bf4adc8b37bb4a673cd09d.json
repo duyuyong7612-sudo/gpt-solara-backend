@@ -1,0 +1,18 @@
+{
+  "id": "video_6934583c9c888190a9d0f31d314e57720e3230548a218c6d",
+  "object": "video",
+  "created_at": 1765038140,
+  "status": "failed",
+  "completed_at": null,
+  "error": {
+    "code": "moderation_blocked",
+    "message": "Your request was blocked by our moderation system."
+  },
+  "expires_at": null,
+  "model": "sora-2",
+  "progress": 99,
+  "prompt": "潘多拉星球上的盛大戰鬥，飛行生物穿梭戰場，色彩絢爛，氣氛緊張刺激",
+  "remixed_from_video_id": null,
+  "seconds": "8",
+  "size": "720x1280"
+}

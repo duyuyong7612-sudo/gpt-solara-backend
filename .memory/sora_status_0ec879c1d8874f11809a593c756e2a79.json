@@ -1,0 +1,15 @@
+{
+  "id": "video_6934a47d5d308191a0e5c8f9f5cb397b0c056c4a44e9853d",
+  "object": "video",
+  "created_at": 1765057661,
+  "status": "completed",
+  "completed_at": 1765057779,
+  "error": null,
+  "expires_at": 1765061379,
+  "model": "sora-2",
+  "progress": 100,
+  "prompt": "中國快餐店內，廚師在忙碌地製作各種美食，畫面展現熱氣騰騰的中國菜，氛圍活力又溫馨。",
+  "remixed_from_video_id": null,
+  "seconds": "8",
+  "size": "720x1280"
+}

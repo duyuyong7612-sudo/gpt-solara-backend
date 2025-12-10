@@ -1,0 +1,15 @@
+{
+  "id": "video_692a725ec4a08190ac2277aaac84f15a043eae1a9ff3c51a",
+  "object": "video",
+  "created_at": 1764389470,
+  "status": "in_progress",
+  "completed_at": null,
+  "error": null,
+  "expires_at": null,
+  "model": "sora-2",
+  "progress": 40,
+  "prompt": "生成太空飞船外星人的太空飞船",
+  "remixed_from_video_id": null,
+  "seconds": "8",
+  "size": "720x1280"
+}

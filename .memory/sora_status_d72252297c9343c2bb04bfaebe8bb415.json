@@ -1,0 +1,15 @@
+{
+  "id": "video_69377aac66f081909bf143708246626f02bd1653936c5b28",
+  "object": "video",
+  "created_at": 1765243564,
+  "status": "completed",
+  "completed_at": 1765243674,
+  "error": null,
+  "expires_at": 1765247274,
+  "model": "sora-2",
+  "progress": 100,
+  "prompt": "房间来了潘多拉星球上阿凡达的同类",
+  "remixed_from_video_id": null,
+  "seconds": "8",
+  "size": "720x1280"
+}

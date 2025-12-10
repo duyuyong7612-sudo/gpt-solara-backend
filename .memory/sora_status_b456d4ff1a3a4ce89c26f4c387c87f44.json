@@ -1,0 +1,15 @@
+{
+  "id": "video_6931060bc0248191883f582c22bd7dfc061a534ea13cc3fd",
+  "object": "video",
+  "created_at": 1764820491,
+  "status": "completed",
+  "completed_at": 1764820611,
+  "error": null,
+  "expires_at": 1764824211,
+  "model": "sora-2",
+  "progress": 100,
+  "prompt": "生成一段10秒鐘的外太空科幻風格視頻，內容是：在神秘外星球的地表，充滿未知色彩的地形，並有未來科技感的建築和裝置。遠處星雲緩緩流動，天空中有飛行器穿梭，整體畫面具有強烈的3D和5D效果，營造出高科技和未來感。",
+  "remixed_from_video_id": null,
+  "seconds": "8",
+  "size": "720x1280"
+}

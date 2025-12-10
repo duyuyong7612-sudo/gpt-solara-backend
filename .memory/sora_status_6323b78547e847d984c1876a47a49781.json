@@ -1,0 +1,15 @@
+{
+  "id": "video_69363d12b53c8193a7a5fd7e7021ed360a01ca20f4187479",
+  "object": "video",
+  "created_at": 1765162258,
+  "status": "completed",
+  "completed_at": 1765162379,
+  "error": null,
+  "expires_at": 1765165979,
+  "model": "sora-2",
+  "progress": 100,
+  "prompt": "自然与未来结合，战舰穿梭在潘多拉星球，未来风格。",
+  "remixed_from_video_id": null,
+  "seconds": "8",
+  "size": "720x1280"
+}

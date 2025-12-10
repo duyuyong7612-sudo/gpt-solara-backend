@@ -1,0 +1,15 @@
+{
+  "id": "video_69392b714f1c819098c5222f25e676b40cef1531bed9025a",
+  "object": "video",
+  "created_at": 1765354353,
+  "status": "completed",
+  "completed_at": 1765354467,
+  "error": null,
+  "expires_at": 1765358067,
+  "model": "sora-2",
+  "progress": 100,
+  "prompt": "室内环境中的电脑，写实风格",
+  "remixed_from_video_id": null,
+  "seconds": "8",
+  "size": "720x1280"
+}

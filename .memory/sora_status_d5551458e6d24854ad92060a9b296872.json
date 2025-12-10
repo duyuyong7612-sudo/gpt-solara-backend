@@ -1,0 +1,15 @@
+{
+  "id": "video_6930a38d22e08190ae22334c4411a965010ee2a63a3e3c1c",
+  "object": "video",
+  "created_at": 1764795277,
+  "status": "completed",
+  "completed_at": 1764795416,
+  "error": null,
+  "expires_at": 1764799016,
+  "model": "sora-2",
+  "progress": 100,
+  "prompt": "生成一段 10 秒鐘的視頻，內容是一個未來科幻風格的場景中，一個人駕駛著飛船，在充滿未來城市元素的背景中穿行。外面是激烈的戰鬥場景，畫面充滿科技感和緊張感，色調以冷色調為主，營造出強烈的科幻氛圍。",
+  "remixed_from_video_id": null,
+  "seconds": "8",
+  "size": "720x1280"
+}

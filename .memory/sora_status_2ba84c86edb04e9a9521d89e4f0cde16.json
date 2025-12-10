@@ -1,0 +1,15 @@
+{
+  "id": "video_69345a1d95748191aa1ab9eb70340c42070f7bfaf83d1a1a",
+  "object": "video",
+  "created_at": 1765038621,
+  "status": "completed",
+  "completed_at": 1765038742,
+  "error": null,
+  "expires_at": 1765042342,
+  "model": "sora-2",
+  "progress": 100,
+  "prompt": "潘多拉星球上的星漢，神秘壯麗的星空景色，充滿夢幻色彩。",
+  "remixed_from_video_id": null,
+  "seconds": "8",
+  "size": "720x1280"
+}

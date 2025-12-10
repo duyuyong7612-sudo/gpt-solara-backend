@@ -1,0 +1,15 @@
+{
+  "id": "video_6938e6b5deac8191b1e47fdc4a3fd7e8014c175921ed36c1",
+  "object": "video",
+  "created_at": 1765336757,
+  "status": "queued",
+  "completed_at": null,
+  "error": null,
+  "expires_at": null,
+  "model": "sora-2",
+  "progress": 10,
+  "prompt": "科幻風格背景中，一架飛機穿梭飛行，營造未來感與動感鏡頭。",
+  "remixed_from_video_id": null,
+  "seconds": "8",
+  "size": "720x1280"
+}

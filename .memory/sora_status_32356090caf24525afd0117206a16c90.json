@@ -1,0 +1,15 @@
+{
+  "id": "video_6932fe50e94c81918047dc395fc189820dbc35fe24fbbc34",
+  "object": "video",
+  "created_at": 1764949585,
+  "status": "completed",
+  "completed_at": 1764949710,
+  "error": null,
+  "expires_at": 1764953310,
+  "model": "sora-2",
+  "progress": 100,
+  "prompt": "約10秒，戰鬥機在潘多拉星球上空巡航，緊張刺激感，外有異星生物和山巒。",
+  "remixed_from_video_id": null,
+  "seconds": "8",
+  "size": "720x1280"
+}

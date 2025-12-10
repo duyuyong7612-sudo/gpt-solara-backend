@@ -1,0 +1,15 @@
+{
+  "id": "video_692f620170fc8190890fd14a21cfcaf701f403b79f7ce242",
+  "object": "video",
+  "created_at": 1764712961,
+  "status": "completed",
+  "completed_at": 1764713078,
+  "error": null,
+  "expires_at": 1764716678,
+  "model": "sora-2",
+  "progress": 100,
+  "prompt": "生成一條視頻，主題是外太空戰艦，呈現一艘巨大戰艦在宇宙中飛行的畫面，鏡頭從遠處拉近，展示戰艦的細節和巨大的體積，背景是星空和遙遠的星雲，時長10秒，整體風格科幻震撼，有環繞的太空音效。",
+  "remixed_from_video_id": null,
+  "seconds": "8",
+  "size": "720x1280"
+}

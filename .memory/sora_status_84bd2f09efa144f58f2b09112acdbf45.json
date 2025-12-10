@@ -1,0 +1,15 @@
+{
+  "id": "video_6932675cd1808190a06b7fe11bbf91c90222b4a5080a7bee",
+  "object": "video",
+  "created_at": 1764910940,
+  "status": "completed",
+  "completed_at": 1764911060,
+  "error": null,
+  "expires_at": 1764914660,
+  "model": "sora-2",
+  "progress": 100,
+  "prompt": "生成一段城市中繁忙街道的視頻，畫面中有許多行人，然後我們的車出現在畫面中，車子突然平空消失，營造出神秘與科技感。",
+  "remixed_from_video_id": null,
+  "seconds": "8",
+  "size": "720x1280"
+}

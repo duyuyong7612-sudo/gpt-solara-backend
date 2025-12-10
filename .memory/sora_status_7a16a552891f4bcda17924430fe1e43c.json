@@ -1,0 +1,15 @@
+{
+  "id": "video_6938c21ae66c81919ba45ed483de09ee0a539b703087e5dd",
+  "object": "video",
+  "created_at": 1765327386,
+  "status": "completed",
+  "completed_at": 1765327507,
+  "error": null,
+  "expires_at": 1765331107,
+  "model": "sora-2",
+  "progress": 100,
+  "prompt": "星球上飞行的飞行生物与战舰交错，科幻风格呈现动态画面。",
+  "remixed_from_video_id": null,
+  "seconds": "8",
+  "size": "720x1280"
+}

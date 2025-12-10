@@ -1,0 +1,15 @@
+{
+  "id": "video_6932909b8b3c8191b9329d8707a8c9dd03f490729c893213",
+  "object": "video",
+  "created_at": 1764921499,
+  "status": "queued",
+  "completed_at": null,
+  "error": null,
+  "expires_at": null,
+  "model": "sora-2",
+  "progress": 0,
+  "prompt": "生成一段 10 秒鐘的科幻風格視頻，內容是：太空降艦在潘多拉星球上行駛，背景是奇幻的外星景觀，降艦在色彩斑斕的森林間穿梭，鏡頭從遠景移至近景，展現降艦的細節與星球的神秘氛圍。",
+  "remixed_from_video_id": null,
+  "seconds": "8",
+  "size": "720x1280"
+}

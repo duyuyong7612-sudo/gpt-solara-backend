@@ -1,0 +1,15 @@
+{
+  "id": "video_69335fec89ac8191826c288bbe5c53fb05fd01c40b0489eb",
+  "object": "video",
+  "created_at": 1764974572,
+  "status": "completed",
+  "completed_at": 1764974691,
+  "error": null,
+  "expires_at": 1764978291,
+  "model": "sora-2",
+  "progress": 100,
+  "prompt": "約15秒環繞潘多拉星球巡航，呈現《阿凡達》的科幻感。",
+  "remixed_from_video_id": null,
+  "seconds": "8",
+  "size": "720x1280"
+}

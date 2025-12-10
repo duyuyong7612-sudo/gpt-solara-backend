@@ -1,0 +1,15 @@
+{
+  "id": "video_6934c555f5c081989abef9278f21478b054d5b70c7c1788c",
+  "object": "video",
+  "created_at": 1765066070,
+  "status": "completed",
+  "completed_at": 1765066237,
+  "error": null,
+  "expires_at": 1765069837,
+  "model": "sora-2",
+  "progress": 100,
+  "prompt": "帕冬那星球上，飛行員駕駛戰鬥機在奇幻叢林中穿梭，科幻風格，畫面震撼。",
+  "remixed_from_video_id": null,
+  "seconds": "8",
+  "size": "720x1280"
+}

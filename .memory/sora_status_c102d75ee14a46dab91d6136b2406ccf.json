@@ -1,0 +1,15 @@
+{
+  "id": "video_692fc2e3197c8190b157a5562959af6501293a413b597e0a",
+  "object": "video",
+  "created_at": 1764737763,
+  "status": "completed",
+  "completed_at": 1764738310,
+  "error": null,
+  "expires_at": 1764741910,
+  "model": "sora-2",
+  "progress": 100,
+  "prompt": "生成一段 15 秒鐘的科幻風格視頻，內容是一艘宇宙飛船的駕駛艙內景，駕駛員正專心駕駛。窗外呈現壯觀的外星戰艦戰鬥場景，光影交錯，沒有對話。整體節奏緊張，畫面充滿未來感。",
+  "remixed_from_video_id": null,
+  "seconds": "8",
+  "size": "720x1280"
+}

@@ -1,0 +1,15 @@
+{
+  "id": "video_692f80a87d788191b124015663f19ef50fe05d82b82e2ba4",
+  "object": "video",
+  "created_at": 1764720808,
+  "status": "completed",
+  "completed_at": 1764720972,
+  "error": null,
+  "expires_at": 1764724572,
+  "model": "sora-2",
+  "progress": 100,
+  "prompt": "根據上傳的照片，製作一段關於泰國航空母艦的科幻視頻。影片風格激情澎湃，加入太空元素，呈現航母起航、穿越太空通道、上升到太空、打開空間洞等高科技場景，配上動感音樂，整體效果科幻又震撼。",
+  "remixed_from_video_id": null,
+  "seconds": "8",
+  "size": "720x1280"
+}

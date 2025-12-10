@@ -1,0 +1,15 @@
+{
+  "id": "video_692a942d0fcc81919c7a0c9032f8858c0a4d5e58c9dc2d19",
+  "object": "video",
+  "created_at": 1764398125,
+  "status": "in_progress",
+  "completed_at": null,
+  "error": null,
+  "expires_at": null,
+  "model": "sora-2",
+  "progress": 90,
+  "prompt": "身材，挪威，森林在大海",
+  "remixed_from_video_id": null,
+  "seconds": "8",
+  "size": "720x1280"
+}

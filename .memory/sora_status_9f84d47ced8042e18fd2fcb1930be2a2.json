@@ -1,0 +1,18 @@
+{
+  "id": "video_692ba4ba782481919df88a147070710f061fa4f6e866b557",
+  "object": "video",
+  "created_at": 1764467898,
+  "status": "failed",
+  "completed_at": null,
+  "error": {
+    "code": "video_generation_failed",
+    "message": "Video generation failed due to an internal error."
+  },
+  "expires_at": null,
+  "model": "sora-2",
+  "progress": 99,
+  "prompt": "进行科幻一下，把代码写漂亮一点，把屏幕搞漂亮一点",
+  "remixed_from_video_id": null,
+  "seconds": "8",
+  "size": "720x1280"
+}

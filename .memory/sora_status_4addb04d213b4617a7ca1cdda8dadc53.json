@@ -1,0 +1,15 @@
+{
+  "id": "video_693072e6004c81908c792e3138caa7f10fe8c0933fd114cf",
+  "object": "video",
+  "created_at": 1764782822,
+  "status": "completed",
+  "completed_at": 1764782978,
+  "error": null,
+  "expires_at": 1764786578,
+  "model": "sora-2",
+  "progress": 100,
+  "prompt": "生成一段20秒的科幻3D風格視頻，內容是：一艘太空戰艦在宇宙中航行，戰艦外部呈現未來科幻風格，有霓虹燈光和金屬質感。鏡頭在戰艦外部環繞，展現細節。隨後切換到艦內，駕駛員坐在座艙內，透過全息顯示屏觀察外部情況。座艙內部充滿高科技感，駕駛員穿著太空服。最后，艦內座艙的全息投影展示宇宙星空，充滿神秘感。",
+  "remixed_from_video_id": null,
+  "seconds": "8",
+  "size": "720x1280"
+}

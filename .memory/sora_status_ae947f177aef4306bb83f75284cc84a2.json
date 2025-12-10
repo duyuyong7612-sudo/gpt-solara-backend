@@ -1,0 +1,18 @@
+{
+  "id": "video_6935445f4f788190894b99a680942cd000261d0ef5511654",
+  "object": "video",
+  "created_at": 1765098591,
+  "status": "failed",
+  "completed_at": null,
+  "error": {
+    "code": "video_generation_failed",
+    "message": "Video generation failed due to an internal error."
+  },
+  "expires_at": null,
+  "model": "sora-2",
+  "progress": 99,
+  "prompt": "上海外滩太空船穿梭，未来感风格，科技氛围",
+  "remixed_from_video_id": null,
+  "seconds": "8",
+  "size": "720x1280"
+}

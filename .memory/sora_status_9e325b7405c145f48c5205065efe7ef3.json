@@ -1,0 +1,15 @@
+{
+  "id": "video_6933049a6da48190a86289db2d52e3770a26924dff1dfa8b",
+  "object": "video",
+  "created_at": 1764951194,
+  "status": "completed",
+  "completed_at": 1764951310,
+  "error": null,
+  "expires_at": 1764954910,
+  "model": "sora-2",
+  "progress": 100,
+  "prompt": "約20秒在潘朵拉星球星河中，飛船穿梭於壯麗自然景色，璀璨星河背景，充滿奇幻色彩。",
+  "remixed_from_video_id": null,
+  "seconds": "8",
+  "size": "720x1280"
+}

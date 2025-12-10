@@ -1,0 +1,15 @@
+{
+  "id": "video_6937c481a2a08198ae939ec01d1f79a203c4cb3df61f6b1c",
+  "object": "video",
+  "created_at": 1765262465,
+  "status": "completed",
+  "completed_at": 1765262637,
+  "error": null,
+  "expires_at": 1765266237,
+  "model": "sora-2",
+  "progress": 100,
+  "prompt": "福建连江海边，F-35战斗机低飞掠过，气氛紧张而逼真",
+  "remixed_from_video_id": null,
+  "seconds": "8",
+  "size": "720x1280"
+}

@@ -1,0 +1,15 @@
+{
+  "id": "video_6931efafdc988190905b229c39e17e7e0a5dbd2905024dd5",
+  "object": "video",
+  "created_at": 1764880303,
+  "status": "completed",
+  "completed_at": 1764880421,
+  "error": null,
+  "expires_at": 1764884021,
+  "model": "sora-2",
+  "progress": 100,
+  "prompt": "生成一段展示三峽愛好者在山頂上俯瞰山谷的10秒鐘影片，場景是三峽山峰巍峨壯麗，鏡頭從他身後拉遠，呈現出廣闊的山谷和壯麗的自然景色，畫面具有科幻未來感，光線柔和自然。",
+  "remixed_from_video_id": null,
+  "seconds": "8",
+  "size": "720x1280"
+}

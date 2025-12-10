@@ -1,0 +1,15 @@
+{
+  "id": "video_693321fd39808191b24d99e06f1067d902fad19f956f03cd",
+  "object": "video",
+  "created_at": 1764958717,
+  "status": "completed",
+  "completed_at": 1764958845,
+  "error": null,
+  "expires_at": 1764962445,
+  "model": "sora-2",
+  "progress": 100,
+  "prompt": "約10秒潘多拉星球上，人類與納美人激烈戰鬥，奇特生態環境，飛龍穿梭，奇幻森林背景。",
+  "remixed_from_video_id": null,
+  "seconds": "8",
+  "size": "720x1280"
+}

@@ -1,0 +1,18 @@
+{
+  "id": "video_692f7df0bee08191a5db4bd5ee4f8bd702d1134e3554adb7",
+  "object": "video",
+  "created_at": 1764720112,
+  "status": "failed",
+  "completed_at": null,
+  "error": {
+    "code": "video_generation_failed",
+    "message": "Video generation failed due to an internal error."
+  },
+  "expires_at": null,
+  "model": "sora-2",
+  "progress": 99,
+  "prompt": "根據提供的照片，製作一段科幻風格的視頻，背景為外太空，有飛船艦隊穿梭。畫面中有一艘高級太空飛船內部，內飾充滿科技感。背景音樂為高科技風格。",
+  "remixed_from_video_id": null,
+  "seconds": "8",
+  "size": "720x1280"
+}

@@ -1,0 +1,15 @@
+{
+  "id": "video_69324e2710c48198b7c3773939700ab401c669cc881c16df",
+  "object": "video",
+  "created_at": 1764904487,
+  "status": "completed",
+  "completed_at": 1764904603,
+  "error": null,
+  "expires_at": 1764908203,
+  "model": "sora-2",
+  "progress": 100,
+  "prompt": "生成一段視頻，內容是一位坐在太空艙內的人，透過巨大的窗戶觀看外面的潘多拉星球。太空艙內部充滿了高科技感，外景是壯麗的星球與宇宙背景，充滿未來感。整體風格偏向科幻，配樂帶有科技感的電子音樂。",
+  "remixed_from_video_id": null,
+  "seconds": "8",
+  "size": "720x1280"
+}

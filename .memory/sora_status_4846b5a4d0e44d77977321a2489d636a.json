@@ -1,0 +1,15 @@
+{
+  "id": "video_692a6bba5650819197ecf1eea73d3fd60196ae6a0187fc7d",
+  "object": "video",
+  "created_at": 1764387770,
+  "status": "completed",
+  "completed_at": 1764387878,
+  "error": null,
+  "expires_at": 1764391478,
+  "model": "sora-2",
+  "progress": 100,
+  "prompt": "生成太空飞船视频",
+  "remixed_from_video_id": null,
+  "seconds": "8",
+  "size": "720x1280"
+}

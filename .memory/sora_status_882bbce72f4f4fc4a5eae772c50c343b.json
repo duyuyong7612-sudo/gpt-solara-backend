@@ -1,0 +1,15 @@
+{
+  "id": "video_6932a58ff5448198ab1a592e98014b3706bdc6dc7bf4aaff",
+  "object": "video",
+  "created_at": 1764926864,
+  "status": "completed",
+  "completed_at": 1764926971,
+  "error": null,
+  "expires_at": 1764930571,
+  "model": "sora-2",
+  "progress": 100,
+  "prompt": "潘多拉星球奇特植物和動物群落，風格夢幻，約15秒。",
+  "remixed_from_video_id": null,
+  "seconds": "8",
+  "size": "720x1280"
+}

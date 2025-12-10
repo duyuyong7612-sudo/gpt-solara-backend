@@ -1,0 +1,15 @@
+{
+  "id": "video_6932638d28388193854932638b2a3a3a081b3311670b0969",
+  "object": "video",
+  "created_at": 1764909965,
+  "status": "completed",
+  "completed_at": 1764910078,
+  "error": null,
+  "expires_at": 1764913678,
+  "model": "sora-2",
+  "progress": 100,
+  "prompt": "生成一段 10 秒鐘的科幻風格視頻，內容是：潘朵拉星球上，一艘未來感十足的戰鬥艦在星球站附近巡航，戰艦造型獨特，外觀閃著金屬光澤，周圍環繞著藍色的星雲。戰艦飛行平穩，鏡頭從遠拉近，展現出戰艦細節與星球站的科幻場景。",
+  "remixed_from_video_id": null,
+  "seconds": "8",
+  "size": "720x1280"
+}

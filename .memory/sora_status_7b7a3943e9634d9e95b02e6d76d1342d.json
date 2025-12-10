@@ -1,0 +1,15 @@
+{
+  "id": "video_693274c56538819898af48d6d7e228500996bcae58e47707",
+  "object": "video",
+  "created_at": 1764914373,
+  "status": "completed",
+  "completed_at": 1764914490,
+  "error": null,
+  "expires_at": 1764918090,
+  "model": "sora-2",
+  "progress": 100,
+  "prompt": "生成一段视频，内容是：战斗飞船在潘多拉星球上巡航，驾驶舱内的视角，看到外面壮观的潘多拉风景，如漂浮的山脉、奇异植物和壮丽日落。背景音乐充满动感和神秘感。",
+  "remixed_from_video_id": null,
+  "seconds": "8",
+  "size": "720x1280"
+}

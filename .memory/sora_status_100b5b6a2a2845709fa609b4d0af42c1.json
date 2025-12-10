@@ -1,0 +1,15 @@
+{
+  "id": "video_692f6ebc3b0c819384ea858d3dff9762011c179669718d1c",
+  "object": "video",
+  "created_at": 1764716220,
+  "status": "completed",
+  "completed_at": 1764716752,
+  "error": null,
+  "expires_at": 1764720352,
+  "model": "sora-2",
+  "progress": 100,
+  "prompt": "生成一段約10秒的視頻，未來科幻風格的太空飛船內部，充滿科技感。一位中國男性角色坐在駕駛座上，透過飛船窗戶看外面的太空場景，畫面運用最先進的3D、5D技術。",
+  "remixed_from_video_id": null,
+  "seconds": "8",
+  "size": "720x1280"
+}

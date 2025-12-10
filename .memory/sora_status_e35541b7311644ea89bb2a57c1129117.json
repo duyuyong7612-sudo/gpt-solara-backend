@@ -1,0 +1,15 @@
+{
+  "id": "video_692f83edca108190a3e073d4091e8b5e0ea0d5df64902519",
+  "object": "video",
+  "created_at": 1764721645,
+  "status": "completed",
+  "completed_at": 1764721776,
+  "error": null,
+  "expires_at": 1764725376,
+  "model": "sora-2",
+  "progress": 100,
+  "prompt": "生成一段以你提供的照片为背景的科幻风格视频，内容是：你和朋友坐在太空船里，穿越未来感十足的城市外太空，音乐背景充满动感和视觉张力。",
+  "remixed_from_video_id": null,
+  "seconds": "8",
+  "size": "720x1280"
+}

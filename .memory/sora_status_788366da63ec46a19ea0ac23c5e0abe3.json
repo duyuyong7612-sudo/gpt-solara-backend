@@ -1,0 +1,18 @@
+{
+  "id": "video_6931eadf048081919f068e3fb6320ee304265e96cdc3cc2e",
+  "object": "video",
+  "created_at": 1764879071,
+  "status": "failed",
+  "completed_at": null,
+  "error": {
+    "code": "video_generation_failed",
+    "message": "Video generation failed due to an internal error."
+  },
+  "expires_at": null,
+  "model": "sora-2",
+  "progress": 99,
+  "prompt": "生成一段科幻風格的視頻，內容是：以未來科技感為主題的城市背景，高科技建築林立，霓虹燈光閃爍。畫面中的飛船從遠處駛來，穿梭於高樓之間，鏡頭從遠景推到近景，強調未來科技氛圍。",
+  "remixed_from_video_id": null,
+  "seconds": "8",
+  "size": "720x1280"
+}

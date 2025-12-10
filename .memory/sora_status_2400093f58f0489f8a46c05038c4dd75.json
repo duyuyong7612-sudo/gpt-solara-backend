@@ -1,0 +1,18 @@
+{
+  "id": "video_6930be8eedd08193bcc145141b7a36da02f0aed0f7af6ac8",
+  "object": "video",
+  "created_at": 1764802191,
+  "status": "failed",
+  "completed_at": null,
+  "error": {
+    "code": "video_generation_failed",
+    "message": "Video generation failed due to an internal error."
+  },
+  "expires_at": null,
+  "model": "sora-2",
+  "progress": 99,
+  "prompt": "生成一段畫面，內容是：在外星生物背景的基礎上，添加一艘地球高科技飛船，內部設計現代又充滿科技感，駕駛員坐在駕駛艙內，邊飛行邊欣賞外星生物的美麗景色。鏡頭運動展示飛船內外的細節，搭配動感音樂。",
+  "remixed_from_video_id": null,
+  "seconds": "8",
+  "size": "720x1280"
+}

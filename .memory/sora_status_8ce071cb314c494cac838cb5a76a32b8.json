@@ -1,0 +1,15 @@
+{
+  "id": "video_693496817ef08190962252214934ce7205d29792dcc0a47b",
+  "object": "video",
+  "created_at": 1765054081,
+  "status": "completed",
+  "completed_at": 1765054197,
+  "error": null,
+  "expires_at": 1765057797,
+  "model": "sora-2",
+  "progress": 100,
+  "prompt": "繁华城市中心，人群熙攘热闹，一座未来科技飞船停落在人们头顶。",
+  "remixed_from_video_id": null,
+  "seconds": "8",
+  "size": "720x1280"
+}

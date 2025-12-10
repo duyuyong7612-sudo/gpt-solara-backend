@@ -1,0 +1,15 @@
+{
+  "id": "video_692f76ceda688191ba2b542894d7dc580bfdb916e20baccc",
+  "object": "video",
+  "created_at": 1764718286,
+  "status": "completed",
+  "completed_at": 1764718418,
+  "error": null,
+  "expires_at": 1764722018,
+  "model": "sora-2",
+  "progress": 100,
+  "prompt": "生成一段視頻，展示中國太空飛船駕駛員坐在高科技駕駛艙內，駕駛飛船穿梭於外太空。畫面結合駕駛艙內部的高科技感和外太空的真實感，營造震撼的視覺效果。",
+  "remixed_from_video_id": null,
+  "seconds": "8",
+  "size": "720x1280"
+}

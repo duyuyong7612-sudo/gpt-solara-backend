@@ -1,0 +1,15 @@
+{
+  "id": "video_6938d53efa6c819094b5e1cf6b8c589a0f5813d921575ae1",
+  "object": "video",
+  "created_at": 1765332287,
+  "status": "completed",
+  "completed_at": 1765332407,
+  "error": null,
+  "expires_at": 1765336007,
+  "model": "sora-2",
+  "progress": 100,
+  "prompt": "潘多拉星球，飞行恐龙与太空船并肩，科幻风格，流畅跟拍。",
+  "remixed_from_video_id": null,
+  "seconds": "8",
+  "size": "720x1280"
+}

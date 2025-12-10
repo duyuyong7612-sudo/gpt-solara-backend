@@ -1,0 +1,18 @@
+{
+  "id": "video_69337a96021c81909f66ae7be8d19d25036bf18d415296f1",
+  "object": "video",
+  "created_at": 1764981398,
+  "status": "failed",
+  "completed_at": null,
+  "error": {
+    "code": "video_generation_failed",
+    "message": "Video generation failed due to an internal error."
+  },
+  "expires_at": null,
+  "model": "sora-2",
+  "progress": 99,
+  "prompt": "宇宙飞船降落在土卫二，展现冰封地表的奇异美景，带有神秘科幻感，约10秒。",
+  "remixed_from_video_id": null,
+  "seconds": "8",
+  "size": "720x1280"
+}

@@ -1,0 +1,15 @@
+{
+  "id": "video_69309f245380819382ba1ec2f7d1efc104b357137ca7a741",
+  "object": "video",
+  "created_at": 1764794148,
+  "status": "in_progress",
+  "completed_at": null,
+  "error": null,
+  "expires_at": null,
+  "model": "sora-2",
+  "progress": 40,
+  "prompt": "生成一段科幻風格的視頻，內容是：一個人在高科技的飛船內駕駛，外面的世界戰火紛飛。飛船內部設計極具科幻感，音效和音樂帶有濃厚的科技風格，並配有高科技的語音提示，如飛船即將穿越特定地點或時間。",
+  "remixed_from_video_id": null,
+  "seconds": "8",
+  "size": "720x1280"
+}

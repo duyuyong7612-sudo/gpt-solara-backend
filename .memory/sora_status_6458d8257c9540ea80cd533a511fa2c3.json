@@ -1,0 +1,15 @@
+{
+  "id": "video_693779d321508190ad6fc86ecfced5960985e5a613201362",
+  "object": "video",
+  "created_at": 1765243347,
+  "status": "completed",
+  "completed_at": 1765243457,
+  "error": null,
+  "expires_at": 1765247057,
+  "model": "sora-2",
+  "progress": 100,
+  "prompt": "房间从新整理下，让被子自动铺开",
+  "remixed_from_video_id": null,
+  "seconds": "8",
+  "size": "720x1280"
+}

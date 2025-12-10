@@ -1,0 +1,15 @@
+{
+  "id": "video_6938ec3d156081989e0cf08c8364d35d0100d69dfbbff150",
+  "object": "video",
+  "created_at": 1765338173,
+  "status": "queued",
+  "completed_at": null,
+  "error": null,
+  "expires_at": null,
+  "model": "sora-2",
+  "progress": 10,
+  "prompt": "高端駕駛艙內，未來科幻風格，鏡頭平穩推進",
+  "remixed_from_video_id": null,
+  "seconds": "8",
+  "size": "720x1280"
+}

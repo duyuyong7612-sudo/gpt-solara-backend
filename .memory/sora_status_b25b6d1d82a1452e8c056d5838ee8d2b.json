@@ -1,0 +1,15 @@
+{
+  "id": "video_6935453759a88190b62507bf503d3a5d03afe0a82067cf06",
+  "object": "video",
+  "created_at": 1765098807,
+  "status": "completed",
+  "completed_at": 1765098923,
+  "error": null,
+  "expires_at": 1765102523,
+  "model": "sora-2",
+  "progress": 100,
+  "prompt": "科技戰艦在外灘上空低空盤旋，未來感強烈",
+  "remixed_from_video_id": null,
+  "seconds": "8",
+  "size": "720x1280"
+}

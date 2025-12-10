@@ -1,0 +1,15 @@
+{
+  "id": "video_693543172638819096428342aa331a100fee2cb00ba13050",
+  "object": "video",
+  "created_at": 1765098263,
+  "status": "completed",
+  "completed_at": 1765098371,
+  "error": null,
+  "expires_at": 1765101971,
+  "model": "sora-2",
+  "progress": 100,
+  "prompt": "潘多拉星球，廣闊環境，科幻風格。",
+  "remixed_from_video_id": null,
+  "seconds": "8",
+  "size": "720x1280"
+}

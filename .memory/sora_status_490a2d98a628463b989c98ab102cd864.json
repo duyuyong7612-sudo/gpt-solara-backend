@@ -1,0 +1,15 @@
+{
+  "id": "video_6934a6d4b1448190b524d599eaac20a10faa9f2f43845d03",
+  "object": "video",
+  "created_at": 1765058260,
+  "status": "completed",
+  "completed_at": 1765058383,
+  "error": null,
+  "expires_at": 1765061983,
+  "model": "sora-2",
+  "progress": 100,
+  "prompt": "中國快餐店內，錢台上擺放各種熟食菜品，環境熱鬧。",
+  "remixed_from_video_id": null,
+  "seconds": "8",
+  "size": "720x1280"
+}

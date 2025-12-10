@@ -1,0 +1,15 @@
+{
+  "id": "video_692f78acc7c881919d6ed42565cac8e60d7bc209f6d5fbe2",
+  "object": "video",
+  "created_at": 1764718765,
+  "status": "completed",
+  "completed_at": 1764718898,
+  "error": null,
+  "expires_at": 1764722498,
+  "model": "sora-2",
+  "progress": 100,
+  "prompt": "生成一段視頻，主角坐在高科技感的飛船內駕駛，飛船穿梭於外太空中，周圍有各種大小飛船和水母群，整體氛圍充滿未來科技感，運鏡流暢且動感十足。",
+  "remixed_from_video_id": null,
+  "seconds": "8",
+  "size": "720x1280"
+}

@@ -1,0 +1,15 @@
+{
+  "id": "video_692ba5f4dc0c81919325c06e1e0bfcb20ddec35c6616b448",
+  "object": "video",
+  "created_at": 1764468212,
+  "status": "completed",
+  "completed_at": 1764468406,
+  "error": null,
+  "expires_at": 1764472006,
+  "model": "sora-2",
+  "progress": 100,
+  "prompt": "对电脑进行优化进行美化，让它变得更加的科技更加的科技感，然后代码写得很漂亮的出来",
+  "remixed_from_video_id": null,
+  "seconds": "8",
+  "size": "720x1280"
+}

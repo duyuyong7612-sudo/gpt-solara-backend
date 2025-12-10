@@ -1,0 +1,18 @@
+{
+  "id": "video_69329a5317088190a4650eee0d2a2668071d61d45f8a63b8",
+  "object": "video",
+  "created_at": 1764923987,
+  "status": "failed",
+  "completed_at": null,
+  "error": {
+    "code": "video_generation_failed",
+    "message": "Video generation failed due to an internal error."
+  },
+  "expires_at": null,
+  "model": "sora-2",
+  "progress": 99,
+  "prompt": "生成一段 10 秒鐘的視頻，內容是：白天的潘朵拉星球，熱帶叢林環繞，奇異的外星植物和動物在其間活動。鏡頭從上至下緩慢俯視整個場景，陽光穿透樹林，營造出神秘而迷人的氛圍，期間偶爾有奇特的飛行生物掠過鏡頭。",
+  "remixed_from_video_id": null,
+  "seconds": "8",
+  "size": "720x1280"
+}

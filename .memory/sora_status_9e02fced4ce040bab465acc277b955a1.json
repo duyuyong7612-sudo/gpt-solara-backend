@@ -1,0 +1,18 @@
+{
+  "id": "video_69375816117881938a7deb835340e31e07788d7bfacef4eb",
+  "object": "video",
+  "created_at": 1765234710,
+  "status": "failed",
+  "completed_at": null,
+  "error": {
+    "code": "moderation_blocked",
+    "message": "Your request was blocked by our moderation system."
+  },
+  "expires_at": null,
+  "model": "sora-2",
+  "progress": 99,
+  "prompt": "來了一个潘多拉星球的人，在这里",
+  "remixed_from_video_id": null,
+  "seconds": "8",
+  "size": "720x1280"
+}

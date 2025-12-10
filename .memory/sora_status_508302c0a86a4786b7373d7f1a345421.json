@@ -1,0 +1,15 @@
+{
+  "id": "video_6931ee88ef0081908bea64a2a3c6d02e0be49f91b485644c",
+  "object": "video",
+  "created_at": 1764880009,
+  "status": "completed",
+  "completed_at": 1764880132,
+  "error": null,
+  "expires_at": 1764883732,
+  "model": "sora-2",
+  "progress": 100,
+  "prompt": "我在大山洞外面",
+  "remixed_from_video_id": null,
+  "seconds": "8",
+  "size": "720x1280"
+}

@@ -1,0 +1,15 @@
+{
+  "id": "video_69353964139c8190bb638a705ce6a0850b41b907a0cbdbbe",
+  "object": "video",
+  "created_at": 1765095780,
+  "status": "completed",
+  "completed_at": 1765095893,
+  "error": null,
+  "expires_at": 1765099493,
+  "model": "sora-2",
+  "progress": 100,
+  "prompt": "神秘森林场景，光影交",
+  "remixed_from_video_id": null,
+  "seconds": "8",
+  "size": "720x1280"
+}

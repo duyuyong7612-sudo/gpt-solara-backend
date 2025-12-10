@@ -1,0 +1,15 @@
+{
+  "id": "video_692ab1475750819082f67b479d907ee80763e4e1a3476296",
+  "object": "video",
+  "created_at": 1764405575,
+  "status": "completed",
+  "completed_at": 1764405685,
+  "error": null,
+  "expires_at": 1764409285,
+  "model": "sora-2",
+  "progress": 100,
+  "prompt": "外星人在操作这台电脑",
+  "remixed_from_video_id": null,
+  "seconds": "8",
+  "size": "720x1280"
+}

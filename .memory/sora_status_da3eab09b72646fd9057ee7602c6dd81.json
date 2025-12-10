@@ -1,0 +1,15 @@
+{
+  "id": "video_692b5c5f87a881908844eeeb96537b9203310bcc51696fb4",
+  "object": "video",
+  "created_at": 1764449375,
+  "status": "in_progress",
+  "completed_at": null,
+  "error": null,
+  "expires_at": null,
+  "model": "sora-2",
+  "progress": 10,
+  "prompt": "外星人五帝的效果从电脑里面窜出来",
+  "remixed_from_video_id": null,
+  "seconds": "8",
+  "size": "720x1280"
+}

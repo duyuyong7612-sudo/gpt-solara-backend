@@ -1,0 +1,15 @@
+{
+  "id": "video_693371f067848198891b7e6c49180c9d020fc009baf16c60",
+  "object": "video",
+  "created_at": 1764979184,
+  "status": "completed",
+  "completed_at": 1764979308,
+  "error": null,
+  "expires_at": 1764982908,
+  "model": "sora-2",
+  "progress": 100,
+  "prompt": "太空艦艦形似戰鬥機，駕駛員在艙內看向外，呈現潘多拉星球景象，背景有恐龍，約15秒，夢幻風格。",
+  "remixed_from_video_id": null,
+  "seconds": "8",
+  "size": "720x1280"
+}

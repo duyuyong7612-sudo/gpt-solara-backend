@@ -1,0 +1,15 @@
+{
+  "id": "video_6932a28847388190bc34fb581fd1375b03c80d9c6d0c1b06",
+  "object": "video",
+  "created_at": 1764926088,
+  "status": "completed",
+  "completed_at": 1764926204,
+  "error": null,
+  "expires_at": 1764929804,
+  "model": "sora-2",
+  "progress": 100,
+  "prompt": "約10秒科幻感十足的潘多拉星球場景，展現強勁科技感和未來感。",
+  "remixed_from_video_id": null,
+  "seconds": "8",
+  "size": "720x1280"
+}

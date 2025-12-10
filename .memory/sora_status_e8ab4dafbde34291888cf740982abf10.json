@@ -1,0 +1,15 @@
+{
+  "id": "video_69333e740e5c81909b7f82de95ec90aa062efe1c28b01c2f",
+  "object": "video",
+  "created_at": 1764966004,
+  "status": "completed",
+  "completed_at": 1764966123,
+  "error": null,
+  "expires_at": 1764969723,
+  "model": "sora-2",
+  "progress": 100,
+  "prompt": "約20秒鏡頭，飛船駕駛員透過窗戶欣賞潘多拉星球的奇特美景，風格夢幻。",
+  "remixed_from_video_id": null,
+  "seconds": "8",
+  "size": "720x1280"
+}

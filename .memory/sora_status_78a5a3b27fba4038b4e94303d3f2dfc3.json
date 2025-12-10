@@ -1,0 +1,15 @@
+{
+  "id": "video_69377840e1d88190ba5ff147cb96352200b6528affbf1033",
+  "object": "video",
+  "created_at": 1765242944,
+  "status": "completed",
+  "completed_at": 1765243048,
+  "error": null,
+  "expires_at": 1765246648,
+  "model": "sora-2",
+  "progress": 100,
+  "prompt": "科幻风格，太空降舰在星际空间航行，镜头感流畅跟拍",
+  "remixed_from_video_id": null,
+  "seconds": "8",
+  "size": "720x1280"
+}

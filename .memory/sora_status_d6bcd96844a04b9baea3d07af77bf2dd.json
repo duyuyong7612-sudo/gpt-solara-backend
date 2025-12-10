@@ -1,0 +1,15 @@
+{
+  "id": "video_6938f8b559248191ad472e67d13640100daf9a9672aa8a62",
+  "object": "video",
+  "created_at": 1765341365,
+  "status": "completed",
+  "completed_at": 1765341490,
+  "error": null,
+  "expires_at": 1765345090,
+  "model": "sora-2",
+  "progress": 100,
+  "prompt": "这只猫在房间里活动，可爱的表情",
+  "remixed_from_video_id": null,
+  "seconds": "8",
+  "size": "720x1280"
+}

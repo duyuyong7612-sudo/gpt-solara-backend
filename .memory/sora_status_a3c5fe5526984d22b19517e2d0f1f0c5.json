@@ -1,0 +1,15 @@
+{
+  "id": "video_69337b70372c8191af1f1454cd8ae0e303dc571403b90726",
+  "object": "video",
+  "created_at": 1764981616,
+  "status": "completed",
+  "completed_at": 1764981726,
+  "error": null,
+  "expires_at": 1764985326,
+  "model": "sora-2",
+  "progress": 100,
+  "prompt": "一艘飛船降臨在土衛二，展示其科幻風格的冰封地表，約10秒。",
+  "remixed_from_video_id": null,
+  "seconds": "8",
+  "size": "720x1280"
+}

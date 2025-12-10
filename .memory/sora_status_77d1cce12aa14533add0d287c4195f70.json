@@ -1,0 +1,15 @@
+{
+  "id": "video_69335584324481908b6942e1a5260439054f63a5bda20dc6",
+  "object": "video",
+  "created_at": 1764971908,
+  "status": "completed",
+  "completed_at": 1764972026,
+  "error": null,
+  "expires_at": 1764975626,
+  "model": "sora-2",
+  "progress": 100,
+  "prompt": "約10秒，駕駛員駕駛飛船在潘多拉星球上穿梭，環境奇幻色彩，類似《阿凡達》風格",
+  "remixed_from_video_id": null,
+  "seconds": "8",
+  "size": "720x1280"
+}

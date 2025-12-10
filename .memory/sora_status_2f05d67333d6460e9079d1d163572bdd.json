@@ -1,0 +1,15 @@
+{
+  "id": "video_692fc63736ac8198825e85ce6d1af25a054c39e5470a2c0a",
+  "object": "video",
+  "created_at": 1764738615,
+  "status": "completed",
+  "completed_at": 1764738759,
+  "error": null,
+  "expires_at": 1764742359,
+  "model": "sora-2",
+  "progress": 100,
+  "prompt": "我这种",
+  "remixed_from_video_id": null,
+  "seconds": "8",
+  "size": "720x1280"
+}

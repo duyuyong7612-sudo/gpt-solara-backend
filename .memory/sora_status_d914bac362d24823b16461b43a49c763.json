@@ -1,0 +1,15 @@
+{
+  "id": "video_692d214ef1b48198a6017b734be4f6e009086bb167060462",
+  "object": "video",
+  "created_at": 1764565327,
+  "status": "completed",
+  "completed_at": 1764565440,
+  "error": null,
+  "expires_at": 1764569040,
+  "model": "sora-2",
+  "progress": 100,
+  "prompt": "外星人在这里",
+  "remixed_from_video_id": null,
+  "seconds": "8",
+  "size": "720x1280"
+}

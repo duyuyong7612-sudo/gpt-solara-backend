@@ -1,0 +1,15 @@
+{
+  "id": "video_69324a505fb88198a4de165385826a6f0f8709afa90f7877",
+  "object": "video",
+  "created_at": 1764903504,
+  "status": "completed",
+  "completed_at": 1764903632,
+  "error": null,
+  "expires_at": 1764907232,
+  "model": "sora-2",
+  "progress": 100,
+  "prompt": "生成一段 10 秒鐘的科幻風格影片，內容是：一艘未來感的戰鬥飛船，飛過潘朵拉星球的絢麗景色。飛船在空中做出浮動的動作，展現靈活的飛行技巧，星球背景中有奇異的動植物和壯觀的山水。整體畫面充滿科幻感和未來感。",
+  "remixed_from_video_id": null,
+  "seconds": "8",
+  "size": "720x1280"
+}

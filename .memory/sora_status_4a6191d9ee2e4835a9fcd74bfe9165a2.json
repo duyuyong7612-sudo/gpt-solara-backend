@@ -1,0 +1,15 @@
+{
+  "id": "video_69331137877081938c06c7dbc48e5d6e0665680c6abcfaed",
+  "object": "video",
+  "created_at": 1764954423,
+  "status": "completed",
+  "completed_at": 1764954542,
+  "error": null,
+  "expires_at": 1764958142,
+  "model": "sora-2",
+  "progress": 100,
+  "prompt": "約10秒潘多拉星球場景，展示叢林、動植物和山巒的神秘與壯麗。",
+  "remixed_from_video_id": null,
+  "seconds": "8",
+  "size": "720x1280"
+}

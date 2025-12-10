@@ -1,0 +1,15 @@
+{
+  "id": "video_69370614fc848193bfc2e3c11e2c68a50da306f25586e4d3",
+  "object": "video",
+  "created_at": 1765213717,
+  "status": "completed",
+  "completed_at": 1765213835,
+  "error": null,
+  "expires_at": 1765217435,
+  "model": "sora-2",
+  "progress": 100,
+  "prompt": "潘多拉星球，戰艦行航，未來風格，宏大壯闊",
+  "remixed_from_video_id": null,
+  "seconds": "8",
+  "size": "720x1280"
+}

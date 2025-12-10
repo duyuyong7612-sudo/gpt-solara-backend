@@ -1,0 +1,15 @@
+{
+  "id": "video_692e16a764d88198851b8f0042c26c930a7fd9d8830e9811",
+  "object": "video",
+  "created_at": 1764628135,
+  "status": "in_progress",
+  "completed_at": null,
+  "error": null,
+  "expires_at": null,
+  "model": "sora-2",
+  "progress": 74,
+  "prompt": "请根据用户提供的素材生成一段有节奏感的短视频。",
+  "remixed_from_video_id": null,
+  "seconds": "8",
+  "size": "720x1280"
+}

@@ -1,0 +1,15 @@
+{
+  "id": "video_693518d2ea5881918bb33c00eaf5a31a0886397aa8abe9e6",
+  "object": "video",
+  "created_at": 1765087443,
+  "status": "completed",
+  "completed_at": 1765087552,
+  "error": null,
+  "expires_at": 1765091152,
+  "model": "sora-2",
+  "progress": 100,
+  "prompt": "飞船在潘多拉星球穿梭，科幻风格，氛围寧静。",
+  "remixed_from_video_id": null,
+  "seconds": "8",
+  "size": "720x1280"
+}

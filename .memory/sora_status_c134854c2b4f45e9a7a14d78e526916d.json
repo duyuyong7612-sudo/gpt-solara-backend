@@ -1,0 +1,15 @@
+{
+  "id": "video_6933312650308191aa40333dea8b702900bd25bf94c041e2",
+  "object": "video",
+  "created_at": 1764962598,
+  "status": "completed",
+  "completed_at": 1764962741,
+  "error": null,
+  "expires_at": 1764966341,
+  "model": "sora-2",
+  "progress": 100,
+  "prompt": "約15秒潘多拉星球戰鬥，科幻風格，奇特山峰與生物，氣氛緊張。",
+  "remixed_from_video_id": null,
+  "seconds": "8",
+  "size": "720x1280"
+}

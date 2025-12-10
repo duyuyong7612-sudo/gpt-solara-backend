@@ -1,0 +1,15 @@
+{
+  "id": "video_692b28559d308198992f396ea58f177a0a06a8887e15f13b",
+  "object": "video",
+  "created_at": 1764436053,
+  "status": "completed",
+  "completed_at": 1764436184,
+  "error": null,
+  "expires_at": 1764439784,
+  "model": "sora-2",
+  "progress": 100,
+  "prompt": "电脑里面出现了大量的代码，这个代码是open AI高级的代码",
+  "remixed_from_video_id": null,
+  "seconds": "8",
+  "size": "720x1280"
+}

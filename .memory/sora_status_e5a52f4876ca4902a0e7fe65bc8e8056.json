@@ -1,0 +1,15 @@
+{
+  "id": "video_692f2b05dc54819189c99653842b42ce02f4db562c5c923a",
+  "object": "video",
+  "created_at": 1764698885,
+  "status": "completed",
+  "completed_at": 1764699012,
+  "error": null,
+  "expires_at": 1764702612,
+  "model": "sora-2",
+  "progress": 100,
+  "prompt": "好的，我已經整理好了，現在根據這些要求為你生成視頻。",
+  "remixed_from_video_id": null,
+  "seconds": "8",
+  "size": "720x1280"
+}

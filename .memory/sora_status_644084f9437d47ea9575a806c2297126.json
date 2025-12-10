@@ -1,0 +1,15 @@
+{
+  "id": "video_6935275779bc8198a30a9705da9332f1047eece7509ea4fb",
+  "object": "video",
+  "created_at": 1765091159,
+  "status": "completed",
+  "completed_at": 1765091276,
+  "error": null,
+  "expires_at": 1765094876,
+  "model": "sora-2",
+  "progress": 100,
+  "prompt": "把他升级",
+  "remixed_from_video_id": null,
+  "seconds": "8",
+  "size": "720x1280"
+}

@@ -1,0 +1,15 @@
+{
+  "id": "video_692b15c04aa88190bbcb492da291528106b9916d70e74a6b",
+  "object": "video",
+  "created_at": 1764431296,
+  "status": "completed",
+  "completed_at": 1764431428,
+  "error": null,
+  "expires_at": 1764435028,
+  "model": "sora-2",
+  "progress": 100,
+  "prompt": "有个欧洲人来到了这个环境",
+  "remixed_from_video_id": null,
+  "seconds": "8",
+  "size": "720x1280"
+}

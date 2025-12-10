@@ -1,0 +1,18 @@
+{
+  "id": "video_692fd3fe73408191837e423ed7258afd0fba73ec28e1cbaf",
+  "object": "video",
+  "created_at": 1764742142,
+  "status": "failed",
+  "completed_at": null,
+  "error": {
+    "code": "video_generation_failed",
+    "message": "Video generation failed due to an internal error."
+  },
+  "expires_at": null,
+  "model": "sora-2",
+  "progress": 99,
+  "prompt": "请根据用户提供的素材生成一段有节奏感的短视频。",
+  "remixed_from_video_id": null,
+  "seconds": "8",
+  "size": "720x1280"
+}

@@ -1,0 +1,15 @@
+{
+  "id": "video_69334cd303988193928ab51fca05c21a0fcf7df035b6bb8e",
+  "object": "video",
+  "created_at": 1764969683,
+  "status": "completed",
+  "completed_at": 1764969812,
+  "error": null,
+  "expires_at": 1764973412,
+  "model": "sora-2",
+  "progress": 100,
+  "prompt": "太空戰艦在潘多拉星球上空飛行，底下是壯麗的懸浮山。",
+  "remixed_from_video_id": null,
+  "seconds": "8",
+  "size": "720x1280"
+}

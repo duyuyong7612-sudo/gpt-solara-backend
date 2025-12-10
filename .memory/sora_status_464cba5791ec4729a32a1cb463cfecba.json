@@ -1,0 +1,15 @@
+{
+  "id": "video_69351f1c92b08190a17cc8a78177f9d70d8450d115f82c5e",
+  "object": "video",
+  "created_at": 1765089052,
+  "status": "completed",
+  "completed_at": 1765089174,
+  "error": null,
+  "expires_at": 1765092774,
+  "model": "sora-2",
+  "progress": 100,
+  "prompt": "战斗舰在潘多拉星球巡航，伴有飞龙与潘多拉能量，奇幻科幻风格",
+  "remixed_from_video_id": null,
+  "seconds": "8",
+  "size": "720x1280"
+}

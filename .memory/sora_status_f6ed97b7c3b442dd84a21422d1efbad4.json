@@ -1,0 +1,15 @@
+{
+  "id": "video_693337a54dc88193bf20c393be6aedcc0cac1d6c70906452",
+  "object": "video",
+  "created_at": 1764964261,
+  "status": "completed",
+  "completed_at": 1764964393,
+  "error": null,
+  "expires_at": 1764967993,
+  "model": "sora-2",
+  "progress": 100,
+  "prompt": "約10秒潘多拉星球戰鬥場景，科幻風格，氛圍緊張。",
+  "remixed_from_video_id": null,
+  "seconds": "8",
+  "size": "720x1280"
+}

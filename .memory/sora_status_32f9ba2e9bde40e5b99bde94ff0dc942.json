@@ -1,0 +1,15 @@
+{
+  "id": "video_692b5dff9604819193fabb511aa7d7340149bdeee9f767c7",
+  "object": "video",
+  "created_at": 1764449791,
+  "status": "completed",
+  "completed_at": 1764449980,
+  "error": null,
+  "expires_at": 1764453580,
+  "model": "sora-2",
+  "progress": 100,
+  "prompt": "用五D六D的效果，把外星人从电脑里面窜出来",
+  "remixed_from_video_id": null,
+  "seconds": "8",
+  "size": "720x1280"
+}

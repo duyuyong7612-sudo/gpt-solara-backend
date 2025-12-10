@@ -1,0 +1,15 @@
+{
+  "id": "video_69376dd43e008190b63cd3c3d7de234b0d51f05c23bea64c",
+  "object": "video",
+  "created_at": 1765240276,
+  "status": "completed",
+  "completed_at": 1765240391,
+  "error": null,
+  "expires_at": 1765243991,
+  "model": "sora-2",
+  "progress": 100,
+  "prompt": "上海外滩，F35战机降落，现代军事氛围",
+  "remixed_from_video_id": null,
+  "seconds": "8",
+  "size": "720x1280"
+}

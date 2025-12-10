@@ -1,0 +1,5 @@
+.env
+uploads/
+memory/
+.venv/
+__pycache__/

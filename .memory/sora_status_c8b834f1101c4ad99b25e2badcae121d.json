@@ -1,0 +1,15 @@
+{
+  "id": "video_6937dd9dff5c8191a51bffdeac420ec300ba5993ace4d14f",
+  "object": "video",
+  "created_at": 1765268894,
+  "status": "completed",
+  "completed_at": 1765269005,
+  "error": null,
+  "expires_at": 1765272605,
+  "model": "sora-2",
+  "progress": 100,
+  "prompt": "科幻风格下，奇异生物在海中游动，身临其境般潜水。",
+  "remixed_from_video_id": null,
+  "seconds": "8",
+  "size": "720x1280"
+}

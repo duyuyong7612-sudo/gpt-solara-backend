@@ -1,0 +1,15 @@
+{
+  "id": "video_6938f1a774ac8193b830ddc088c8f5040b98177d1b4ae976",
+  "object": "video",
+  "created_at": 1765339559,
+  "status": "completed",
+  "completed_at": 1765339862,
+  "error": null,
+  "expires_at": 1765343462,
+  "model": "sora-2",
+  "progress": 100,
+  "prompt": "室内环境，猫以写实风格在场景中活动",
+  "remixed_from_video_id": null,
+  "seconds": "8",
+  "size": "720x1280"
+}

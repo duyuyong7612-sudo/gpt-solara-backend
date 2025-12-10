@@ -1,0 +1,15 @@
+{
+  "id": "video_693291d5c0888198bd11c592444eaa4608b3f1941a2452a8",
+  "object": "video",
+  "created_at": 1764921813,
+  "status": "completed",
+  "completed_at": 1764921929,
+  "error": null,
+  "expires_at": 1764925529,
+  "model": "sora-2",
+  "progress": 100,
+  "prompt": "生成一段10秒鐘的科幻風格視頻，內容是：一艘宇宙飛船在潘多拉星球的藍天中行駛，透過飛船的巨大玻璃窗，可以看到外面壯麗的潘多拉星球景觀，奇異的山峰、浮空的島嶼和外星植物，帶有神秘的氛圍。視頻配以科幻感的音樂來增強氣氛。",
+  "remixed_from_video_id": null,
+  "seconds": "8",
+  "size": "720x1280"
+}
