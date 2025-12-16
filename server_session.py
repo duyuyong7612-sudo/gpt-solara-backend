@@ -4,6 +4,8 @@
 # ✅ 修复：Sora 下载/播放统一走 /v1/videos/{video_id}/content（官方方式）
 # ✅ 保留：Luma add-audio 不动
 # ✅ 保留：billing include_router 不动
+# ✅ 修复：接入 auth_router，/auth/apple 返回 access_token（走 auth.py）
+# ✅ 保留：原 /auth/apple 实现改名为 /auth/apple_legacy，避免冲突
 # ================================
 
 import os
@@ -31,6 +33,9 @@ from dotenv import load_dotenv
 
 # ✅ billing（两行之一：import）
 from billing import router as billing_router
+
+# ✅ auth（新增：让 /auth/apple 返回 access_token）
+from auth import router as auth_router
 
 # ============== ENV ==============
 load_dotenv()
@@ -290,7 +295,7 @@ def _resize_video_file(src_path: str, dst_path: str, target_wh: Optional[tuple[i
             "ffmpeg", "-y", "-i", src_path,
             "-vf",
             f"scale=w={w}:h={h}:force_original_aspect_ratio=decrease,"
-            f"pad={w}:{h}:(ow-iw)/2:(oh-ih)/2",
+            f"pad={w}:{h}:(ow-iw)/2:(oh-iw)/2",
             "-c:v", "libx264", "-preset", "veryfast", "-an", dst_path,
         ]
         subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -321,9 +326,7 @@ def sora_create(prompt: str, ref_path: Optional[str] = None, ref_mime: Optional[
             mime = ref_mime or _guess_mime_from_ext(ref_path)
             headers = _auth_headers()
             headers["Accept"] = "application/json"
-            files = {
-                "input_reference": (os.path.basename(ref_path), open(ref_path, "rb"), mime)
-            }
+            files = {"input_reference": (os.path.basename(ref_path), open(ref_path, "rb"), mime)}
             data = {"model": model, "prompt": prompt_final, "seconds": str(sec), "size": size}
             r = requests.post(url, headers=headers, data=data, files=files, timeout=60)
             _log_http(r, f"SORA.CREATE[ref:{mime}]")
@@ -397,6 +400,7 @@ def sora_content_location(video_id: str) -> str:
     if r.status_code in (302, 303) and r.headers.get("Location"):
         return r.headers["Location"]
     return ""
+
 def bg_sora_worker(job_id: str, prompt: str, timeout_sec: int = 600, release_on_exit: bool = False):
     """
     ✅ 修复点：
@@ -428,7 +432,6 @@ def bg_sora_worker(job_id: str, prompt: str, timeout_sec: int = 600, release_on_
                 pass
 
             if status in ("completed", "succeeded", "done"):
-                # ✅ 关键：让前端稳定拿我们自己的代理地址
                 SORA_JOBS[job_id]["url"] = f"/video/stream/{job_id}"
                 SORA_JOBS[job_id]["status"] = "done"
                 SORA_JOBS[job_id]["progress"] = 100
@@ -451,7 +454,6 @@ def bg_sora_worker(job_id: str, prompt: str, timeout_sec: int = 600, release_on_
                 SORA_SEM.release()
         except Exception:
             pass
-
 # ============== LUMA REST (独立线路) ==============
 LUMA_CREATE_URL = "https://api.lumalabs.ai/dream-machine/v1/generations"
 LUMA_GET_URL = "https://api.lumalabs.ai/dream-machine/v1/generations/{gid}"
@@ -606,6 +608,7 @@ def _persist_image_to_static_for_luma(src_path: str, job_id: str) -> Optional[st
     except Exception as e:
         log.warning("[LUMA] persist image failed: %s", e)
         return None
+
 # ================================
 # FastAPI app + routes
 # ================================
@@ -624,16 +627,21 @@ app = FastAPI(title="Solara Backend", lifespan=lifespan)
 # ✅ billing（两行之一：include_router）
 app.include_router(billing_router)
 
+# ✅ auth（新增：include_router，让 /auth/apple 返回 access_token）
+app.include_router(auth_router)
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
     allow_methods=["*"],
     allow_headers=["*"],
 )
-# ---------------- AUTH: Apple (MVP) ----------------
-def _decode_jwt_payload(jwt: str) -> dict:
+
+# ---------------- AUTH: Apple (LEGACY, renamed) ----------------
+# ⚠️ 旧实现保留但改名，避免与 auth_router 的 /auth/apple 冲突
+def _decode_jwt_payload_legacy(jwt: str) -> dict:
     """
-    Decode JWT payload only (MVP). No signature verification.
+    Decode JWT payload only (MVP). No signature verification. (LEGACY)
     """
     try:
         parts = (jwt or "").split(".")
@@ -646,12 +654,13 @@ def _decode_jwt_payload(jwt: str) -> dict:
     except Exception:
         return {}
 
-@app.post("/auth/apple")
-async def auth_apple(req: Request):
+@app.post("/auth/apple_legacy")
+async def auth_apple_legacy(req: Request):
     """
-    MVP Apple auth:
+    Legacy Apple auth:
     Body: { "identity_token": "<JWT from Apple>" }
     Return: { ok, user_id, email(optional) }
+    NOTE: new auth lives in auth.py -> /auth/apple (returns access_token).
     """
     try:
         body = await req.json()
@@ -662,7 +671,7 @@ async def auth_apple(req: Request):
     if not tok:
         return JSONResponse({"ok": False, "error": "missing_identity_token"}, status_code=400)
 
-    payload = _decode_jwt_payload(tok)
+    payload = _decode_jwt_payload_legacy(tok)
     sub = (payload.get("sub") or "").strip()
     if not sub:
         return JSONResponse({"ok": False, "error": "missing_sub"}, status_code=400)
@@ -671,6 +680,7 @@ async def auth_apple(req: Request):
     email = (payload.get("email") or "").strip()
 
     return {"ok": True, "user_id": user_id, "email": email}
+
 # --------------------------------------------------
 
 app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
@@ -767,7 +777,6 @@ async def create_video(
 
     threading.Thread(target=bg_sora_worker, args=(job_id, prompt, 600, True), daemon=True).start()
     return {"ok": True, "job_id": job_id, "status_url": f"/video/status/{job_id}", "status": "running"}
-
 @app.get("/video/status/{job_id}")
 def video_status(job_id: str):
     job = SORA_JOBS.get(job_id)
@@ -790,8 +799,8 @@ def video_stream(job_id: str, range_header: Optional[str] = Header(None, alias="
     """
     ✅ 修复点：
     - Sora 统一用 /v1/videos/{video_id}/content
-    - 同时支持 302/303 redirect 和 200/206 直接返回（你日志里就是 200）
-    - 支持 Range（iOS/VideoPlayer/下载都更稳）
+    - 同时支持 302/303 redirect 和 200/206 直接返回
+    - 支持 Range
     """
     job = SORA_JOBS.get(job_id)
     if not job:
@@ -803,7 +812,6 @@ def video_stream(job_id: str, range_header: Optional[str] = Header(None, alias="
     if not fid and not vid:
         return JSONResponse({"ok": False, "error": "video not ready"}, status_code=409)
 
-    # 兼容 file_id
     if fid:
         files_url = f"https://api.openai.com/v1/files/{fid}/content"
         headers = {"Authorization": f"Bearer {OPENAI_API_KEY}"}
@@ -825,7 +833,6 @@ def video_stream(job_id: str, range_header: Optional[str] = Header(None, alias="
             status_code=(r.status_code if r.status_code in (200, 206) else 200)
         )
 
-    # ✅ 官方正确：/videos/{id}/content
     content_url = f"https://api.openai.com/v1/videos/{vid}/content"
     headers = {"Authorization": f"Bearer {SORA_API_KEY}", "OpenAI-Beta": "video-generation=v1"}
     if OPENAI_ORG_ID:
@@ -835,7 +842,6 @@ def video_stream(job_id: str, range_header: Optional[str] = Header(None, alias="
 
     rc = requests.get(content_url, headers=headers, stream=True, allow_redirects=False, timeout=120)
 
-    # 302/303：跟随真实链接
     if rc.status_code in (302, 303) and rc.headers.get("Location"):
         loc = rc.headers["Location"]
         r2 = requests.get(loc, stream=True, timeout=120)
@@ -854,7 +860,6 @@ def video_stream(job_id: str, range_header: Optional[str] = Header(None, alias="
             status_code=(r2.status_code if r2.status_code in (200, 206) else 200)
         )
 
-    # 200/206：OpenAI 直接返回视频字节
     if rc.status_code in (200, 206):
         proxy_headers = {k: rc.headers[k] for k in ["Content-Type", "Content-Length", "Content-Range", "Accept-Ranges"] if k in rc.headers}
 
@@ -870,7 +875,6 @@ def video_stream(job_id: str, range_header: Optional[str] = Header(None, alias="
             status_code=rc.status_code
         )
 
-    # 其它错误：透传一点信息方便你排查
     try:
         detail = rc.text[:400]
     except Exception:
@@ -968,6 +972,7 @@ def luma_status_api(job_id: str):
         "resolution": "720p",
         "cost_credits_estimate": 110,
     }
+
 @app.get("/luma/stream/{job_id}")
 def luma_stream(job_id: str, range_header: Optional[str] = Header(None, alias="Range")):
     job = LUMA_JOBS.get(job_id)
