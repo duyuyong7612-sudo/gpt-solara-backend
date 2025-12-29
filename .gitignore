@@ -2,4 +2,26 @@
 uploads/
 memory/
 .venv/
+__pycache__/billing_store.json
+cat >> .gitignore <<'EOF'
+# secrets
+.env
+
+# python
 __pycache__/
+*.pyc
+
+# venv
+.venv*/
+venv/
+.venv311/
+
+# runtime stores (do NOT commit)
+billing_store.json
+.memory/
+uploads/
+
+# local artifacts
+*.mp4
+*.mov
+.DS_Store

@@ -1,11 +1,6 @@
 # ================================
-# server_session.py  (FULL)
-# Sora(高端8s) + Luma(普通10s/720p) 两条线完全分离
-# ✅ 修复：Sora 下载/播放统一走 /v1/videos/{video_id}/content（官方方式）
-# ✅ 保留：Luma add-audio 不动
-# ✅ 保留：billing include_router 不动
-# ✅ 修复：接入 auth_router，/auth/apple 返回 access_token（走 auth.py）
-# ✅ 保留：原 /auth/apple 实现改名为 /auth/apple_legacy，避免冲突
+# server_session.py  (FULL, STABLE)
+# ✅ Remix 链路对齐版：支持 /video/remix + 修复 remix prompt
 # ================================
 
 import os
@@ -20,26 +15,27 @@ import logging
 import threading
 import subprocess
 from pathlib import Path
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, Tuple
 from contextlib import asynccontextmanager
 
 import requests
-from requests.exceptions import ReadTimeout
 from fastapi import FastAPI, UploadFile, File, Form, Request, Header
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from dotenv import load_dotenv
 
-# ✅ billing（两行之一：import）
-from billing import router as billing_router
-
-# ✅ auth（新增：让 /auth/apple 返回 access_token）
-from auth import router as auth_router
-
-# ============== ENV ==============
+# ✅✅ FIX：必须先 load_dotenv，再 import billing/auth（它们 import 时会读 os.getenv）
 load_dotenv()
 
+# ✅ billing
+from billing import router as billing_router
+
+# ✅ auth
+from auth import router as auth_router
+
+
+# ============== ENV ==============
 OPENAI_API_KEY = (os.getenv("OPENAI_API_KEY") or "").strip()
 SORA_API_KEY = (os.getenv("SORA_API_KEY") or OPENAI_API_KEY).strip()
 OPENAI_ORG_ID = (os.getenv("OPENAI_ORG_ID") or "").strip()
@@ -88,6 +84,7 @@ UPLOADS_DIR.mkdir(exist_ok=True)
 MEM_DIR = BASE_DIR / ".memory"
 MEM_DIR.mkdir(exist_ok=True)
 
+
 # ============== JOB TABLES ==============
 SORA_JOBS: Dict[str, Dict[str, Any]] = {}
 LUMA_JOBS: Dict[str, Dict[str, Any]] = {}
@@ -101,25 +98,94 @@ SOLARA_MAX_TURNS = 30
 SOLARA_SESSIONS: Dict[str, Dict[str, Any]] = {}
 SOLARA_LAST_MEDIA: Dict[str, Dict[str, Any]] = {}
 
-# ============== Sora Base Prompt ==============
-SORA_BASE_PROMPT = """
-你是專門為手機端生成「干淨、無文字元素」短視頻的專業導演與視覺設計師。
 
-請嚴格遵守：
-1. 畫面中禁止任何文字元素（任何語言/數字/字幕/Logo/水印）
-2. 若有參考圖片或影片，只保留真正主體，背景雜物一律忽略或重畫
-3. 只用畫面講故事（構圖/光影/運鏡），不要把 UI/招牌/字樣帶進畫面
-4. 風格乾淨、現代、有設計感，適合作為 AI 視頻 App 的示例
-5. 出錯時寧可簡潔，也不要冒險產生任何文字/字幕
+# ============== Prompts (ONE SOURCE OF TRUTH) ==============
+SOLARA_SYSTEM_PROMPT = r"""
+你是「GPT Solara」通用智能型语音助手,以realtime模型能力，像chatGpT一样能力
 
-你的目標：完全無文字 + 去雜物 + 竖屏短視頻。
+【1. 角色與總目標】
+- 第一角色通用语音助手，根据客户语义判断是否需要进入第二角色视频生成助手。你代表全人类，是人类科技文明的结晶，你拥有人类所有的知识与技能，你要服务使用者，解答问题，帮助他们创造一切你所知道的知识。
+- 如果客户想创作生成AI视频，这时候你才是语音影片设计师，你将协助客户让他们得到他们想要的东西：「幫使用者一起想像畫面 → 幫他整理出一句清楚的生成描述」。
+
+【语言策略（必须遵守）】
+• 始终跟随用户语言：用户用中文你就中文；用户用英文你就英文；用户用日文你就日文。
+• 如果用户一条消息里混用多种语言：以用户最后一句为准。
+• 用户明确要求“用某某语言回答”，优先遵从。
+• SORA 行也使用同一种语言输出，語氣自然、冷靜、有設計感，不要太熱情吵鬧。
+
+【2. 對話節奏】
+1) 一開始先用通用型的语音助手互动；当客户想创作生成AI视频时，再进入影片设计师模式。
+2) 多聽少講。讓使用者連續說幾個畫面細節，不用每一句都回覆。
+3) 每次輪到你說話時，控制在 1～3 句內，避免長篇大論，方便語音播放。
+4) 如果使用者明顯還在補充，就暫時不要收尾，也不要急著總結或下結論。
+
+【3. 追問策略（只問關鍵）】
+- 只在關鍵不清楚時，才追問 1～2 句：
+  • 主體是誰或什麼？（人 / 物 / 動物 / 城市 / 自然場景…）
+  • 場景與環境？（室內 / 室外 / 城市夜景 / 太空 / 海邊…）
+  • 氣氛與風格？（寫實 / 夢幻 / 科幻 / 溫暖 / 懸疑 / 逗趣…）
+- 不要问影片时长，也不要一直问技术性问题。
+
+【4. 何时判定「可以收尾」】
+- 使用者說「差不多了」「就這樣」「OK 可以」等；
+- 或已經有足夠多畫面細節；
+- 使用者停頓、不再補充新資訊。
+此时先用一句过渡：「好，我帮你整理成一句生成描述」。
+
+【5. 生成影片描述（重點）】
+- 把整個對話濃縮成一段 ≤50 个中文字描述。
+- 优先保留：主体、场景、氛围/风格、镜头感（慢镜头/跟拍/手持）。
+- 不要写具体秒数，不要提「10 秒影片」等。
+- 不要加入解释，只需直接描述画面。
+
+【6. 觸發 Sora 的唯一格式】
+当准备好描述时，用单独一行输出：
+SORA: 这里写整理好的画面描述（≤50字）
+
+【9. 畫面純淨要求（非常重要）】
+- SORA 行只能描述画面中实际会看到的「人物、物体、场景、光线、运动」等内容。
+- 不要要求画面出现任何文字/字幕/水印/LOGO/App UI。
+- 若参考图片来自手机截图，必须自动忽略所有 UI 元件。
 """.strip()
+
+SORA_BASE_PROMPT = SOLARA_SYSTEM_PROMPT
+SORA_REALTIME_INSTRUCTIONS = SOLARA_SYSTEM_PROMPT
+
 
 def build_sora_prompt(user_prompt: str) -> str:
     up = (user_prompt or "").strip()
     if not up:
         up = "請根據用戶提供的素材生成乾淨、無文字元素的手機竖屏短視頻。"
     return SORA_BASE_PROMPT + "\n\n用戶需求：\n" + up
+
+
+# ✅✅✅ Remix 专用 Prompt（关键修复点）
+def build_sora_remix_prompt(base_video_id: str, user_instruction: str) -> str:
+    """
+    ✅ 修复点：
+    Remix 不能复用 build_sora_prompt()（那段是“通用助手系统提示”，会导致模型重构场景）
+    这里必须明确强调：保持主体/场景/构图/镜头运动一致，仅做“用户要求的改动”。
+
+    目标：避免“二次生成出来但不是原视频的继续”。
+    """
+    base_video_id = _normalize_video_id(base_video_id)
+    instr = (user_instruction or "").strip()
+    if not instr:
+        instr = "Make subtle improvements. Keep everything else the same."
+
+    return (
+        f"REMIX TASK (base video: {base_video_id}).\n"
+        "STRICT RULES:\n"
+        "- Preserve the same main subject identity (same person/character/object), same environment, same composition/framing, and same camera motion.\n"
+        "- Do NOT introduce new subjects, new backgrounds, or a different setting.\n"
+        "- Do NOT remove the main subject.\n"
+        "- Keep style/lighting consistent unless explicitly requested.\n"
+        "- Apply ONLY the requested change(s). If ambiguous, make the smallest change possible.\n"
+        "\n"
+        "Requested changes:\n"
+        f"{instr}\n"
+    )
+
 
 # ============== Utils ==============
 def _cleanup_recent():
@@ -131,15 +197,19 @@ def _cleanup_recent():
         if now - LUMA_RECENT_KEYS[k]["ts"] > RECENT_TTL:
             LUMA_RECENT_KEYS.pop(k, None)
 
+
 def _sha1_bytes(b: bytes) -> str:
     return hashlib.sha1(b).hexdigest()
+
 
 def _idem_key(ip: str, prompt: str, img_h: str, vid_h: str) -> str:
     raw = f"{ip}|{(prompt or '').strip()}|img:{img_h}|vid:{vid_h}"
     return hashlib.sha1(raw.encode("utf-8")).hexdigest()
 
+
 def _short(s: str, n: int = 600) -> str:
     return (s or "")[:n]
+
 
 def _log_http(r: requests.Response, tag: str):
     try:
@@ -148,6 +218,7 @@ def _log_http(r: requests.Response, tag: str):
                  tag, r.request.method, r.request.url, r.status_code, rid, _short(r.text))
     except Exception:
         pass
+
 
 def _guess_mime_from_ext(path: str) -> str:
     ext = os.path.splitext(path)[1].lower()
@@ -167,13 +238,15 @@ def _guess_mime_from_ext(path: str) -> str:
         return "video/webm"
     return "application/octet-stream"
 
+
 def _normalize_video_id(vid: str) -> str:
     """
-    兜底：防止 video_id 被误拼接（你日志里出现 video_xxx + 尾巴），只保留 video_<alnum> 主体。
+    兜底：防止 video_id 被误拼接（日志里出现 video_xxx + 尾巴），只保留 video_<alnum> 主体。
     """
     s = (vid or "").strip()
     m = re.search(r"(video_[A-Za-z0-9]+)", s)
     return m.group(1) if m else s
+
 
 def extract_url(data: dict) -> str:
     if not isinstance(data, dict):
@@ -195,6 +268,7 @@ def extract_url(data: dict) -> str:
                     return u
     return ""
 
+
 def extract_file_id(data: dict) -> str:
     if not isinstance(data, dict):
         return ""
@@ -214,12 +288,14 @@ def extract_file_id(data: dict) -> str:
                 return f2
     return ""
 
-def _parse_size(size_str: str) -> Optional[tuple[int, int]]:
+
+def _parse_size(size_str: str) -> Optional[Tuple[int, int]]:
     try:
         w, h = size_str.lower().split("x")
         return int(w), int(h)
     except Exception:
         return None
+
 
 def _ensure_portrait_size(size_str: str) -> str:
     wh = _parse_size(size_str)
@@ -233,9 +309,11 @@ def _ensure_portrait_size(size_str: str) -> str:
         return f"{w}x{h}"
     return "720x1280" if h <= 1500 else "1024x1792"
 
+
 SORA_SIZE_DEFAULT = _ensure_portrait_size(SORA_SIZE_DEFAULT)
 
-def _resize_image_bytes(raw: bytes, target_wh: Optional[tuple[int, int]]) -> bytes:
+
+def _resize_image_bytes(raw: bytes, target_wh: Optional[Tuple[int, int]]) -> bytes:
     if not target_wh:
         return raw
     try:
@@ -251,6 +329,98 @@ def _resize_image_bytes(raw: bytes, target_wh: Optional[tuple[int, int]]) -> byt
         return buf.getvalue()
     except Exception:
         return raw
+
+
+# ================================
+# Remix parsing (NEW)
+# ================================
+REMIX_BEGIN = "[REMIX_REQUEST]"
+REMIX_END = "[/REMIX_REQUEST]"
+
+def _extract_remix_block(raw_prompt: str) -> str:
+    s = raw_prompt or ""
+    if REMIX_BEGIN not in s:
+        return ""
+    if REMIX_END in s:
+        try:
+            return s.split(REMIX_BEGIN, 1)[1].split(REMIX_END, 1)[0]
+        except Exception:
+            return ""
+    # 没有 END，就取后半段
+    try:
+        return s.split(REMIX_BEGIN, 1)[1]
+    except Exception:
+        return ""
+
+def _strip_remix_block(raw_prompt: str) -> str:
+    s = raw_prompt or ""
+    if REMIX_BEGIN not in s:
+        return s
+    if REMIX_END in s:
+        pre, rest = s.split(REMIX_BEGIN, 1)
+        _, post = rest.split(REMIX_END, 1)
+        return (pre + " " + post).strip()
+    # 没 END，则直接去掉 BEGIN 后所有
+    return s.split(REMIX_BEGIN, 1)[0].strip()
+
+def parse_remix_request(raw_prompt: str) -> Optional[Dict[str, str]]:
+    """
+    识别 iOS 发来的（fallback 模式）：
+    [REMIX_REQUEST]
+    base_video_id: video_xxx
+    user_instruction: ....
+    [/REMIX_REQUEST]
+    """
+    s = (raw_prompt or "").strip()
+    if not s or REMIX_BEGIN not in s:
+        return None
+
+    block = _extract_remix_block(s)
+    if not block:
+        block = s
+
+    # base_video_id 优先从 base_video_id: 行取，否则兜底取第一个 video_*
+    base_id = ""
+    m = re.search(r"base_video_id\s*:\s*(video_[A-Za-z0-9]+)", block, flags=re.I)
+    if m:
+        base_id = m.group(1)
+    else:
+        m2 = re.search(r"(video_[A-Za-z0-9]+)", block)
+        if m2:
+            base_id = m2.group(1)
+
+    base_id = _normalize_video_id(base_id)
+    if not base_id:
+        return None
+
+    # instruction：优先 user_instruction / instruction / prompt 后面的全部内容（可多行）
+    instr = ""
+    m3 = re.search(r"(user_instruction|instruction|prompt)\s*:\s*([\s\S]*?)\Z", block, flags=re.I)
+    if m3:
+        instr = (m3.group(2) or "").strip()
+    else:
+        # 兜底：去掉 base_video_id 行剩余内容
+        lines = [ln.strip() for ln in block.splitlines() if ln.strip()]
+        lines2 = []
+        for ln in lines:
+            if re.search(r"base_video_id\s*:", ln, flags=re.I):
+                continue
+            if ln.strip().lower().startswith("user_instruction:"):
+                lines2.append(ln.split(":", 1)[1].strip())
+            else:
+                lines2.append(ln)
+        instr = " ".join(lines2).strip()
+
+    # 如果 block 里提取不到，就用整个 prompt 去掉块后的文本兜底
+    if not instr:
+        instr = _strip_remix_block(s).strip()
+
+    return {
+        "base_video_id": base_id,
+        "instruction": instr,
+    }
+
+
 # ================================
 # Sora / Luma REST + workers
 # ================================
@@ -267,6 +437,7 @@ def _json_headers():
         h["OpenAI-Organization"] = OPENAI_ORG_ID
     return h
 
+
 def _auth_headers():
     h = {
         "Authorization": f"Bearer {SORA_API_KEY}",
@@ -275,6 +446,7 @@ def _auth_headers():
     if OPENAI_ORG_ID:
         h["OpenAI-Organization"] = OPENAI_ORG_ID
     return h
+
 
 def _luma_headers():
     if not LUMA_API_KEY:
@@ -285,8 +457,9 @@ def _luma_headers():
         "Content-Type": "application/json",
     }
 
+
 # ============== Video tools ==============
-def _resize_video_file(src_path: str, dst_path: str, target_wh: Optional[tuple[int, int]]) -> str:
+def _resize_video_file(src_path: str, dst_path: str, target_wh: Optional[Tuple[int, int]]) -> str:
     if not target_wh:
         return src_path
     try:
@@ -294,14 +467,16 @@ def _resize_video_file(src_path: str, dst_path: str, target_wh: Optional[tuple[i
         cmd = [
             "ffmpeg", "-y", "-i", src_path,
             "-vf",
+            # ✅ 修复：pad 的 y 偏移应为 (oh-ih)/2
             f"scale=w={w}:h={h}:force_original_aspect_ratio=decrease,"
-            f"pad={w}:{h}:(ow-iw)/2:(oh-iw)/2",
+            f"pad={w}:{h}:(ow-iw)/2:(oh-ih)/2",
             "-c:v", "libx264", "-preset", "veryfast", "-an", dst_path,
         ]
         subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         return dst_path
     except Exception:
         return src_path
+
 
 def _video_to_mosaic_image(src_path: str, dst_path: str, tiles: int = 1) -> Optional[str]:
     try:
@@ -310,6 +485,7 @@ def _video_to_mosaic_image(src_path: str, dst_path: str, tiles: int = 1) -> Opti
         return dst_path
     except Exception:
         return None
+
 
 # ============== SORA REST ==============
 def sora_create(prompt: str, ref_path: Optional[str] = None, ref_mime: Optional[str] = None) -> str:
@@ -322,11 +498,13 @@ def sora_create(prompt: str, ref_path: Optional[str] = None, ref_mime: Optional[
     r: requests.Response
 
     if ref_path:
+        files = None
         try:
             mime = ref_mime or _guess_mime_from_ext(ref_path)
             headers = _auth_headers()
             headers["Accept"] = "application/json"
-            files = {"input_reference": (os.path.basename(ref_path), open(ref_path, "rb"), mime)}
+            fh = open(ref_path, "rb")
+            files = {"input_reference": (os.path.basename(ref_path), fh, mime)}
             data = {"model": model, "prompt": prompt_final, "seconds": str(sec), "size": size}
             r = requests.post(url, headers=headers, data=data, files=files, timeout=60)
             _log_http(r, f"SORA.CREATE[ref:{mime}]")
@@ -337,7 +515,8 @@ def sora_create(prompt: str, ref_path: Optional[str] = None, ref_mime: Optional[
             _log_http(r, f"SORA.CREATE[{model}]")
         finally:
             try:
-                files["input_reference"][1].close()
+                if files and files.get("input_reference"):
+                    files["input_reference"][1].close()
             except Exception:
                 pass
     else:
@@ -358,6 +537,35 @@ def sora_create(prompt: str, ref_path: Optional[str] = None, ref_mime: Optional[
         raise RuntimeError(f"missing video id: {data}")
     return _normalize_video_id(str(vid))
 
+
+def sora_remix(base_video_id: str, instruction: str) -> str:
+    """
+    ✅ 修复版：Remix 不再走 build_sora_prompt（避免“二次生成变全新视频”）
+    """
+    base_video_id = _normalize_video_id(base_video_id)
+    url = f"https://api.openai.com/v1/videos/{base_video_id}/remix"
+
+    # ✅ 核心修复：Remix Prompt 单独构造
+    prompt_final = build_sora_remix_prompt(base_video_id, instruction)
+    body = {"prompt": prompt_final}
+
+    r = requests.post(url, headers=_json_headers(), json=body, timeout=60)
+    _log_http(r, f"SORA.REMIX[{base_video_id}]")
+
+    if r.status_code >= 400:
+        try:
+            err = r.json()
+        except Exception:
+            err = {"message": r.text}
+        raise RuntimeError(f"Sora remix error: {err}")
+
+    data = r.json() if r.text else {}
+    vid = data.get("id") or data.get("video_id")
+    if not vid:
+        raise RuntimeError(f"missing remix video id: {data}")
+    return _normalize_video_id(str(vid))
+
+
 def sora_status(video_id: str) -> dict:
     video_id = _normalize_video_id(video_id)
     r = requests.get(f"https://api.openai.com/v1/videos/{video_id}", headers=_auth_headers(), timeout=60)
@@ -366,7 +574,8 @@ def sora_status(video_id: str) -> dict:
         raise RuntimeError(r.text)
     return r.json() if r.text else {}
 
-# ⚠️ 以下三个函数保留兼容，但本修复版不再依赖它们完成下载（避免你遇到的 404）
+
+# 兼容保留（本修复版下载不依赖这些）
 def sora_assets(video_id: str) -> dict:
     video_id = _normalize_video_id(video_id)
     r = requests.get(f"https://api.openai.com/v1/videos/{video_id}/assets", headers=_auth_headers(), timeout=60)
@@ -374,6 +583,7 @@ def sora_assets(video_id: str) -> dict:
     if r.status_code >= 400:
         return {}
     return r.json() if r.text else {}
+
 
 def sora_download_location(video_id: str) -> str:
     video_id = _normalize_video_id(video_id)
@@ -388,6 +598,7 @@ def sora_download_location(video_id: str) -> str:
         return r.headers["Location"]
     return ""
 
+
 def sora_content_location(video_id: str) -> str:
     video_id = _normalize_video_id(video_id)
     r = requests.get(
@@ -401,44 +612,81 @@ def sora_content_location(video_id: str) -> str:
         return r.headers["Location"]
     return ""
 
-def bg_sora_worker(job_id: str, prompt: str, timeout_sec: int = 600, release_on_exit: bool = False):
+
+def bg_sora_worker(job_id: str, prompt: str, timeout_sec: int = 1800, release_on_exit: bool = False):
     """
     ✅ 修复点：
-    - completed 后不再去 /assets /download 兜圈子
-    - 统一：前端只用 /video/stream/{job_id} 播放/下载
+    - 真正支持 remix：检测 job['mode']=="remix"
+    - completed 后统一：前端只用 /video/stream/{job_id} 播放/下载
+    - 超时增强：progress>=99 给 finishing 宽限
     """
     try:
         job = SORA_JOBS.get(job_id, {})
+        mode = (job.get("mode") or "").strip() or ("remix" if job.get("remix_base_video_id") else "create")
+
         ref_path = job.get("ref_path")
         ref_mime = job.get("ref_mime")
 
-        video_id = sora_create(prompt, ref_path=ref_path, ref_mime=ref_mime)
-        video_id = _normalize_video_id(video_id)
-        SORA_JOBS[job_id].update({"status": "running", "video_id": video_id})
+        # 1) create or remix
+        if mode == "remix":
+            base_id = _normalize_video_id(job.get("remix_base_video_id") or "")
+            instr = (job.get("remix_instruction") or prompt or "").strip()
+            if not base_id:
+                raise RuntimeError("missing remix_base_video_id")
+            if not instr:
+                instr = "Make subtle improvements. Keep everything else the same."
+            video_id = sora_remix(base_id, instr)
+        else:
+            video_id = sora_create(prompt, ref_path=ref_path, ref_mime=ref_mime)
 
-        deadline = time.time() + timeout_sec
+        video_id = _normalize_video_id(video_id)
+        SORA_JOBS[job_id].update({"status": "running", "video_id": video_id, "openai_status": "running"})
+
+        deadline = time.time() + int(timeout_sec or 1800)
         last_status = ""
+        finishing_grace_used = False
+        transient_fail = 0
 
         while True:
-            info = sora_status(video_id)
-            status = str(info.get("status") or info.get("state") or last_status or "processing").lower()
+            try:
+                info = sora_status(video_id)
+                transient_fail = 0
+            except Exception as e:
+                # ✅ 网络抖动/临时失败：不要立刻把任务判死
+                transient_fail += 1
+                if transient_fail <= 5:
+                    time.sleep(2)
+                    continue
+                raise e
+
+            status_raw = str(info.get("status") or info.get("state") or last_status or "processing")
+            status = status_raw.lower().strip()
             last_status = status
+
+            SORA_JOBS[job_id]["openai_status"] = status_raw
             SORA_JOBS[job_id]["status"] = status
 
+            prog = None
             try:
                 prog = int(info.get("progress") or 0)
                 SORA_JOBS[job_id]["progress"] = max(SORA_JOBS[job_id].get("progress", 0), prog)
             except Exception:
-                pass
+                prog = None
 
-            if status in ("completed", "succeeded", "done"):
+            # ✅ progress 到 99 以上，给 finishing 宽限（避免 99% 被 timeout 杀）
+            if prog is not None and prog >= 99 and not finishing_grace_used:
+                deadline = max(deadline, time.time() + 600)  # +10min
+                finishing_grace_used = True
+
+            if status in ("completed", "succeeded", "done", "success"):
                 SORA_JOBS[job_id]["url"] = f"/video/stream/{job_id}"
                 SORA_JOBS[job_id]["status"] = "done"
                 SORA_JOBS[job_id]["progress"] = 100
                 return
 
-            if status in ("failed", "error", "cancelled"):
+            if status in ("failed", "error", "cancelled", "canceled"):
                 raise RuntimeError(f"sora failed: {status}")
+
             if time.time() > deadline:
                 raise TimeoutError("sora timeout")
 
@@ -449,15 +697,41 @@ def bg_sora_worker(job_id: str, prompt: str, timeout_sec: int = 600, release_on_
         SORA_JOBS[job_id]["status"] = "failed"
         log.exception("[SORA] job=%s FAILED: %s", job_id, e)
     finally:
+        # 兼容保留：如果外面还在用 release_on_exit=True 的旧调用，不会崩
         try:
             if release_on_exit:
                 SORA_SEM.release()
         except Exception:
             pass
+
+
+def _spawn_sora_job(job_id: str, prompt: str, timeout_sec: int):
+    """
+    ✅ NEW：排队执行，避免 busy=429 让前端判“二次生成失败”
+    成本不变：仍然由 SORA_SEM 控制并发
+    """
+    def runner():
+        acquired = False
+        try:
+            # 等待并发额度（阻塞）
+            SORA_SEM.acquire()
+            acquired = True
+            bg_sora_worker(job_id, prompt, timeout_sec=timeout_sec, release_on_exit=False)
+        finally:
+            if acquired:
+                try:
+                    SORA_SEM.release()
+                except Exception:
+                    pass
+
+    threading.Thread(target=runner, daemon=True).start()
+
+
 # ============== LUMA REST (独立线路) ==============
 LUMA_CREATE_URL = "https://api.lumalabs.ai/dream-machine/v1/generations"
 LUMA_GET_URL = "https://api.lumalabs.ai/dream-machine/v1/generations/{gid}"
 LUMA_AUDIO_URL = "https://api.lumalabs.ai/dream-machine/v1/generations/{gid}/audio"
+
 
 def luma_create(prompt: str, image_url: Optional[str] = None) -> str:
     sec = max(1, int(LUMA_SECONDS_DEFAULT or 10))
@@ -488,6 +762,7 @@ def luma_create(prompt: str, image_url: Optional[str] = None) -> str:
         raise RuntimeError(f"missing generation id: {data}")
     return gid
 
+
 def luma_add_audio(gid: str, audio_prompt: str) -> dict:
     ap = (audio_prompt or "").strip() or LUMA_AUDIO_PROMPT_DEFAULT
     body = {"prompt": ap}
@@ -501,12 +776,14 @@ def luma_add_audio(gid: str, audio_prompt: str) -> dict:
         raise RuntimeError(f"Luma add audio error: {err}")
     return r.json() if r.text else {}
 
+
 def luma_status(gid: str) -> dict:
     r = requests.get(LUMA_GET_URL.format(gid=gid), headers=_luma_headers(), timeout=60)
     _log_http(r, "LUMA.STATUS")
     if r.status_code >= 400:
         raise RuntimeError(r.text)
     return r.json() if r.text else {}
+
 
 def bg_luma_worker(job_id: str, prompt: str, image_url: Optional[str], timeout_sec: int = 900, release_on_exit: bool = False):
     try:
@@ -582,6 +859,7 @@ def bg_luma_worker(job_id: str, prompt: str, image_url: Optional[str], timeout_s
         except Exception:
             pass
 
+
 def _persist_image_to_static_for_luma(src_path: str, job_id: str) -> Optional[str]:
     if not PUBLIC_BASE_URL:
         return None
@@ -609,6 +887,7 @@ def _persist_image_to_static_for_luma(src_path: str, job_id: str) -> Optional[st
         log.warning("[LUMA] persist image failed: %s", e)
         return None
 
+
 # ================================
 # FastAPI app + routes
 # ================================
@@ -622,12 +901,13 @@ async def lifespan(app: FastAPI):
     yield
     log.info("[BOOT] stop")
 
+
 app = FastAPI(title="Solara Backend", lifespan=lifespan)
 
-# ✅ billing（两行之一：include_router）
+# ✅ billing
 app.include_router(billing_router)
 
-# ✅ auth（新增：include_router，让 /auth/apple 返回 access_token）
+# ✅ auth
 app.include_router(auth_router)
 
 app.add_middleware(
@@ -638,7 +918,6 @@ app.add_middleware(
 )
 
 # ---------------- AUTH: Apple (LEGACY, renamed) ----------------
-# ⚠️ 旧实现保留但改名，避免与 auth_router 的 /auth/apple 冲突
 def _decode_jwt_payload_legacy(jwt: str) -> dict:
     """
     Decode JWT payload only (MVP). No signature verification. (LEGACY)
@@ -653,6 +932,7 @@ def _decode_jwt_payload_legacy(jwt: str) -> dict:
         return json.loads(raw.decode("utf-8"))
     except Exception:
         return {}
+
 
 @app.post("/auth/apple_legacy")
 async def auth_apple_legacy(req: Request):
@@ -681,21 +961,129 @@ async def auth_apple_legacy(req: Request):
 
     return {"ok": True, "user_id": user_id, "email": email}
 
-# --------------------------------------------------
 
+# --------------------------------------------------
 app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
+
 
 @app.middleware("http")
 async def audit(req: Request, call_next):
     t0 = time.time()
     resp = await call_next(req)
-    if req.url.path in ("/video", "/luma", "/rt/intent", "/rt/intent_luma", "/session", "/solara/photo"):
+    if req.url.path in ("/video", "/video/remix", "/luma", "/rt/intent", "/rt/intent_luma", "/session", "/solara/photo"):
         ip = req.client.host if req.client else "-"
         log.info("[AUDIT] ip=%s %s %s -> %s in %dms",
                  ip, req.method, req.url.path, resp.status_code, int((time.time()-t0)*1000))
     return resp
 
+
 # ---------------- SORA: create/status/stream ----------------
+async def _save_upload_to_file_and_sha1(upload: UploadFile, dst_path: Path) -> str:
+    """
+    ✅ 分块保存 + 计算 sha1，避免一次性读入内存
+    """
+    h = hashlib.sha1()
+    with open(dst_path, "wb") as f:
+        while True:
+            chunk = await upload.read(1024 * 1024)  # 1MB
+            if not chunk:
+                break
+            f.write(chunk)
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _job_is_active(job: Optional[Dict[str, Any]]) -> bool:
+    if not job:
+        return False
+    st = str(job.get("status") or "").lower().strip()
+    # 我们内部最终态：done / failed
+    if st in ("done", "failed"):
+        return False
+    # 其它都认为 still running/queued
+    return True
+
+
+# ✅✅✅ 对齐 iOS：/video/remix（JSON）
+@app.post("/video/remix")
+async def create_video_remix(request: Request):
+    """
+    iOS createRemixJob() 首选调用的接口：
+    POST /video/remix
+    JSON: { "base_video_id": "video_xxx", "instruction": "..." }
+
+    ✅ 修复点：
+    - 让前端不再 404 回退到 /video + structured prompt（那条回退很容易变“新生成”）
+    - Remix job 明确 mode=remix，并带 remixed_from_video_id 字段
+    """
+    ip = request.client.host if request.client else "unknown"
+
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+
+    base_video_id = _normalize_video_id((body.get("base_video_id") or body.get("video_id") or "").strip())
+    instruction = (body.get("instruction") or body.get("prompt") or "").strip()
+
+    if not base_video_id:
+        return JSONResponse({"ok": False, "error": "missing base_video_id"}, status_code=400)
+
+    # ---- Idempotency: remix 必须包含 base id ----
+    _cleanup_recent()
+    prompt_idem = f"REMIX|{base_video_id}|{instruction}"
+    idem = _idem_key(ip, prompt_idem, "", "")
+    rec = RECENT_KEYS.get(idem)
+    if rec:
+        old_job_id = rec["job_id"]
+        old_job = SORA_JOBS.get(old_job_id)
+        if _job_is_active(old_job):
+            return {
+                "ok": True,
+                "job_id": old_job_id,
+                "status_url": f"/video/status/{old_job_id}",
+                "status": old_job.get("status") if old_job else "running",
+                "remixed_from_video_id": base_video_id,
+            }
+        else:
+            RECENT_KEYS.pop(idem, None)
+
+    # ---- Create job ----
+    job_id = uuid.uuid4().hex
+    SORA_JOBS[job_id] = {
+        "status": "queued",
+        "progress": 0,
+        "prompt": instruction or "Make subtle improvements. Keep everything else the same.",
+        "prompt_raw": json.dumps(body, ensure_ascii=False),
+        "url": None,
+        "file_id": None,
+        "video_id": None,
+        "error": None,
+        "created": int(time.time()),
+        "ref_path": None,
+        "ref_mime": None,
+        "provider": "sora",
+        "seconds": 8,
+        "mode": "remix",
+        "remix_base_video_id": base_video_id,
+        "remix_instruction": instruction or "",
+        "openai_status": None,
+    }
+    RECENT_KEYS[idem] = {"job_id": job_id, "ts": time.time()}
+
+    # ✅ timeout：remix finishing 更久，给更长
+    timeout_sec = 1800
+    _spawn_sora_job(job_id, SORA_JOBS[job_id]["prompt"], timeout_sec=timeout_sec)
+
+    return {
+        "ok": True,
+        "job_id": job_id,
+        "status_url": f"/video/status/{job_id}",
+        "status": "queued",
+        "remixed_from_video_id": base_video_id,
+    }
+
+
 @app.post("/video")
 async def create_video(
     request: Request,
@@ -706,34 +1094,83 @@ async def create_video(
 ):
     ip = request.client.host if request.client else "unknown"
 
-    raw_img = raw_vid = None
-    img_h = vid_h = ""
+    raw_img: Optional[bytes] = None
+    img_h = ""
+    vid_h = ""
+
+    # 为了 idem：先算 hash（视频分块写盘，避免内存峰值）
+    tmp_video_path: Optional[Path] = None
 
     if image_file:
         raw_img = await image_file.read()
-        img_h = _sha1_bytes(raw_img)
+        img_h = _sha1_bytes(raw_img) if raw_img else ""
+
     if video_file:
-        raw_vid = await video_file.read()
-        vid_h = _sha1_bytes(raw_vid)
+        tmp_video_path = UPLOADS_DIR / f"tmp_upload_{uuid.uuid4().hex}.mp4"
+        try:
+            vid_h = await _save_upload_to_file_and_sha1(video_file, tmp_video_path)
+        except Exception:
+            try:
+                if tmp_video_path.exists():
+                    tmp_video_path.unlink()
+            except Exception:
+                pass
+            raise
 
-    if not prompt.strip():
-        prompt = "Generate a video based on the reference media." if (raw_img or raw_vid) else "Generate a video."
+    # -------------- Remix detect (fallback) --------------
+    remix = parse_remix_request(prompt or "")
+    mode = "create"
+    remix_base = ""
+    remix_instruction = ""
 
+    prompt_effective = (prompt or "").strip()
+    prompt_idem = prompt_effective
+
+    if remix:
+        mode = "remix"
+        remix_base = remix.get("base_video_id", "")
+        remix_instruction = (remix.get("instruction", "") or "").strip()
+        prompt_effective = remix_instruction or "Make subtle improvements. Keep everything else the same."
+        # ✅ idem 必须包含 base_id，否则不同 base 视频会误去重
+        prompt_idem = f"REMIX|{remix_base}|{prompt_effective}"
+
+    if not prompt_effective.strip():
+        prompt_effective = "Generate a video based on the reference media." if (raw_img or tmp_video_path) else "Generate a video."
+        prompt_idem = prompt_effective
+
+    # -------------- Idempotency (FIX) --------------
     _cleanup_recent()
-    idem = _idem_key(ip, prompt, img_h, vid_h)
+    idem = _idem_key(ip, prompt_idem, img_h, vid_h)
     rec = RECENT_KEYS.get(idem)
     if rec:
-        return {"ok": True, "job_id": rec["job_id"], "status_url": f"/video/status/{rec['job_id']}", "status": "running"}
+        old_job_id = rec["job_id"]
+        old_job = SORA_JOBS.get(old_job_id)
 
-    if not SORA_SEM.acquire(blocking=False):
-        return JSONResponse({"ok": False, "error": "busy: one sora job already running"}, status_code=429)
+        # ✅ FIX：只有 still active 才复用；done/failed 必须新建 job
+        if _job_is_active(old_job):
+            try:
+                if tmp_video_path and tmp_video_path.exists():
+                    tmp_video_path.unlink()
+            except Exception:
+                pass
+            return {
+                "ok": True,
+                "job_id": old_job_id,
+                "status_url": f"/video/status/{old_job_id}",
+                "status": old_job.get("status") if old_job else "running",
+            }
+        else:
+            # stale -> 删除去重记录，让这次真正创建新 job
+            RECENT_KEYS.pop(idem, None)
 
+    # -------------- Create job --------------
     job_id = uuid.uuid4().hex
     SORA_JOBS[job_id] = {
         "status": "queued",
         "progress": 0,
-        "prompt": prompt,
-        "url": None,          # done 后会写成 /video/stream/{job_id}
+        "prompt": prompt_effective,     # ✅ 真正用于生成的 prompt
+        "prompt_raw": (prompt or ""),   # ✅ 原始 prompt（便于排查）
+        "url": None,                    # done 后会写成 /video/stream/{job_id}
         "file_id": None,
         "video_id": None,
         "error": None,
@@ -742,14 +1179,22 @@ async def create_video(
         "ref_mime": None,
         "provider": "sora",
         "seconds": 8,
+        # remix fields
+        "mode": mode,
+        "remix_base_video_id": remix_base or None,
+        "remix_instruction": remix_instruction or None,
+        "openai_status": None,
     }
+
     RECENT_KEYS[idem] = {"job_id": job_id, "ts": time.time()}
 
     ref_path = None
     ref_mime = None
+
     try:
         target_wh = _parse_size(SORA_SIZE_DEFAULT)
 
+        # image -> resize to target, store as ref
         if raw_img is not None:
             raw_img_resized = _resize_image_bytes(raw_img, target_wh)
             fn = UPLOADS_DIR / f"{job_id}_img.jpg"
@@ -757,9 +1202,11 @@ async def create_video(
             ref_path = str(fn)
             ref_mime = "image/jpeg"
 
-        if raw_vid is not None:
+        # video -> move temp file to job src, optionally resize, generate thumb if no image
+        if tmp_video_path is not None and tmp_video_path.exists():
             src_fn = UPLOADS_DIR / f"{job_id}_vid_src.mp4"
-            src_fn.write_bytes(raw_vid)
+            tmp_video_path.replace(src_fn)
+
             dst_fn = UPLOADS_DIR / f"{job_id}_vid.mp4"
             final_fn = _resize_video_file(str(src_fn), str(dst_fn), target_wh)
 
@@ -769,19 +1216,30 @@ async def create_video(
                 if thumb_path and Path(thumb_path).exists():
                     ref_path = thumb_path
                     ref_mime = "image/jpeg"
+
     except Exception as e:
         log.warning("[SORA] ref prepare failed: %s", e)
 
     SORA_JOBS[job_id]["ref_path"] = ref_path
     SORA_JOBS[job_id]["ref_mime"] = ref_mime
 
-    threading.Thread(target=bg_sora_worker, args=(job_id, prompt, 600, True), daemon=True).start()
-    return {"ok": True, "job_id": job_id, "status_url": f"/video/status/{job_id}", "status": "running"}
+    # ✅ timeout：remix 更容易 finishing 久一点，给更长
+    timeout_sec = 1800 if mode == "remix" else 1200
+
+    # ✅ NEW：排队执行（不再 429 busy）
+    _spawn_sora_job(job_id, prompt_effective, timeout_sec=timeout_sec)
+
+    return {"ok": True, "job_id": job_id, "status_url": f"/video/status/{job_id}", "status": "queued"}
+
+
 @app.get("/video/status/{job_id}")
 def video_status(job_id: str):
     job = SORA_JOBS.get(job_id)
     if not job:
         return JSONResponse({"ok": False, "error": "job not found"}, status_code=404)
+
+    vid = _normalize_video_id(job.get("video_id") or "")
+
     return {
         "ok": True,
         "status": job.get("status"),
@@ -789,10 +1247,85 @@ def video_status(job_id: str):
         "url": job.get("url"),           # ✅ done 后是 /video/stream/{job_id}
         "file_id": job.get("file_id"),
         "error": job.get("error"),
-        "video_id": job.get("video_id"),
+
+        # ✅ 兼容字段：你 iOS 里会从 openai_video_id / video_id 取
+        "video_id": vid,                 # legacy / existing
+        "openai_video_id": vid,          # ✅ NEW: server authoritative
+        "remixed_from_video_id": job.get("remix_base_video_id") if (job.get("mode") == "remix") else None,
+
         "provider": "sora",
         "seconds": 8,
+
+        # ✅ NEW：稳定字段，便于 iOS 显示与排查
+        "mode": job.get("mode"),
+        "remix_base_video_id": job.get("remix_base_video_id"),
+        "remix_instruction": job.get("remix_instruction"),
+        "openai_status": job.get("openai_status"),
     }
+
+
+def _streaming_proxy_response(r: requests.Response, media_type_default: str = "video/mp4") -> StreamingResponse:
+    proxy_headers = {k: r.headers[k] for k in ["Content-Type", "Content-Length", "Content-Range", "Accept-Ranges"] if k in r.headers}
+
+    def gen():
+        try:
+            for c in r.iter_content(128 * 1024):
+                if c:
+                    yield c
+        finally:
+            try:
+                r.close()
+            except Exception:
+                pass
+
+    return StreamingResponse(
+        gen(),
+        media_type=r.headers.get("Content-Type", media_type_default),
+        headers=proxy_headers,
+        status_code=(r.status_code if r.status_code in (200, 206) else 200)
+    )
+
+
+def _fetch_sora_content_response(video_id: str, range_header: Optional[str]) -> requests.Response:
+    """
+    ✅ NEW：加轻量重试，解决 completed 后 content 可能短暂 404/409 的竞态
+    """
+    vid = _normalize_video_id(video_id)
+    content_url = f"https://api.openai.com/v1/videos/{vid}/content"
+
+    headers = {"Authorization": f"Bearer {SORA_API_KEY}", "OpenAI-Beta": "video-generation=v1"}
+    if OPENAI_ORG_ID:
+        headers["OpenAI-Organization"] = OPENAI_ORG_ID
+    if range_header:
+        headers["Range"] = range_header
+
+    backoffs = [0.5, 1.0, 2.0, 4.0]
+    last = None
+
+    for i in range(len(backoffs) + 1):
+        r = requests.get(content_url, headers=headers, stream=True, allow_redirects=False, timeout=120)
+
+        # redirect -> return it to caller处理二跳
+        if r.status_code in (302, 303):
+            return r
+
+        if r.status_code in (200, 206):
+            return r
+
+        # 某些时候 content 会短暂未就绪
+        if r.status_code in (404, 409, 425, 500, 502, 503, 504) and i < len(backoffs):
+            try:
+                r.close()
+            except Exception:
+                pass
+            time.sleep(backoffs[i])
+            last = r
+            continue
+
+        return r
+
+    return last
+
 
 @app.get("/video/stream/{job_id}")
 def video_stream(job_id: str, range_header: Optional[str] = Header(None, alias="Range")):
@@ -800,7 +1333,8 @@ def video_stream(job_id: str, range_header: Optional[str] = Header(None, alias="
     ✅ 修复点：
     - Sora 统一用 /v1/videos/{video_id}/content
     - 同时支持 302/303 redirect 和 200/206 直接返回
-    - 支持 Range
+    - 支持 Range（包括 redirect 后二跳仍带 Range）
+    - completed 后 content 竞态：轻量重试
     """
     job = SORA_JOBS.get(job_id)
     if not job:
@@ -812,74 +1346,84 @@ def video_stream(job_id: str, range_header: Optional[str] = Header(None, alias="
     if not fid and not vid:
         return JSONResponse({"ok": False, "error": "video not ready"}, status_code=409)
 
+    # ---- files content path (if you ever use file_id) ----
     if fid:
         files_url = f"https://api.openai.com/v1/files/{fid}/content"
         headers = {"Authorization": f"Bearer {OPENAI_API_KEY}"}
         if range_header:
             headers["Range"] = range_header
         r = requests.get(files_url, headers=headers, stream=True, timeout=120)
+        return _streaming_proxy_response(r)
 
-        proxy_headers = {k: r.headers[k] for k in ["Content-Type", "Content-Length", "Content-Range", "Accept-Ranges"] if k in r.headers}
+    # ---- sora video content (official) ----
+    rc = _fetch_sora_content_response(vid, range_header)
 
-        def gen_file():
-            for c in r.iter_content(128 * 1024):
-                if c:
-                    yield c
-
-        return StreamingResponse(
-            gen_file(),
-            media_type=r.headers.get("Content-Type", "video/mp4"),
-            headers=proxy_headers,
-            status_code=(r.status_code if r.status_code in (200, 206) else 200)
-        )
-
-    content_url = f"https://api.openai.com/v1/videos/{vid}/content"
-    headers = {"Authorization": f"Bearer {SORA_API_KEY}", "OpenAI-Beta": "video-generation=v1"}
-    if OPENAI_ORG_ID:
-        headers["OpenAI-Organization"] = OPENAI_ORG_ID
-    if range_header:
-        headers["Range"] = range_header
-
-    rc = requests.get(content_url, headers=headers, stream=True, allow_redirects=False, timeout=120)
-
+    # redirect -> fetch real location (keep Range!)
     if rc.status_code in (302, 303) and rc.headers.get("Location"):
         loc = rc.headers["Location"]
-        r2 = requests.get(loc, stream=True, timeout=120)
+        try:
+            rc.close()
+        except Exception:
+            pass
 
-        proxy_headers = {k: r2.headers[k] for k in ["Content-Type", "Content-Length", "Content-Range", "Accept-Ranges"] if k in r2.headers}
-
-        def gen_loc():
-            for c in r2.iter_content(128 * 1024):
-                if c:
-                    yield c
-
-        return StreamingResponse(
-            gen_loc(),
-            media_type=r2.headers.get("Content-Type", "video/mp4"),
-            headers=proxy_headers,
-            status_code=(r2.status_code if r2.status_code in (200, 206) else 200)
-        )
+        headers2 = {}
+        if range_header:
+            headers2["Range"] = range_header
+        r2 = requests.get(loc, headers=headers2, stream=True, timeout=120)
+        return _streaming_proxy_response(r2)
 
     if rc.status_code in (200, 206):
-        proxy_headers = {k: rc.headers[k] for k in ["Content-Type", "Content-Length", "Content-Range", "Accept-Ranges"] if k in rc.headers}
-
-        def gen_content():
-            for c in rc.iter_content(128 * 1024):
-                if c:
-                    yield c
-
-        return StreamingResponse(
-            gen_content(),
-            media_type=rc.headers.get("Content-Type", "video/mp4"),
-            headers=proxy_headers,
-            status_code=rc.status_code
-        )
+        return _streaming_proxy_response(rc)
 
     try:
         detail = rc.text[:400]
     except Exception:
         detail = ""
+    try:
+        rc.close()
+    except Exception:
+        pass
     return JSONResponse({"ok": False, "error": f"content fetch failed: {rc.status_code}", "detail": detail}, status_code=502)
+
+
+@app.get("/video/content/{video_id}")
+def video_content(video_id: str, range_header: Optional[str] = Header(None, alias="Range")):
+    """
+    ✅ NEW：按 OpenAI video_id 直接代理 content
+    （满足你之前“提供无需客户端鉴权的内容下载”要求，避免 iOS 直连 OpenAI 401）
+    """
+    vid = _normalize_video_id(video_id)
+    if not vid:
+        return JSONResponse({"ok": False, "error": "invalid video_id"}, status_code=400)
+
+    rc = _fetch_sora_content_response(vid, range_header)
+
+    if rc.status_code in (302, 303) and rc.headers.get("Location"):
+        loc = rc.headers["Location"]
+        try:
+            rc.close()
+        except Exception:
+            pass
+
+        headers2 = {}
+        if range_header:
+            headers2["Range"] = range_header
+        r2 = requests.get(loc, headers=headers2, stream=True, timeout=120)
+        return _streaming_proxy_response(r2)
+
+    if rc.status_code in (200, 206):
+        return _streaming_proxy_response(rc)
+
+    try:
+        detail = rc.text[:400]
+    except Exception:
+        detail = ""
+    try:
+        rc.close()
+    except Exception:
+        pass
+    return JSONResponse({"ok": False, "error": f"content fetch failed: {rc.status_code}", "detail": detail}, status_code=502)
+
 
 # ---------------- LUMA: create/status/stream ----------------
 @app.post("/luma")
@@ -897,7 +1441,7 @@ async def create_luma(
     img_h = ""
     if image_file:
         raw_img = await image_file.read()
-        img_h = _sha1_bytes(raw_img)
+        img_h = _sha1_bytes(raw_img) if raw_img else ""
 
     if not prompt.strip():
         prompt = "Generate a clean vertical mobile video."
@@ -955,6 +1499,7 @@ async def create_luma(
     threading.Thread(target=bg_luma_worker, args=(job_id, prompt, image_url, 900, True), daemon=True).start()
     return {"ok": True, "job_id": job_id, "status_url": f"/luma/status/{job_id}", "status": "running"}
 
+
 @app.get("/luma/status/{job_id}")
 def luma_status_api(job_id: str):
     job = LUMA_JOBS.get(job_id)
@@ -973,6 +1518,7 @@ def luma_status_api(job_id: str):
         "cost_credits_estimate": 110,
     }
 
+
 @app.get("/luma/stream/{job_id}")
 def luma_stream(job_id: str, range_header: Optional[str] = Header(None, alias="Range")):
     job = LUMA_JOBS.get(job_id)
@@ -987,17 +1533,8 @@ def luma_stream(job_id: str, range_header: Optional[str] = Header(None, alias="R
     if range_header:
         headers["Range"] = range_header
     r = requests.get(url, headers=headers, stream=True, timeout=120)
+    return _streaming_proxy_response(r)
 
-    proxy_headers = {k: r.headers[k] for k in ["Content-Type", "Content-Length", "Content-Range", "Accept-Ranges"] if k in r.headers}
-
-    def gen():
-        for c in r.iter_content(128 * 1024):
-            if c:
-                yield c
-
-    return StreamingResponse(gen(), media_type=r.headers.get("Content-Type", "video/mp4"),
-                             headers=proxy_headers,
-                             status_code=(r.status_code if r.status_code in (200, 206) else 200))
 
 # ---------------- Photo cache ----------------
 @app.post("/solara/photo")
@@ -1024,17 +1561,12 @@ async def solara_photo(req: Request, session_id: str = Form(""), image_file: Upl
     SOLARA_LAST_MEDIA[sk] = {"type": "image", "path": str(p), "mime": "image/jpeg", "ts": int(time.time())}
     return {"ok": True, "session_id": sk, "path": str(p), "mime": "image/jpeg"}
 
+
 # ================================
 # Realtime session + intent_sora + intent_luma + health + run
 # ================================
 REALTIME_SESS_URL = "https://api.openai.com/v1/realtime/sessions"
 
-SORA_REALTIME_INSTRUCTIONS = """
-你是「GPT Solara」的即時語音版本，透過 Realtime 模型和使用者自然對話。
-你是全能型語音助手，可以幫忙聊天、查資訊、講解知識、討論程式與產品、一起規劃生活與工作。
-
-只有在使用者主動提到「短視頻 / 影片 / 生成視頻」時，才幫他整理成清楚的生成描述。
-""".strip()
 
 def _realtime_ephemeral(model: str, voice: str, instructions: Optional[str] = None):
     body: Dict[str, Any] = {"model": model, "voice": voice}
@@ -1053,6 +1585,7 @@ def _realtime_ephemeral(model: str, voice: str, instructions: Optional[str] = No
     if not key:
         return None, "missing ephemeral key"
     return key, None
+
 
 @app.post("/session")
 async def session_post(req: Request):
@@ -1080,10 +1613,12 @@ async def session_post(req: Request):
         "voice": voice,
     }
 
+
 def _session_key(req: Request, session_id: str) -> str:
     ip = req.client.host if req.client else "unknown"
     sid = (session_id or "default").strip()
     return f"{ip}:{sid}"
+
 
 def _append_turn(session_key: str, role: str, text: str, media: Optional[Dict[str, Any]] = None):
     sess = SOLARA_SESSIONS.setdefault(session_key, {"turns": []})
@@ -1093,6 +1628,7 @@ def _append_turn(session_key: str, role: str, text: str, media: Optional[Dict[st
     sess["turns"].append(turn)
     if len(sess["turns"]) > SOLARA_MAX_TURNS:
         sess["turns"] = sess["turns"][-SOLARA_MAX_TURNS:]
+
 
 @app.post("/rt/intent")
 async def rt_intent(req: Request):
@@ -1108,9 +1644,6 @@ async def rt_intent(req: Request):
     session_id = (body.get("session_id") or body.get("conversation_id") or "").strip()
     sk = _session_key(req, session_id)
 
-    if not SORA_SEM.acquire(blocking=False):
-        return JSONResponse({"ok": False, "error": "busy"}, status_code=429)
-
     job_id = uuid.uuid4().hex
 
     last_media = SOLARA_LAST_MEDIA.get(sk) or {}
@@ -1121,6 +1654,7 @@ async def rt_intent(req: Request):
         "status": "queued",
         "progress": 0,
         "prompt": prompt,
+        "prompt_raw": prompt,
         "url": None,
         "file_id": None,
         "video_id": None,
@@ -1130,12 +1664,19 @@ async def rt_intent(req: Request):
         "ref_mime": ref_mime,
         "provider": "sora",
         "seconds": 8,
+        "mode": "create",
+        "remix_base_video_id": None,
+        "remix_instruction": None,
+        "openai_status": None,
     }
 
     _append_turn(sk, "user", f"^SORA_INTENT: {prompt}", media=(last_media if last_media else None))
 
-    threading.Thread(target=bg_sora_worker, args=(job_id, prompt, 600, True), daemon=True).start()
+    # ✅ NEW：排队执行（不再 busy=429）
+    _spawn_sora_job(job_id, prompt, timeout_sec=1200)
+
     return {"ok": True, "job_id": job_id, "status_url": f"/video/status/{job_id}", "session_id": sk}
+
 
 @app.post("/rt/intent_luma")
 async def rt_intent_luma(req: Request):
@@ -1183,6 +1724,7 @@ async def rt_intent_luma(req: Request):
     threading.Thread(target=bg_luma_worker, args=(job_id, prompt, image_url, 900, True), daemon=True).start()
     return {"ok": True, "job_id": job_id, "status_url": f"/luma/status/{job_id}", "session_id": sk}
 
+
 @app.get("/health")
 def health():
     return {
@@ -1193,8 +1735,10 @@ def health():
         "public_base_url": PUBLIC_BASE_URL or "",
         "endpoints": {
             "sora_create": "/video",
+            "sora_remix": "/video/remix",
             "sora_status": "/video/status/{job_id}",
             "sora_stream": "/video/stream/{job_id}",
+            "sora_content": "/video/content/{video_id}",
             "luma_create": "/luma",
             "luma_status": "/luma/status/{job_id}",
             "luma_stream": "/luma/stream/{job_id}",
@@ -1205,6 +1749,19 @@ def health():
         },
     }
 
+
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("server_session:app", host="0.0.0.0", port=8000, reload=False, log_level="info", access_log=False)
+    uvicorn.run(
+        "server_session:app",
+        host="0.0.0.0",
+        port=8000,
+        reload=False,
+        log_level="info",
+        access_log=False
+    )
+# ================================
+# server_session.py  (FULL, STABLE)
+# ✅ Remix 链路对齐版：支持 /video/remix + 修复 remix prompt
+# ================================
+
