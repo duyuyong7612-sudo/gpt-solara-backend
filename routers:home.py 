@@ -1,0 +1,534 @@
+"""
+routers/home_automation.py
+
+Solara Home Automation (Pi light) — Commercial-grade alignment
+------------------------------------------------------------
+
+Goals:
+- App binds gateway + device profile JSON to backend.
+- Backend stores binding per "client identity" (client_id) with IP fallback.
+- /session auto-switches to a dedicated "home-only" Realtime assistant when a binding exists.
+- Assistant emits a single machine-readable line:
+    HOME_CMD: {"cmd":"light_on"}  / {"cmd":"light_off"}  / {"cmd":"light_toggle"}
+- App parses HOME_CMD and calls /home/dispatch to actually hit the gateway.
+
+Design notes:
+- For local dev, client_id is optional; key defaults to requester IP.
+- For commercial deployments, ALWAYS pass a stable client_id (e.g., user account id, device id),
+  via JSON field "client_id" or header "X-Client-ID".
+- In-memory store is OK for local / single-instance; replace with Redis/DB for production.
+"""
+
+from __future__ import annotations
+
+import json
+import time
+import uuid
+import re
+from typing import Any, Dict, Optional, Tuple
+
+import requests
+from fastapi import APIRouter, Request
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel, Field
+
+router = APIRouter(prefix="/home", tags=["home-automation"])
+
+# -----------------------------
+# Storage (in-memory)
+# -----------------------------
+
+_HOME_BINDINGS: Dict[str, Dict[str, Any]] = {}
+_HOME_LOCK = __import__("threading").Lock()
+HOME_BIND_TTL_SEC = int(__import__("os").getenv("HOME_BIND_TTL_SEC") or "86400")  # 24h default
+
+
+def _now() -> float:
+    return time.time()
+
+
+def _cleanup() -> None:
+    now = _now()
+    with _HOME_LOCK:
+        for k in list(_HOME_BINDINGS.keys()):
+            b = _HOME_BINDINGS.get(k) or {}
+            ts = float(b.get("updated_at") or 0)
+            if ts and (now - ts) > HOME_BIND_TTL_SEC:
+                _HOME_BINDINGS.pop(k, None)
+
+
+def _client_ip(req: Request) -> str:
+    try:
+        if req.client and req.client.host:
+            return req.client.host
+    except Exception:
+        pass
+    return "unknown"
+
+
+def _client_id_from(req: Request, client_id: Optional[str]) -> Optional[str]:
+    if client_id and str(client_id).strip():
+        return str(client_id).strip()
+    h = (req.headers.get("x-client-id") or req.headers.get("x-device-id") or "").strip()
+    return h or None
+
+
+def _binding_key(req: Request, client_id: Optional[str]) -> str:
+    cid = _client_id_from(req, client_id)
+    if cid:
+        return f"cid:{cid}"
+    # fallback for local dev
+    return f"ip:{_client_ip(req)}"
+
+
+def _norm_url(u: str) -> str:
+    s = (u or "").strip()
+    while s.endswith("/"):
+        s = s[:-1]
+    return s
+
+
+def _looks_like_http_url(s: str) -> bool:
+    ss = (s or "").strip().lower()
+    return ss.startswith("http://") or ss.startswith("https://")
+
+
+def _safe_url_or_none(s: str) -> Optional[str]:
+    """
+    Basic safety: allow only http(s).
+    (If you deploy publicly, you should also add SSRF protection / allow-lists.)
+    """
+    u = _norm_url(s)
+    if not u:
+        return None
+    if not _looks_like_http_url(u):
+        return None
+    return u
+
+
+def _extract_gateway_from_profile(profile_json: str) -> Optional[str]:
+    try:
+        obj = json.loads(profile_json)
+        if isinstance(obj, dict):
+            for k in ("gateway", "gateway_url", "gatewayBaseURL", "gateway_base_url", "pi_base_url", "base_url"):
+                v = obj.get(k)
+                if isinstance(v, str) and _looks_like_http_url(v):
+                    return _norm_url(v)
+    except Exception:
+        pass
+    return None
+
+
+def _extract_commands_from_profile(profile_json: str) -> Dict[str, Dict[str, str]]:
+    out: Dict[str, Dict[str, str]] = {}
+    if not profile_json:
+        return out
+    try:
+        obj = json.loads(profile_json)
+        if not isinstance(obj, dict):
+            return out
+        cmds = obj.get("commands")
+        if not isinstance(cmds, list):
+            return out
+        for c in cmds:
+            if not isinstance(c, dict):
+                continue
+            name = str(c.get("name") or "").strip()
+            method = str(c.get("method") or "POST").strip().upper()
+            path = str(c.get("path") or "").strip()
+            if not name or not path:
+                continue
+            if not path.startswith("/"):
+                path = "/" + path
+            if method not in ("GET", "POST", "PUT", "PATCH", "DELETE"):
+                method = "POST"
+            out[name] = {"method": method, "path": path}
+    except Exception:
+        # profile might be plain text (not json) — ignore
+        pass
+    return out
+
+
+def _extract_device_name(profile_json: str) -> Optional[str]:
+    try:
+        obj = json.loads(profile_json)
+        if isinstance(obj, dict):
+            v = obj.get("device") or obj.get("name")
+            if isinstance(v, str) and v.strip():
+                return v.strip()
+    except Exception:
+        pass
+    return None
+
+
+def _extract_examples(profile_json: str) -> Optional[list]:
+    try:
+        obj = json.loads(profile_json)
+        if isinstance(obj, dict):
+            ex = obj.get("examples")
+            if isinstance(ex, list) and ex:
+                return ex
+    except Exception:
+        pass
+    return None
+
+
+def home_has_binding(req: Request, client_id: Optional[str] = None) -> bool:
+    _cleanup()
+    key = _binding_key(req, client_id)
+    with _HOME_LOCK:
+        return key in _HOME_BINDINGS
+
+
+def _get_binding(req: Request, client_id: Optional[str] = None) -> Optional[Dict[str, Any]]:
+    _cleanup()
+    key = _binding_key(req, client_id)
+    with _HOME_LOCK:
+        b = _HOME_BINDINGS.get(key)
+    return b
+
+
+# -----------------------------
+# Instruction builder (Realtime system prompt)
+# -----------------------------
+
+def home_instructions_for_request(req: Request, client_id: Optional[str] = None) -> Optional[str]:
+    """
+    Build a strict "home-only" assistant definition for Realtime.
+    This prompt is intentionally restrictive for commercial reliability.
+    """
+    b = _get_binding(req, client_id)
+    if not b:
+        return None
+
+    device_display = (b.get("display_name") or b.get("device_name") or b.get("device") or "家居设备").strip()
+    cmds = list((b.get("commands") or {}).keys()) or ["light_on", "light_off", "light_toggle"]
+    examples = b.get("examples") or ["打开灯", "关灯", "切换灯"]
+
+    # Hard rules: output HOME_CMD line only when a command should be executed.
+    return (
+        "你是【家居控制专用助手】（Home Automation Assistant）。\n"
+        "你的唯一目标：帮助用户用语音控制家里的设备；不要做闲聊、不要写长文、不要编造信息。\n"
+        "\n"
+        f"【已绑定设备】{device_display}\n"
+        f"【可用命令】{', '.join(cmds)}\n"
+        f"【用户口令示例】{', '.join([str(x) for x in examples])}\n"
+        "\n"
+        "【执行规则（非常重要）】\n"
+        "1) 当且仅当用户明确表达“开灯/关灯/切换灯”等控制意图时，才执行命令。\n"
+        "2) 执行时：先用一句中文极简确认（<= 12 字），然后立刻输出一行机器指令：\n"
+        "   HOME_CMD: {\"cmd\":\"light_on\"}\n"
+        "   HOME_CMD: {\"cmd\":\"light_off\"}\n"
+        "   HOME_CMD: {\"cmd\":\"light_toggle\"}\n"
+        "3) HOME_CMD 这一行必须独占一行、必须是严格 JSON，不要追加任何解释、不要多字。\n"
+        "4) 如果用户不是控制意图（例如闲聊/问天气/让你写文案），请礼貌拒绝并引导他说控制口令。\n"
+        "5) 你永远不直接访问网关；实际请求由客户端调用 /home/dispatch 完成。\n"
+    )
+
+
+# -----------------------------
+# Models
+# -----------------------------
+
+class GatewayProfileIn(BaseModel):
+    # Client identity (commercial)
+    client_id: Optional[str] = Field(default=None, description="Stable client identifier. Prefer passing this in production.")
+    session_id: Optional[str] = None  # optional legacy
+
+    # gateway
+    gateway_base_url: Optional[str] = None
+    gatewayBaseURL: Optional[str] = None
+    gateway_url: Optional[str] = None
+    gatewayUrl: Optional[str] = None
+    gateway: Optional[str] = None
+    pi_base_url: Optional[str] = None
+    base_url: Optional[str] = None
+
+    # auth
+    gateway_token: Optional[str] = None
+    bearer: Optional[str] = None
+    token: Optional[str] = None
+
+    # profile json/text
+    profile_json: Optional[str] = None
+    profileJSON: Optional[str] = None
+    profile: Optional[str] = None
+    device_profile: Optional[Dict[str, Any]] = None
+
+    # media url (optional)
+    profile_media_url: Optional[str] = None
+    profileMediaURL: Optional[str] = None
+
+    # UI
+    display_name: Optional[str] = None
+
+
+class DispatchIn(BaseModel):
+    client_id: Optional[str] = None
+    session_id: Optional[str] = None  # legacy
+    cmd: Optional[str] = None
+    command: Optional[str] = None
+    action: Optional[str] = None
+    text: Optional[str] = None
+    utterance: Optional[str] = None
+    prompt: Optional[str] = None
+
+
+# -----------------------------
+# Bind endpoints
+# -----------------------------
+
+def _extract_gateway_from_body(raw: Dict[str, Any], profile_json: str) -> Optional[str]:
+    # prefer explicit gateway fields
+    for k in ("gateway_base_url", "gatewayBaseURL", "gateway_url", "gatewayUrl", "gateway", "pi_base_url", "base_url"):
+        v = raw.get(k)
+        if isinstance(v, str):
+            u = _safe_url_or_none(v)
+            if u:
+                return u
+
+    # fallback: profile json includes gateway
+    g2 = _extract_gateway_from_profile(profile_json)
+    if g2:
+        return _safe_url_or_none(g2)
+    return None
+
+
+def _extract_profile_json(raw: Dict[str, Any]) -> str:
+    if isinstance(raw.get("device_profile"), dict):
+        try:
+            return json.dumps(raw["device_profile"], ensure_ascii=False)
+        except Exception:
+            pass
+
+    for k in ("profile_json", "profileJSON", "profile"):
+        v = raw.get(k)
+        if isinstance(v, str) and v.strip():
+            return v.strip()
+    return ""
+
+
+def _extract_token(raw: Dict[str, Any]) -> Optional[str]:
+    for k in ("gateway_token", "token", "bearer"):
+        v = raw.get(k)
+        if isinstance(v, str) and v.strip():
+            return v.strip()
+    return None
+
+
+def _headers_for_gateway(token: Optional[str]) -> Dict[str, str]:
+    t = (token or "").strip()
+    if not t:
+        return {}
+    if t.lower().startswith("bearer "):
+        return {"Authorization": t}
+    return {"Authorization": f"Bearer {t}"}
+
+
+@router.post("/gateway_profile")
+async def set_gateway_profile(req: Request, body: GatewayProfileIn):
+    raw = body.model_dump(exclude_none=True)
+
+    # client key
+    key = _binding_key(req, raw.get("client_id"))
+    ip_key = f"ip:{_client_ip(req)}"
+
+    profile_json = _extract_profile_json(raw)
+    token = _extract_token(raw)
+    display_name = str(raw.get("display_name") or "").strip() or None
+
+    gateway = _extract_gateway_from_body(raw, profile_json)
+    if not gateway:
+        return JSONResponse(
+            {"ok": False, "error": "missing gateway url", "hint": "请提供 gateway_base_url/gateway 或在 profile_json 里包含 gateway 字段"},
+            status_code=400,
+        )
+
+    # parse commands/device name
+    commands = _extract_commands_from_profile(profile_json)
+    device_name = _extract_device_name(profile_json)
+    examples = _extract_examples(profile_json)
+
+    bind_id = uuid.uuid4().hex
+    updated_at = _now()
+
+    # optional: ping health
+    health_ok = None
+    health_data = None
+    try:
+        r = requests.get(gateway + "/health", headers=_headers_for_gateway(token), timeout=2.5)
+        health_ok = 200 <= r.status_code < 300
+        if health_ok:
+            try:
+                health_data = r.json()
+            except Exception:
+                health_data = (r.text or "")[:300]
+    except Exception:
+        health_ok = None
+
+    rec = {
+        "bind_id": bind_id,
+        "key": key,
+        "ip_key": ip_key,
+        "gateway": gateway,
+        "token": token,  # do NOT log this
+        "profile_json": profile_json,
+        "profile_media_url": str(raw.get("profile_media_url") or raw.get("profileMediaURL") or "").strip() or None,
+        "commands": commands,
+        "device_name": device_name,
+        "display_name": display_name,
+        "examples": examples,
+        "health_ok": health_ok,
+        "health_data": health_data,
+        "updated_at": updated_at,
+    }
+
+    _cleanup()
+    with _HOME_LOCK:
+        _HOME_BINDINGS[key] = rec
+        _HOME_BINDINGS[ip_key] = rec  # IP alias for /session calls that don't send client_id
+
+    return {
+        "ok": True,
+        "bind_id": bind_id,
+        "key": key,
+        "gateway": gateway,
+        "device_name": device_name,
+        "display_name": display_name,
+        "commands": list(commands.keys()) if commands else [],
+        "health_ok": health_ok,
+        "updated_at": updated_at,
+    }
+
+
+# Compatibility aliases for older clients / different naming
+@router.post("/bind")
+async def bind_alias(req: Request, body: GatewayProfileIn):
+    return await set_gateway_profile(req, body)
+
+@router.post("/device_profile")
+async def device_profile_alias(req: Request, body: GatewayProfileIn):
+    return await set_gateway_profile(req, body)
+
+
+@router.get("/gateway_profile")
+async def get_gateway_profile(req: Request, client_id: Optional[str] = None):
+    key = _binding_key(req, client_id)
+    b = _get_binding(req, client_id)
+    if not b:
+        return {"ok": True, "bound": False, "key": key, "binding": None}
+    # sanitize token
+    b2 = dict(b)
+    if "token" in b2:
+        b2["token"] = "***"
+    return {"ok": True, "bound": True, "key": key, "binding": b2}
+
+
+@router.get("/instructions")
+async def get_instructions(req: Request, client_id: Optional[str] = None):
+    inst = home_instructions_for_request(req, client_id=client_id)
+    if not inst:
+        return {"ok": True, "bound": False, "instructions": None}
+    return {"ok": True, "bound": True, "instructions": inst}
+
+
+# -----------------------------
+# Dispatch endpoint
+# -----------------------------
+
+_CMD_RE = re.compile(r"HOME_CMD:\s*(\{.*\})", re.I)
+
+def _infer_cmd_from_text(t: str) -> Optional[str]:
+    s = (t or "").strip().lower()
+    if not s:
+        return None
+    # CN + EN
+    if any(k in s for k in ("开灯", "打开灯", "turn on", "light on", "switch on", "on the light")):
+        return "light_on"
+    if any(k in s for k in ("关灯", "关闭灯", "turn off", "light off", "switch off", "off the light")):
+        return "light_off"
+    if any(k in s for k in ("切换", "toggle", "翻转")):
+        return "light_toggle"
+    return None
+
+
+def _extract_cmd_from_any(raw: Dict[str, Any]) -> Optional[str]:
+    for k in ("cmd", "command", "action"):
+        v = raw.get(k)
+        if isinstance(v, str) and v.strip():
+            return v.strip()
+
+    # if app accidentally sends assistant text with HOME_CMD line
+    for k in ("text", "utterance", "prompt"):
+        v = raw.get(k)
+        if isinstance(v, str) and v.strip():
+            m = _CMD_RE.search(v)
+            if m:
+                try:
+                    obj = json.loads(m.group(1))
+                    if isinstance(obj, dict) and isinstance(obj.get("cmd"), str):
+                        return obj["cmd"].strip()
+                except Exception:
+                    pass
+            c = _infer_cmd_from_text(v)
+            if c:
+                return c
+
+    return None
+
+
+@router.post("/dispatch")
+async def dispatch(req: Request, body: DispatchIn):
+    raw = body.model_dump(exclude_none=True)
+
+    b = _get_binding(req, raw.get("client_id"))
+    if not b:
+        return JSONResponse(
+            {"ok": False, "error": "not_bound", "hint": "请先调用 /home/gateway_profile 绑定网关与设备参数"},
+            status_code=409,
+        )
+
+    cmd = _extract_cmd_from_any(raw)
+    if not cmd:
+        return JSONResponse({"ok": False, "error": "missing cmd/action/text"}, status_code=400)
+
+    cmd = str(cmd).strip()
+
+    commands: Dict[str, Dict[str, str]] = b.get("commands") or {}
+    if not commands:
+        # default pi light map
+        commands = {
+            "light_on": {"method": "POST", "path": "/light/on"},
+            "light_off": {"method": "POST", "path": "/light/off"},
+            "light_toggle": {"method": "POST", "path": "/light/toggle"},
+        }
+
+    spec = commands.get(cmd)
+    if not spec:
+        return JSONResponse({"ok": False, "error": "unknown_cmd", "cmd": cmd, "known": list(commands.keys())}, status_code=400)
+
+    method = (spec.get("method") or "POST").upper()
+    path = (spec.get("path") or "").strip()
+    if not path.startswith("/"):
+        path = "/" + path if path else ""
+
+    gateway = _safe_url_or_none(str(b.get("gateway") or ""))
+    if not gateway:
+        return JSONResponse({"ok": False, "error": "invalid_gateway"}, status_code=500)
+
+    url = gateway + path
+    headers = _headers_for_gateway(b.get("token"))
+
+    try:
+        if method == "GET":
+            r = requests.get(url, headers=headers, timeout=4.5)
+        else:
+            r = requests.post(url, headers=headers, timeout=4.5)
+        ok = 200 <= r.status_code < 300
+        try:
+            data = r.json()
+        except Exception:
+            data = (r.text or "")[:800]
+        return {"ok": ok, "cmd": cmd, "url": url, "status": r.status_code, "resp": data}
+    except Exception as e:
+        return JSONResponse({"ok": False, "error": "gateway_request_failed", "detail": str(e), "cmd": cmd, "url": url}, status_code=502)
