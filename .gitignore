@@ -1,10 +1,40 @@
-.env
-.memory
+# python
 __pycache__/
 *.pyc
+*.pyo
+*.pyd
+
+# env
+.env
+.venv/
+venv/
+
+# local data
+memory.sqlite3
+memory.sqlite3-wal
+memory.sqlite3-shm
+billing_store.json
+uploads/
+downloads/
+data/
+media/
+media_store.pyc
+
+# media / misc
+*.mp4
+.DS_Store
+
+# local runtime data
+_media/
+uploads/
+downloads/
+MP3/
+OpenAI/
+SSE/
+*.sqlite3
+*.sqlite3-wal
+*.sqlite3-shm
+.env
 .venv/
 .venv311/
-uploads/
-media/
 .DS_Store
-_media/
