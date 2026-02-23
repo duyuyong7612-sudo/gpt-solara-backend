@@ -8919,7 +8919,16 @@ def health():
             "home_dispatch": "/home/dispatch",
         },
     }
-
+# ---- Fix OpenAPI 500 (Pydantic v2 ForwardRef) ----
+try:
+    V2RegisterReq.model_rebuild()
+    V2LoginReq.model_rebuild()
+    V2CommentReq.model_rebuild()
+    V2ShareReq.model_rebuild()
+    V2RecoEventReq.model_rebuild()
+    V2DMMessageReq.model_rebuild()
+except Exception:
+    pass
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(
