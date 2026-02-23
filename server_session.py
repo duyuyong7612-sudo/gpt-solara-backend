@@ -3048,7 +3048,7 @@ def sora_create(prompt: str, ref_path: Optional[str] = None, ref_mime: Optional[
             _log_http(r, f"SORA.CREATE[ref:{mime}]")
         except Exception as e:
             log.warning("[SORA] create with ref failed -> text-only fallback: %s", e)
-            body = {"model": model, "prompt": prompt_final, "seconds": sec, "size": size}
+            body = {"model": model, "prompt": prompt_final, "seconds": str(sec), "size": size}
             r = requests.post(url, headers=_json_headers(), json=body, timeout=60)
             _log_http(r, f"SORA.CREATE[{model}]")
         finally:
@@ -3058,7 +3058,7 @@ def sora_create(prompt: str, ref_path: Optional[str] = None, ref_mime: Optional[
             except Exception:
                 pass
     else:
-        body = {"model": model, "prompt": prompt_final, "seconds": sec, "size": size}
+        body = {"model": model, "prompt": prompt_final, "seconds": str(sec), "size": size}
         r = requests.post(url, headers=_json_headers(), json=body, timeout=60)
         _log_http(r, f"SORA.CREATE[{model}]")
 
