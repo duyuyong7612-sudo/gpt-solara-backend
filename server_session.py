@@ -46,6 +46,7 @@ from array import array
 
 from pathlib import Path
 from typing import Optional, Dict, Any, Tuple, Iterator, List
+from pydantic import BaseModel, ConfigDict
 from contextlib import asynccontextmanager
 
 import requests
@@ -8036,6 +8037,43 @@ async def v1_video_stream(video_id: str, request: Request):
         media_type=mime,
         filename=os.path.basename(file_path),
     )
+
+# -----------------------------------------------------------------------------
+# v2 request models (Pydantic)
+# Fix for Render /openapi.json 500: these types were referenced by v2 routes
+# but were never defined, which breaks FastAPI's OpenAPI schema generation
+# under Pydantic v2.
+# -----------------------------------------------------------------------------
+
+class V2RegisterReq(BaseModel):
+    model_config = ConfigDict(extra='allow')
+    username: str
+    password: str
+    display_name: Optional[str] = None
+
+class V2LoginReq(BaseModel):
+    model_config = ConfigDict(extra='allow')
+    username: str
+    password: str
+
+class V2CommentReq(BaseModel):
+    model_config = ConfigDict(extra='allow')
+    text: Optional[str] = None
+
+class V2ShareReq(BaseModel):
+    model_config = ConfigDict(extra='allow')
+    channel: Optional[str] = None
+
+class V2RecoEventReq(BaseModel):
+    model_config = ConfigDict(extra='allow')
+    video_id: str
+    event_type: str
+    meta: Optional[Dict[str, Any]] = None
+
+class V2DMMessageReq(BaseModel):
+    model_config = ConfigDict(extra='allow')
+    text: Optional[str] = None
+
 @app.post("/v2/auth/register")
 async def v2_auth_register(req: V2RegisterReq):
     username = (req.username or "").strip().lower()
@@ -8892,6 +8930,7 @@ if __name__ == "__main__":
         log_level="info",
         access_log=False,
     )
+
 
 
 
