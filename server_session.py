@@ -272,7 +272,7 @@ CHAT_ENABLE_WEB_SEARCH_DEFAULT = (os.getenv("CHAT_ENABLE_WEB_SEARCH_DEFAULT") or
 
 # TTS for chat streaming (sentence-by-sentence)
 TTS_SPEECH_URL = "https://api.openai.com/v1/audio/speech"
-TTS_MODEL_DEFAULT = (os.getenv("TTS_MODEL") or "gpt-5-mini-tts").strip()
+TTS_MODEL_DEFAULT = (os.getenv("TTS_MODEL") or "gpt-4o-mini-tts").strip()
 TTS_VOICE_DEFAULT = (os.getenv("TTS_VOICE") or REALTIME_VOICE_DEFAULT).strip()
 TTS_INSTRUCTIONS_DEFAULT = (os.getenv("TTS_INSTRUCTIONS") or "Use a natural, energetic, brisk, clear voice. Keep pauses short. Prefer Mandarin Chinese when the text is Chinese. Avoid reading code symbols or long punctuation verbatim.").strip()
 TTS_SPEED_DEFAULT = float(os.getenv("TTS_SPEED") or "1.15")
