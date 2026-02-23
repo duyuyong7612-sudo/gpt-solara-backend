@@ -366,10 +366,6 @@ MEMORY_ITEM_MAX_CHARS = int(os.getenv("SOLARA_MEMORY_ITEM_MAX_CHARS") or "240")
 MEMORY_MAX_ITEMS_PER_USER = int(os.getenv("SOLARA_MEMORY_MAX_ITEMS_PER_USER") or "2000")
 MEMORY_RECENT_FALLBACK_N = int(os.getenv("SOLARA_MEMORY_RECENT_FALLBACK_N") or "6")
 MEMORY_EMBED_MODEL = (os.getenv("SOLARA_MEMORY_EMBED_MODEL") or "text-embedding-3-small").strip()
-VISION_CAPTION_MODEL = (os.getenv("SOLARA_VISION_CAPTION_MODEL") or os.getenv("VISION_MODEL") or "gpt-4o-mini").strip()
-VISION_CAPTION_MAX_CHARS = int(os.getenv("SOLARA_VISION_CAPTION_MAX_CHARS") or "180")
-VISION_CAPTION_MAX_IMAGES_PER_TURN = int(os.getenv("SOLARA_VISION_CAPTION_MAX_IMAGES_PER_TURN") or "2")
-
 
 def _sanitize_user_key(key: str) -> str:
     k = (key or "").strip()
@@ -455,24 +451,6 @@ def _init_mem_db() -> None:
         """)
         con.execute("CREATE INDEX IF NOT EXISTS idx_mem_user_used ON memory_items(user_key, last_used_at DESC);")
         con.execute("CREATE UNIQUE INDEX IF NOT EXISTS uq_mem_user_sha1 ON memory_items(user_key, text_sha1);")
-
-# --- Multimodal memory: images (store a short caption + embedding) ---
-con.execute("""
-CREATE TABLE IF NOT EXISTS memory_media (
-  id TEXT PRIMARY KEY,
-  user_key TEXT NOT NULL,
-  media_type TEXT NOT NULL,      -- image|video|other
-  source TEXT DEFAULT '',        -- url or note
-  caption TEXT NOT NULL,
-  sha1 TEXT NOT NULL,
-  embedding BLOB NOT NULL,
-  dim INTEGER NOT NULL,
-  created_at REAL NOT NULL,
-  last_used_at REAL NOT NULL
-);
-""")
-con.execute("CREATE INDEX IF NOT EXISTS idx_mem_media_user_used ON memory_media(user_key, last_used_at DESC);")
-con.execute("CREATE UNIQUE INDEX IF NOT EXISTS uq_mem_media_user_sha1 ON memory_media(user_key, sha1);")
 
 _init_conv_db()
 _init_mem_db()
@@ -2030,109 +2008,6 @@ def memory_add(user_key: str, text: str) -> None:
         );
         """, (user_key, MEMORY_MAX_ITEMS_PER_USER))
 
-def _openai_caption_image_data_url(data_url: str) -> str:
-    """Return a short Chinese caption for an image (for multimodal memory)."""
-    du = (data_url or "").strip()
-    if not du:
-        return ""
-    # If no key, skip (we still can chat with images because /chat uses base64 input_image,
-    # but memory captioning needs a model call).
-    if not OPENAI_API_KEY:
-        return ""
-    prompt = (
-        "请用中文为这张图片写一条【短caption】，用于长期记忆检索。\n"
-        "要求：\n"
-        "- 只描述客观可见内容（人物/物体/场景/文字）\n"
-        "- 不要猜测身份、不要编造\n"
-        "- 不要超过 1 句话，尽量精炼\n"
-    )
-    try:
-        inp = [{
-            "role": "user",
-            "content": [
-                {"type": "input_text", "text": prompt},
-                {"type": "input_image", "image_url": du},
-            ],
-        }]
-        obj = _openai_responses_create_nonstream(
-            model=VISION_CAPTION_MODEL,
-            inp=inp,
-            max_output_tokens=120,
-            truncation="auto",
-        )
-        # Extract output_text
-        out = []
-        for item in (obj.get("output") or []):
-            for c in (item.get("content") or []):
-                if c.get("type") == "output_text":
-                    out.append(c.get("text") or "")
-        cap = ("".join(out)).strip()
-        cap = re.sub(r"\s+", " ", cap).strip()
-        if len(cap) > VISION_CAPTION_MAX_CHARS:
-            cap = cap[:VISION_CAPTION_MAX_CHARS].rstrip() + "…"
-        return cap
-    except Exception as e:
-        log.warning("[mem.media] caption failed: %s", e)
-        return ""
-
-
-def memory_media_add_image(user_key: str, *, source: str, caption: str, image_bytes: bytes) -> None:
-    user_key = _sanitize_user_key(user_key)
-    cap = (caption or "").strip()
-    if not cap:
-        return
-    if not image_bytes:
-        return
-    emb = _openai_embed(cap)
-    if not emb:
-        return
-    sha = hashlib.sha1(image_bytes).hexdigest()
-    now = time.time()
-    with _mem_conn() as con:
-        con.execute("""
-        INSERT INTO memory_media(id,user_key,media_type,source,caption,sha1,embedding,dim,created_at,last_used_at)
-        VALUES(?,?,?,?,?,?,?,?,?,?)
-        ON CONFLICT(user_key,sha1)
-        DO UPDATE SET caption=excluded.caption, embedding=excluded.embedding, dim=excluded.dim, last_used_at=excluded.last_used_at;
-        """, (uuid.uuid4().hex, user_key, "image", (source or "")[:500], cap, sha, _pack_f32(emb), len(emb), now, now))
-
-
-def memory_media_search(user_key: str, query: str, k: int, min_score: float) -> List[Dict[str, Any]]:
-    user_key = _sanitize_user_key(user_key)
-    q = (query or "").strip()
-    if not q:
-        return []
-    qv_list = _openai_embed(q)
-    if not qv_list:
-        return []
-    qv = array("f", [float(x) for x in qv_list])
-    rows = []
-    with _mem_conn() as con:
-        cur = con.execute("SELECT id,media_type,source,caption,embedding,dim FROM memory_media WHERE user_key=? ORDER BY last_used_at DESC LIMIT 800", (user_key,))
-        rows = cur.fetchall()
-    scored = []
-    for rid, mtype, src, cap, blob, dim in rows:
-        try:
-            v = _unpack_f32(blob)
-            if len(v) != int(dim):
-                continue
-            s = _cosine(qv, v)
-            if s >= float(min_score):
-                scored.append((s, rid, mtype, src, cap))
-        except Exception:
-            continue
-    scored.sort(reverse=True, key=lambda x: x[0])
-    top = scored[:max(1, int(k))]
-    now = time.time()
-    if top:
-        with _mem_conn() as con:
-            for s, rid, *_ in top:
-                con.execute("UPDATE memory_media SET last_used_at=? WHERE id=? AND user_key=?", (now, rid, user_key))
-    return [
-        {"id": rid, "media_type": mtype, "source": src, "caption": cap, "score": float(s)}
-        for (s, rid, mtype, src, cap) in top
-    ]
-
 def memory_search(user_key: str, query: str, k: int, min_score: float) -> List[Dict[str, Any]]:
     user_key = _sanitize_user_key(user_key)
     q = (query or "").strip()
@@ -2170,18 +2045,10 @@ def memory_search(user_key: str, query: str, k: int, min_score: float) -> List[D
                 con.execute("UPDATE memory_items SET last_used_at=? WHERE id=? AND user_key=?", (now, rid, user_key))
     return [{"id": rid, "text": txt, "score": float(s)} for (s,rid,txt) in top]
 
-
 def memory_build_context(user_key: str, query: str, k: int = MEMORY_TOP_K_DEFAULT, min_score: float = MEMORY_MIN_SCORE_DEFAULT) -> str:
     hits = memory_search(user_key, query, k=k, min_score=min_score)
-    media_hits: List[Dict[str, Any]] = []
-    try:
-        media_hits = memory_media_search(user_key, query, k=max(1, int(k)//2), min_score=min_score)
-    except Exception:
-        media_hits = []
-
-    if not hits and not media_hits:
+    if not hits:
         return ""
-
     lines = ["以下是【长期记忆】（仅供参考；若有冲突/不确定请向用户确认）："]
     total = 0
     for h in hits:
@@ -2191,22 +2058,6 @@ def memory_build_context(user_key: str, query: str, k: int = MEMORY_TOP_K_DEFAUL
         if len(t) > MEMORY_ITEM_MAX_CHARS:
             t = t[:MEMORY_ITEM_MAX_CHARS].rstrip() + "…"
         add = f"- {t}"
-        if total + len(add) > MEMORY_CONTEXT_MAX_CHARS:
-            break
-        lines.append(add)
-        total += len(add)
-
-# Multimodal memory (images): add a compact section
-if media_hits:
-    lines.append("")
-    lines.append("以下是【长期记忆-图片摘要】：")
-    for h in media_hits:
-        cap = (h.get("caption") or "").strip()
-        if not cap:
-            continue
-        if len(cap) > MEMORY_ITEM_MAX_CHARS:
-            cap = cap[:MEMORY_ITEM_MAX_CHARS].rstrip() + "…"
-        add = f"- [image] {cap}"
         if total + len(add) > MEMORY_CONTEXT_MAX_CHARS:
             break
         lines.append(add)
@@ -4875,12 +4726,40 @@ def _resolve_local_upload_path(url: str) -> Optional[Path]:
         if cand.exists():
             return cand
 
+    # Common in some clients/routers: /files/<file>
+    if "/files/" in path:
+        rel = path.split("/files/", 1)[1].lstrip("/")
+        cand = UPLOADS_DIR / rel
+        if cand.exists():
+            return cand
+
     # Sometimes: uploads/<file>
     if path.startswith("uploads/"):
         rel = path[len("uploads/"):]
         cand = UPLOADS_DIR / rel
         if cand.exists():
             return cand
+
+    # Sometimes: files/<file>
+    if path.startswith("files/"):
+        rel = path[len("files/"):]
+        cand = UPLOADS_DIR / rel
+        if cand.exists():
+            return cand
+
+    # Absolute path (only allow inside UPLOADS_DIR)
+    # Some upload routes return absolute filesystem paths; keep it safe.
+    if path.startswith("/"):
+        try:
+            abs_p = Path(path)
+            if abs_p.exists():
+                try:
+                    abs_p.resolve().relative_to(UPLOADS_DIR.resolve())
+                    return abs_p
+                except Exception:
+                    pass
+        except Exception:
+            pass
 
     # Fallback: absolute within project (rare)
     if path.startswith("/"):
@@ -4914,11 +4793,16 @@ def _server_self_url(path_or_url: str) -> str:
         return s
 
     # Relative path
+    port = (os.getenv("PORT") or "8000").strip()
     if s.startswith("/"):
-        port = (os.getenv("PORT") or "8000").strip()
         return f"http://127.0.0.1:{port}{s}"
 
-    return s
+    # Some upload routers return paths without leading slash (e.g. "files/<id>").
+    # Make them fetchable by THIS backend.
+    # NOTE: keep non-http schemes intact (e.g., data:)
+    if s.startswith("data:"):
+        return s
+    return f"http://127.0.0.1:{port}/" + s.lstrip("/")
 
 
 def _read_image_bytes_from_attachment(a: Dict[str, Any]) -> bytes:
@@ -4929,6 +4813,14 @@ def _read_image_bytes_from_attachment(a: Dict[str, Any]) -> bytes:
     """
     url = (a.get("url") or "").strip()
 
+    # 0) data URL (already base64)
+    if url.startswith("data:") and "base64," in url:
+        try:
+            b64 = url.split("base64,", 1)[1]
+            return base64.b64decode(b64)
+        except Exception:
+            raise RuntimeError("image_data_url_decode_failed")
+
     # 1) local file path (uploads/)
     if url:
         p = _resolve_local_upload_path(url)
@@ -4938,6 +4830,9 @@ def _read_image_bytes_from_attachment(a: Dict[str, Any]) -> bytes:
     # 2) fetch from this server
     if url:
         fetch_url = _server_self_url(url)
+        # If it is still not a valid URL, bail early (requests would raise)
+        if not (fetch_url.startswith("http://") or fetch_url.startswith("https://")):
+            raise RuntimeError(f"image_fetch_invalid_url: {fetch_url}")
         r = requests.get(fetch_url, timeout=30)
         if r.status_code >= 400:
             raise RuntimeError(f"image_fetch_failed {r.status_code}: {_short(r.text, 200)}")
@@ -5117,21 +5012,40 @@ def _build_responses_input(messages: List[Dict[str, str]], attachments: List[Dic
             url = (a.get("url") or "").strip()
             mime = (a.get("mime") or "").strip()
 
-            # ✅✅✅ FIX (Scheme-A): image must be sent as DATA URL in image_url (OpenAI must NOT download LAN URLs)
-            if at == "image" and url:
-                try:
-                    raw = _read_image_bytes_from_attachment(a)
-                    b64 = base64.b64encode(raw).decode("utf-8")
-                    mime2 = (mime or "").strip() or "image/jpeg"
-                    if not mime2.startswith("image/"):
-                        mime2 = "image/jpeg"
-                    data_url = f"data:{mime2};base64,{b64}"
-                    content_list.append({"type": "input_image", "image_url": data_url})
-                except Exception as e:
-                    log.warning("[chat.attach] image->base64 failed url=%s err=%s", _short(url, 160), e)
-                    # keep chat alive; degrade gracefully
-                    content_list.append({"type": "input_text", "text": f"[image unavailable] {url}"})
-                continue
+            # Some upload routes return OpenAI file IDs. Responses API supports `file_id` for input_image.
+            # We keep it as an escape hatch when server-side byte fetching fails.
+            file_id = (
+                str(a.get("file_id") or a.get("fileId") or a.get("openai_file_id") or a.get("openaiFileId") or a.get("id") or "")
+                .strip()
+            )
+            file_id_is_openai = file_id.startswith(("file_", "file-"))
+
+            is_image = (at == "image") or (at in ("photo", "picture", "img")) or (mime.lower().startswith("image/"))
+
+            # ✅✅✅ Image (Scheme-A): prefer DATA URL in `image_url` (OpenAI must NOT download LAN URLs)
+            # Fallback: if server cannot fetch bytes but caller provided an OpenAI `file_id`, use it.
+            if is_image:
+                if url:
+                    try:
+                        raw = _read_image_bytes_from_attachment(a)
+                        b64 = base64.b64encode(raw).decode("utf-8")
+                        mime2 = (mime or "").strip() or "image/jpeg"
+                        if not mime2.lower().startswith("image/"):
+                            mime2 = "image/jpeg"
+                        data_url = f"data:{mime2};base64,{b64}"
+                        content_list.append({"type": "input_image", "image_url": data_url})
+                    except Exception as e:
+                        log.warning("[chat.attach] image->base64 failed url=%s err=%s", _short(url, 160), e)
+                        if file_id_is_openai:
+                            content_list.append({"type": "input_image", "file_id": file_id})
+                        else:
+                            # keep chat alive; degrade gracefully
+                            content_list.append({"type": "input_text", "text": f"[image unavailable] {url}"})
+                    continue
+
+                if file_id_is_openai:
+                    content_list.append({"type": "input_image", "file_id": file_id})
+                    continue
             # ✅ audio: Responses API does NOT accept input_audio. Use transcript -> input_text.
             if at == "audio":
                 tr = (a.get("transcript") or "").strip()
@@ -6005,34 +5919,6 @@ async def chat_legacy(request: Request):
     if attachments:
         user_transcript = await asyncio.to_thread(_transcribe_audio_attachments_inplace, attachments)
 
-# ✅ Multimodal memory: caption images and store (best-effort)
-if MEMORY_ENABLED_DEFAULT and attachments:
-    try:
-        n_img = 0
-        for a in attachments:
-            if not isinstance(a, dict):
-                continue
-            if (a.get("type") or "").strip().lower() != "image":
-                continue
-            n_img += 1
-            if n_img > VISION_CAPTION_MAX_IMAGES_PER_TURN:
-                break
-            try:
-                raw = _read_image_bytes_from_attachment(a)
-                b64 = base64.b64encode(raw).decode("utf-8")
-                mime2 = ((a.get("mime") or "") or "image/jpeg").strip()
-                if not mime2.startswith("image/"):
-                    mime2 = "image/jpeg"
-                data_url = f"data:{mime2};base64,{b64}"
-                cap = _openai_caption_image_data_url(data_url)
-                if cap:
-                    memory_media_add_image(user_key, source=(a.get("url") or ""), caption=cap, image_bytes=raw)
-                    memory_add(user_key, f"用户图片：{cap}")
-            except Exception:
-                continue
-    except Exception:
-        pass
-
     # Long-output safeguards (optional overrides)
     try:
         max_output_tokens = int(body.get("max_output_tokens") or CHAT_MAX_OUTPUT_TOKENS_DEFAULT)
@@ -6223,35 +6109,6 @@ async def chat_prepare(request: Request):
     if attachments:
         # Do transcription in a background thread (avoid blocking the event loop)
         user_transcript = await asyncio.to_thread(_transcribe_audio_attachments_inplace, attachments)
-
-# ✅ Multimodal memory: caption images and store to vector DB (best-effort, non-blocking)
-if MEMORY_ENABLED_DEFAULT and attachments:
-    try:
-        n_img = 0
-        for a in attachments:
-            if not isinstance(a, dict):
-                continue
-            if (a.get("type") or "").strip().lower() != "image":
-                continue
-            n_img += 1
-            if n_img > VISION_CAPTION_MAX_IMAGES_PER_TURN:
-                break
-            try:
-                raw = _read_image_bytes_from_attachment(a)
-                b64 = base64.b64encode(raw).decode("utf-8")
-                mime2 = ((a.get("mime") or "") or "image/jpeg").strip()
-                if not mime2.startswith("image/"):
-                    mime2 = "image/jpeg"
-                data_url = f"data:{mime2};base64,{b64}"
-                cap = _openai_caption_image_data_url(data_url)
-                if cap:
-                    memory_media_add_image(user_key, source=(a.get("url") or ""), caption=cap, image_bytes=raw)
-                    # Also store a text memory hook for better recall with text-only embeddings
-                    memory_add(user_key, f"用户图片：{cap}")
-            except Exception:
-                continue
-    except Exception:
-        pass
 
     # Last user text (used for title, memory query, persistence)
     last_user_text = ""
@@ -6546,30 +6403,6 @@ def memory_search_api(request: Request, q: str, k: int = MEMORY_TOP_K_DEFAULT):
     user_key = _derive_user_key(request, {})
     hits = memory_search(user_key, q, k=max(1,int(k)), min_score=MEMORY_MIN_SCORE_DEFAULT)
     return {"ok": True, "user_key": user_key, "matches": hits}
-
-
-@app.get("/memory/media/search")
-def memory_media_search_api(request: Request, q: str, k: int = 4):
-    user_key = _derive_user_key(request, {})
-    hits = memory_media_search(user_key, q, k=max(1, int(k)), min_score=MEMORY_MIN_SCORE_DEFAULT)
-    return {"ok": True, "user_key": user_key, "matches": hits}
-
-@app.get("/memory/media/list")
-def memory_media_list_api(request: Request, limit: int = 50, offset: int = 0):
-    user_key = _derive_user_key(request, {})
-    limit = max(1, min(int(limit), 200))
-    offset = max(0, int(offset))
-    with _mem_conn() as con:
-        cur = con.execute(
-            "SELECT id,media_type,source,caption,created_at,last_used_at FROM memory_media WHERE user_key=? ORDER BY last_used_at DESC LIMIT ? OFFSET ?",
-            (user_key, limit, offset),
-        )
-        rows = cur.fetchall()
-    items = []
-    for mid,mtype,src,cap,created_at,last_used_at in rows:
-        items.append({"id": mid, "media_type": mtype, "source": src, "caption": cap, "created_at": created_at, "last_used_at": last_used_at})
-    return {"ok": True, "user_key": user_key, "items": items}
-
 
 @app.post("/memory/clear")
 def memory_clear_api(request: Request):
