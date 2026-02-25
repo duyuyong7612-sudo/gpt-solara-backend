@@ -311,3 +311,4 @@ def require_credit(req: Request, kind: str = "text", cost: int = 1) -> Optional[
     u[field] = left - cost
     return None
 
+

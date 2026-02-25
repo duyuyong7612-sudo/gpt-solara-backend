@@ -136,7 +136,8 @@ OPENAI_API_KEY = (os.getenv("OPENAI_API_KEY") or os.getenv("SORA_API_KEY") or ""
 SORA_API_KEY = (os.getenv("SORA_API_KEY") or OPENAI_API_KEY).strip()
 OPENAI_ORG_ID = (os.getenv("OPENAI_ORG_ID") or "").strip()
 
-REALTIME_MODEL_DEFAULT = (os.getenv("REALTIME_MODEL") or "gpt-realtime-mini").strip()
+REALTIME_MODEL_DEFAULT = (os.getenv("REALTIME_MODEL") or "gpt-4o-realtime-preview").strip()
+REALTIME_MODEL_FALLBACK = (os.getenv("REALTIME_MODEL_FALLBACK") or "gpt-realtime-mini").strip()
 REALTIME_VOICE_DEFAULT = (os.getenv("REALTIME_VOICE") or "alloy").strip()
 
 # ✅ Backend no longer hardcodes a long "work definition" prompt.
@@ -203,10 +204,19 @@ except Exception:
     VIDEO_DEDUP_TTL_SEC = 3600
 
 # ---- Chat + TTS streaming ----
-CHAT_MODEL_DEFAULT = (os.getenv("CHAT_MODEL") or "gpt-5").strip()
+# NOTE: `CHAT_MODEL_DEFAULT` is the safe OpenAI default used when no plan/model is specified.
+# Ultra can still be routed to Claude via ULTRA_TEXT_MODEL (see /chat + /chat/prepare plan routing).
+CHAT_MODEL_DEFAULT = (os.getenv("CHAT_MODEL") or "gpt-4o-mini").strip()
 CHAT_STREAM_TIMEOUT_SEC = int(os.getenv("CHAT_STREAM_TIMEOUT_SEC") or "180")
 CHAT_STREAM_CHUNK_TIMEOUT_SEC = float(os.getenv("CHAT_STREAM_CHUNK_TIMEOUT_SEC") or "25")
 CHAT_JOB_TTL_SEC = int(os.getenv("CHAT_JOB_TTL_SEC") or "1800")  # 30min
+
+# ---- Anthropic (Claude) ----
+# Used when model id starts with "claude-" (e.g. "claude-sonnet-4-6").
+ANTHROPIC_API_KEY = (os.getenv("ANTHROPIC_API_KEY") or os.getenv("ANTHROPIC_KEY") or "").strip()
+ANTHROPIC_BASE_URL = (os.getenv("ANTHROPIC_BASE_URL") or "https://api.anthropic.com").strip().rstrip("/")
+# Your curl example uses 2023-06-01; keep default aligned.
+ANTHROPIC_VERSION = (os.getenv("ANTHROPIC_VERSION") or "2023-06-01").strip()
 
 # ---- Smart Router: DeepSeek for default text, OpenAI for web search + Realtime ----
 # Route modes:
@@ -229,11 +239,132 @@ CHAT_ENABLE_TTS_STREAMING = (os.getenv("CHAT_ENABLE_TTS_STREAMING") or "0").stri
 DEEPSEEK_API_KEY = (os.getenv("DEEPSEEK_API_KEY") or "").strip()
 DEEPSEEK_BASE_URL = (os.getenv("DEEPSEEK_BASE_URL") or "https://api.deepseek.com").strip().rstrip("/")
 DEEPSEEK_MODEL_DEFAULT = (os.getenv("DEEPSEEK_MODEL") or "deepseek-reasoner").strip()
+
+# If your client/UI still sends `model: "gpt-5"` (e.g. Ultra tier text model),
+# we remap it to a Claude model id available in Anthropic.
+# You can override this mapping via env.
+GPT5_MODEL_ALIAS = (os.getenv("GPT5_MODEL_ALIAS") or "claude-sonnet-4-6").strip()
 try:
     DEEPSEEK_TIMEOUT_SEC = float(os.getenv("DEEPSEEK_TIMEOUT_SEC") or "120")
 except Exception:
     DEEPSEEK_TIMEOUT_SEC = 120.0
 
+
+
+
+# ---------------------- Stable plan -> model mapping ----------------------
+
+def _env_pick(*names: str, default: str = "") -> str:
+    """Return the first non-empty env var among names, else default."""
+    for n in names:
+        try:
+            v = os.getenv(n)
+        except Exception:
+            v = None
+        if v is None:
+            continue
+        v = str(v).strip()
+        if v:
+            return v
+    return default
+
+
+# Canonical plan -> model mapping (server-side truth).
+# Override each via env so models never "randomly" change.
+#
+# Recommended env names (pick any; first non-empty wins):
+#   Guest/Basic: CHAT_MODEL_GUEST / CHAT_MODEL_BASIC / BASIC_MODEL / BASIC_TEXT_MODEL
+#   Pro:        CHAT_MODEL_PRO   / PRO_MODEL       / PRO_TEXT_MODEL
+#   Ultra:      CHAT_MODEL_ULTRA / ULTRA_MODEL     / ULTRA_TEXT_MODEL
+#   Coder:      CHAT_MODEL_CODER / CODER_MODEL     / CODER_TEXT_MODEL / ADVANCED_MODEL
+CHAT_MODEL_GUEST = _env_pick("CHAT_MODEL_GUEST", "CHAT_MODEL_BASIC", "GUEST_MODEL", "BASIC_MODEL", "BASIC_TEXT_MODEL", default="gpt-4o-mini")
+CHAT_MODEL_PRO   = _env_pick("CHAT_MODEL_PRO", "PRO_MODEL", "PRO_TEXT_MODEL", default="gpt-4o")
+CHAT_MODEL_ULTRA = _env_pick("CHAT_MODEL_ULTRA", "ULTRA_MODEL", "ULTRA_TEXT_MODEL", default="gpt-5.2-pro")
+CHAT_MODEL_CODER = _env_pick("CHAT_MODEL_CODER", "CODER_MODEL", "CODER_TEXT_MODEL", "ADVANCED_MODEL", default="gpt-5.2-pro")
+
+# Backward-compatible plan aliases (app/UI may send any of these).
+PLAN_TO_MODEL: Dict[str, str] = {
+    "guest": CHAT_MODEL_GUEST,
+    "basic": CHAT_MODEL_GUEST,
+    "free": CHAT_MODEL_GUEST,
+    "pro": CHAT_MODEL_PRO,
+    "pro_voice": CHAT_MODEL_PRO,
+    "ultra": CHAT_MODEL_ULTRA,
+    "ultra_video": CHAT_MODEL_ULTRA,
+    "coder": CHAT_MODEL_CODER,
+    "advanced": CHAT_MODEL_CODER,
+}
+
+# Model -> canonical plan (for inference when client doesn't send plan)
+MODEL_TO_PLAN: Dict[str, str] = {}
+for _p, _m in PLAN_TO_MODEL.items():
+    if _p not in ("guest", "pro", "ultra", "coder"):
+        continue
+    if _m and _m not in MODEL_TO_PLAN:
+        MODEL_TO_PLAN[_m] = _p
+
+ALLOWED_CHAT_MODELS = set(MODEL_TO_PLAN.keys())
+
+
+def _normalize_plan(raw: str) -> str:
+    raw0 = (raw or "").strip()
+    s = raw0.lower()
+    if not s:
+        return ""
+    s2 = re.sub(r"[\s_\-]+", "", s)
+
+    # English keywords
+    if "ultra" in s2:
+        return "ultra"
+    if "pro" in s2:
+        return "pro"
+    if "coder" in s2 or "advanced" in s2:
+        return "coder"
+    if "guest" in s2 or "basic" in s2 or "free" in s2:
+        return "guest"
+
+    # Chinese keywords (UI display names)
+    if "视频" in raw0 or "影片" in raw0:
+        return "ultra"
+    if "语音" in raw0 or "通话" in raw0:
+        return "pro"
+    if "编程" in raw0 or "高级" in raw0:
+        return "coder"
+    if "基础" in raw0 or "文本" in raw0 or "免费" in raw0:
+        return "guest"
+
+    if s in PLAN_TO_MODEL:
+        return s
+    return s
+
+
+def _infer_plan_from_model(model: str) -> str:
+    m = (model or "").strip()
+    if not m:
+        return ""
+    return MODEL_TO_PLAN.get(m, "")
+
+
+def _select_model_for_request(plan_raw: str, client_model: str) -> Tuple[str, str, str]:
+    """Return (model, canonical_plan, reason)."""
+    plan = _normalize_plan(plan_raw)
+    cm = (client_model or "").strip()
+
+    # Optional: allow arbitrary client model selection (debug only).
+    if CHAT_ALLOW_CLIENT_MODEL and cm:
+        return cm, (_infer_plan_from_model(cm) or plan or "guest"), "client_override"
+
+    # 1) explicit plan wins
+    if plan in PLAN_TO_MODEL:
+        canonical = "guest" if plan in ("basic", "free") else ("coder" if plan in ("advanced",) else plan)
+        return PLAN_TO_MODEL[plan], canonical, "plan"
+
+    # 2) no plan: accept client model only if it is one of our allowed plan models
+    if cm in ALLOWED_CHAT_MODELS:
+        return cm, (_infer_plan_from_model(cm) or plan or "guest"), "client_model_allowed"
+
+    # 3) last resort
+    return CHAT_MODEL_GUEST, "guest", "fallback"
 
 
 # ✅ UX / Rendering alignment (iOS code highlight depends on fenced blocks)
@@ -245,6 +376,7 @@ CHAT_SYSTEM_STYLE_PROMPT = (
     "- Use LaTeX for math where appropriate.\n"
     "- Do not output internal tool reference IDs (e.g., turn2search12) or raw system errors to the user.\n"
     "- IMPORTANT: In this app you CAN speak and will be played via TTS. Never claim you cannot speak/voice/play audio. If asked, confidently answer and continue.\n"
+    "- IMPORTANT: This app injects long-term memory context in system messages labelled 【长期记忆】. Never claim you have no long-term memory. If the memory section is empty, say you have not saved personal info yet and ask the user to tell you.\n"
 )
 def _prepend_style_prompt(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     if not messages:
@@ -262,6 +394,12 @@ def _prepend_style_prompt(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]
 CHAT_MAX_OUTPUT_TOKENS_DEFAULT = int(os.getenv("CHAT_MAX_OUTPUT_TOKENS") or "25000")
 # - Auto continuation loops when upstream ends as incomplete due to token cap.
 CHAT_MAX_CONTINUATIONS_DEFAULT = int(os.getenv("CHAT_MAX_CONTINUATIONS") or "3")
+
+# Server-side conversation history fallback for clients that send only the newest message
+# (fixes "no context" issues when the app view is recreated or a plan switches screens).
+CHAT_HISTORY_FALLBACK_MESSAGES = int(os.getenv("CHAT_HISTORY_FALLBACK_MESSAGES") or "40")
+CHAT_HISTORY_FALLBACK_MESSAGES = max(0, min(CHAT_HISTORY_FALLBACK_MESSAGES, 200))
+
 # - requests timeout tuning for long SSE streams
 CHAT_STREAM_CONNECT_TIMEOUT_SEC = float(os.getenv("CHAT_STREAM_CONNECT_TIMEOUT_SEC") or "20")
 CHAT_STREAM_READ_TIMEOUT_SEC = float(os.getenv("CHAT_STREAM_READ_TIMEOUT_SEC") or "600")
@@ -367,6 +505,18 @@ MEMORY_MAX_ITEMS_PER_USER = int(os.getenv("SOLARA_MEMORY_MAX_ITEMS_PER_USER") or
 MEMORY_RECENT_FALLBACK_N = int(os.getenv("SOLARA_MEMORY_RECENT_FALLBACK_N") or "6")
 MEMORY_EMBED_MODEL = (os.getenv("SOLARA_MEMORY_EMBED_MODEL") or "text-embedding-3-small").strip()
 
+# Structured "facts" memory (always injected, query-independent)
+MEMORY_FACTS_ENABLED_DEFAULT = (os.getenv("SOLARA_MEMORY_FACTS_ENABLED") or "1").strip().lower() not in ("0", "false", "no")
+MEMORY_FACTS_PROMPT_LIMIT = int(os.getenv("SOLARA_MEMORY_FACTS_PROMPT_LIMIT") or "12")
+MEMORY_FACTS_CONTEXT_MAX_CHARS = int(os.getenv("SOLARA_MEMORY_FACTS_CONTEXT_MAX_CHARS") or "1200")
+MEMORY_FACTS_ITEM_MAX_CHARS = int(os.getenv("SOLARA_MEMORY_FACTS_ITEM_MAX_CHARS") or "220")
+MEMORY_FACTS_MAX_ITEMS_PER_USER = int(os.getenv("SOLARA_MEMORY_FACTS_MAX_ITEMS_PER_USER") or "400")
+MEMORY_FACTS_EXTRACT_ENABLED = (os.getenv("SOLARA_MEMORY_FACTS_EXTRACT_ENABLED") or "1").strip().lower() not in ("0", "false", "no")
+MEMORY_FACTS_EXTRACT_MODEL_OPENAI = (os.getenv("SOLARA_MEMORY_FACTS_EXTRACT_MODEL_OPENAI") or "gpt-4o-mini").strip()
+MEMORY_FACTS_EXTRACT_MODEL_ANTHROPIC = (os.getenv("SOLARA_MEMORY_FACTS_EXTRACT_MODEL_ANTHROPIC") or "claude-3-haiku-20240307").strip()
+MEMORY_FACTS_IMPORTANCE_MIN = int(os.getenv("SOLARA_MEMORY_FACTS_IMPORTANCE_MIN") or "2")
+
+
 def _sanitize_user_key(key: str) -> str:
     k = (key or "").strip()
     if not k:
@@ -376,14 +526,57 @@ def _sanitize_user_key(key: str) -> str:
     return re.sub(r"[^a-zA-Z0-9_\-:.]", "_", k)
 
 def _derive_user_key(req: Request, body: Dict[str, Any]) -> str:
-    # Prefer explicit client id; fallback to IP
-    cid = (body.get("client_id") or body.get("clientId") or body.get("user_key") or "").strip()
+    """Return a stable user key for memory/history.
+
+    Priority:
+      1) Authenticated user id from Bearer token (if present)
+      2) Explicit user_id/userId/uid in JSON body or x-user-id header
+      3) client_id/clientId or x-client-id header
+      4) IP fallback
+    """
+
+    # 1) Auth token (preferred when available)
+    try:
+        tok = _get_bearer_token(req)
+        if tok:
+            payload = _decode_access_token(tok)
+            if isinstance(payload, dict):
+                sub = str(payload.get("sub") or "").strip()
+                if sub:
+                    return _sanitize_user_key(sub)
+    except Exception:
+        pass
+
+    # 2) Explicit user id (login account id / stable device id)
+    uid = str(
+        body.get("user_id")
+        or body.get("userId")
+        or body.get("uid")
+        or body.get("account_id")
+        or body.get("accountId")
+        or ""
+    ).strip()
+    if not uid:
+        uid = str(
+            req.headers.get("x-user-id")
+            or req.headers.get("x-uid")
+            or req.headers.get("x-account-id")
+            or ""
+        ).strip()
+    if uid:
+        return _sanitize_user_key(uid)
+
+    # 3) Explicit client id (anonymous device id)
+    cid = str(body.get("client_id") or body.get("clientId") or body.get("user_key") or body.get("userKey") or "").strip()
     if not cid:
-        cid = (req.headers.get("x-client-id") or req.headers.get("x-user-key") or "").strip()
+        cid = str(req.headers.get("x-client-id") or req.headers.get("x-user-key") or "").strip()
     if cid:
         return _sanitize_user_key(cid)
+
+    # 4) IP fallback (least stable)
     ip = req.client.host if req.client else "unknown"
     return _sanitize_user_key(ip)
+
 
 def _client_id(req: Request) -> str:
     """Best-effort stable client identifier for anonymous clients.
@@ -451,6 +644,21 @@ def _init_mem_db() -> None:
         """)
         con.execute("CREATE INDEX IF NOT EXISTS idx_mem_user_used ON memory_items(user_key, last_used_at DESC);")
         con.execute("CREATE UNIQUE INDEX IF NOT EXISTS uq_mem_user_sha1 ON memory_items(user_key, text_sha1);")
+
+        # Structured facts memory (query-independent, top importance always injected)
+        con.execute("""
+        CREATE TABLE IF NOT EXISTS memory_facts (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          user_key TEXT NOT NULL,
+          content TEXT NOT NULL,
+          tags TEXT DEFAULT '',
+          importance INTEGER DEFAULT 1,
+          hash TEXT NOT NULL,
+          created_at REAL NOT NULL,
+          UNIQUE(user_key, hash)
+        );
+        """)
+        con.execute("CREATE INDEX IF NOT EXISTS idx_memfacts_user_imp_time ON memory_facts(user_key, importance DESC, created_at DESC);")
 
 _init_conv_db()
 _init_mem_db()
@@ -2065,6 +2273,239 @@ def memory_build_context(user_key: str, query: str, k: int = MEMORY_TOP_K_DEFAUL
     return "\n".join(lines).strip()
 
 
+# =========================
+# ✅ Structured long-term memory ("facts")
+# - Always injected (query-independent) so name/preferences are recalled even if user asks unrelated questions.
+# - De-duplicated by (user_key + md5(content)).
+# =========================
+
+def _memory_fact_hash(user_key: str, content: str) -> str:
+    raw = f"{_sanitize_user_key(user_key)}:{(content or '').strip().lower()}"
+    return hashlib.md5(raw.encode("utf-8")).hexdigest()
+
+def memory_facts_save(user_key: str, content: str, tags: str = "", importance: int = 1) -> None:
+    if not MEMORY_FACTS_ENABLED_DEFAULT:
+        return
+    u = _sanitize_user_key(user_key)
+    c = (content or "").strip()
+    if not c:
+        return
+    # Keep facts short & stable
+    c = re.sub(r"\s+", " ", c).strip()
+    if len(c) > 420:
+        c = c[:420].rstrip() + "…"
+
+    try:
+        imp = int(importance or 1)
+    except Exception:
+        imp = 1
+    imp = max(1, min(imp, 5))
+
+    h = _memory_fact_hash(u, c)
+    now = time.time()
+
+    with _mem_conn() as con:
+        con.execute(
+            """
+            INSERT OR IGNORE INTO memory_facts (user_key, content, tags, importance, hash, created_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (u, c, (tags or "").strip(), imp, h, now),
+        )
+        # Prune (keep most important + newest)
+        con.execute(
+            """
+            DELETE FROM memory_facts
+            WHERE id IN (
+              SELECT id FROM memory_facts
+              WHERE user_key=?
+              ORDER BY importance DESC, created_at DESC
+              LIMIT -1 OFFSET ?
+            )
+            """,
+            (u, MEMORY_FACTS_MAX_ITEMS_PER_USER),
+        )
+
+def memory_facts_list(user_key: str, limit: int = 20) -> List[Dict[str, Any]]:
+    if not MEMORY_FACTS_ENABLED_DEFAULT:
+        return []
+    u = _sanitize_user_key(user_key)
+    lim = max(1, min(int(limit or 20), 200))
+    with _mem_conn() as con:
+        cur = con.execute(
+            "SELECT id, content, tags, importance, created_at FROM memory_facts WHERE user_key=? ORDER BY importance DESC, created_at DESC LIMIT ?",
+            (u, lim),
+        )
+        rows = cur.fetchall()
+
+    out: List[Dict[str, Any]] = []
+    for rid, content, tags, imp, created_at in rows:
+        out.append(
+            {
+                "id": int(rid),
+                "content": str(content or ""),
+                "tags": str(tags or ""),
+                "importance": int(imp or 1),
+                "created_at": float(created_at or 0.0),
+            }
+        )
+    return out
+
+def memory_facts_build_prompt(user_key: str, limit: int = MEMORY_FACTS_PROMPT_LIMIT) -> str:
+    if not MEMORY_FACTS_ENABLED_DEFAULT:
+        return ""
+    mems = memory_facts_list(user_key, limit=limit)
+    if not mems:
+        return ""
+    lines = ["以下是【长期记忆】（重要事实/偏好；如不确定请向用户确认）："]
+    total = 0
+    for m in mems:
+        c = (m.get("content") or "").strip()
+        if not c:
+            continue
+        if len(c) > MEMORY_FACTS_ITEM_MAX_CHARS:
+            c = c[:MEMORY_FACTS_ITEM_MAX_CHARS].rstrip() + "…"
+        add = f"- {c}"
+        if total + len(add) > MEMORY_FACTS_CONTEXT_MAX_CHARS:
+            break
+        lines.append(add)
+        total += len(add)
+    return "\n".join(lines).strip()
+
+def _parse_json_array_best_effort(s: str) -> List[Dict[str, Any]]:
+    """Parse a JSON array from an LLM output. Best-effort, safe fallback to []."""
+    if not s:
+        return []
+    t = s.strip()
+    # strip code fences
+    t = t.replace("```json", "").replace("```JSON", "").replace("```", "").strip()
+    # locate first '[' ... last ']'
+    if "[" in t and "]" in t:
+        t = t[t.find("["): t.rfind("]") + 1]
+    try:
+        obj = json.loads(t)
+        if isinstance(obj, list):
+            return [x for x in obj if isinstance(x, dict)]
+    except Exception:
+        return []
+    return []
+
+def _extract_memory_facts_openai(user_msg: str, ai_reply: str) -> List[Dict[str, Any]]:
+    if not OPENAI_API_KEY:
+        return []
+    prompt = (
+        "你是记忆提取助手。请从下面对话中提取值得长期记住的用户信息。\\n"
+        "只提取对未来有帮助的事实：姓名/称呼、身份/职业、偏好、目标、重要约束、长期项目等。\\n"
+        "不要提取泛泛聊天、情绪化表达、临时问题细节。\\n"
+        "如果没有值得记忆的内容，返回空数组 []。\\n\\n"
+        f"用户说：{user_msg}\\n"
+        f"助手说：{ai_reply}\\n\\n"
+        "以 JSON 数组返回，格式：\\n"
+        "[{\"content\":\"记忆内容\",\"tags\":\"标签1,标签2\",\"importance\":1到5的整数}]\\n"
+        "只返回 JSON，不要解释。"
+    )
+    try:
+        r = requests.post(
+            "https://api.openai.com/v1/chat/completions",
+            headers={"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"},
+            json={
+                "model": MEMORY_FACTS_EXTRACT_MODEL_OPENAI or "gpt-4o-mini",
+                "messages": [{"role": "user", "content": prompt}],
+                "temperature": 0.2,
+                "max_tokens": 400,
+            },
+            timeout=25,
+        )
+        if r.status_code >= 400:
+            return []
+        j = r.json()
+        content = (((j.get("choices") or [{}])[0]).get("message") or {}).get("content") or ""
+        items = _parse_json_array_best_effort(str(content))
+        return items
+    except Exception:
+        return []
+
+def _extract_memory_facts_anthropic(user_msg: str, ai_reply: str) -> List[Dict[str, Any]]:
+    if not ANTHROPIC_API_KEY:
+        return []
+    prompt = (
+        "You are a memory extraction assistant. Extract durable user facts from the conversation.\\n"
+        "Only include helpful long-term facts (name, role, preferences, goals, constraints).\\n"
+        "If nothing is worth saving, return [].\\n\\n"
+        f"User: {user_msg}\\n"
+        f"Assistant: {ai_reply}\\n\\n"
+        "Return ONLY a JSON array of objects with keys: content, tags, importance (1-5)."
+    )
+    try:
+        url = f"{ANTHROPIC_BASE_URL}/v1/messages"
+        payload = {
+            "model": MEMORY_FACTS_EXTRACT_MODEL_ANTHROPIC or "claude-3-haiku-20240307",
+            "max_tokens": 400,
+            "temperature": 0.2,
+            "system": "Return JSON only.",
+            "messages": [{"role": "user", "content": prompt}],
+        }
+        r = requests.post(url, headers=_anthropic_headers(stream=False), data=json.dumps(payload), timeout=25)
+        if r.status_code >= 400:
+            return []
+        j = r.json()
+        # Anthropic response content blocks
+        blocks = j.get("content") or []
+        txt = ""
+        for b in blocks:
+            if isinstance(b, dict) and b.get("type") == "text":
+                txt += str(b.get("text") or "")
+        items = _parse_json_array_best_effort(txt)
+        return items
+    except Exception:
+        return []
+
+def extract_and_save_memory_facts(user_key: str, user_msg: str, ai_reply: str) -> None:
+    """Best-effort: extract & save structured long-term memories. Never raises."""
+    if not MEMORY_FACTS_ENABLED_DEFAULT:
+        return
+    if not MEMORY_FACTS_EXTRACT_ENABLED:
+        return
+
+    um = (user_msg or "").strip()
+    ar = (ai_reply or "").strip()
+    if not um and not ar:
+        return
+
+    # Cheap gate to avoid extracting on every trivial turn
+    gate_text = (um + "\n" + ar).strip()
+    if len(gate_text) < 24:
+        return
+    if not _should_memory_add(um) and not _should_memory_add(ar):
+        return
+
+    items: List[Dict[str, Any]] = []
+    if OPENAI_API_KEY:
+        items = _extract_memory_facts_openai(um, ar)
+    elif ANTHROPIC_API_KEY:
+        items = _extract_memory_facts_anthropic(um, ar)
+
+    if not items:
+        return
+
+    for it in items:
+        try:
+            c = str(it.get("content") or "").strip()
+            if not c:
+                continue
+            tags = str(it.get("tags") or "").strip()
+            try:
+                imp = int(it.get("importance") or 1)
+            except Exception:
+                imp = 1
+            if imp < MEMORY_FACTS_IMPORTANCE_MIN:
+                continue
+            memory_facts_save(user_key, c, tags=tags, importance=imp)
+        except Exception:
+            continue
+
+
+
 MEMORY_MIN_CHARS = int(os.getenv("MEMORY_MIN_CHARS") or "12")
 
 def _looks_like_code(t: str) -> bool:
@@ -2930,6 +3371,168 @@ def _chat_headers(stream: bool = True) -> Dict[str, str]:
 
 
 # ================================
+# Anthropic (Claude) helpers
+# ================================
+
+def _is_claude_model(model: str) -> bool:
+    return bool((model or "").strip().lower().startswith("claude-"))
+
+
+def _anthropic_headers(stream: bool = False) -> Dict[str, str]:
+    if not ANTHROPIC_API_KEY:
+        raise RuntimeError("missing ANTHROPIC_API_KEY")
+    h = {
+        "x-api-key": ANTHROPIC_API_KEY,
+        "anthropic-version": ANTHROPIC_VERSION or "2023-06-01",
+        "content-type": "application/json",
+    }
+    if stream:
+        h["accept"] = "text/event-stream"
+    return h
+
+
+def _responses_input_to_anthropic(inp: List[Dict[str, Any]]) -> Tuple[str, List[Dict[str, Any]]]:
+    """Convert OpenAI Responses-style `input` to Anthropic `messages` + `system`.
+
+    OpenAI input: [{role, content:[{type:input_text|output_text|input_image,...}]}]
+    Anthropic: system:str, messages:[{role:user|assistant, content:[{type:text|image,...}]}]
+    """
+
+    def _extract_text(blocks: Any) -> str:
+        out: List[str] = []
+        for b in (blocks or []):
+            if not isinstance(b, dict):
+                continue
+            t = (b.get("type") or "").strip()
+            if t in ("input_text", "output_text", "text"):
+                s = b.get("text")
+                if isinstance(s, str) and s:
+                    out.append(s)
+        return "\n".join(out).strip()
+
+    system_parts: List[str] = []
+    msgs: List[Dict[str, Any]] = []
+
+    for m in (inp or []):
+        if not isinstance(m, dict):
+            continue
+        role = (m.get("role") or "").strip().lower()
+        blocks = m.get("content") or []
+
+        if role in ("system", "developer"):
+            t = _extract_text(blocks)
+            if t:
+                system_parts.append(t)
+            continue
+
+        if role not in ("user", "assistant"):
+            role = "user"
+
+        a_blocks: List[Dict[str, Any]] = []
+        for b in (blocks or []):
+            if not isinstance(b, dict):
+                continue
+            bt = (b.get("type") or "").strip()
+
+            if bt in ("input_text", "output_text", "text"):
+                txt = b.get("text")
+                if isinstance(txt, str) and txt:
+                    a_blocks.append({"type": "text", "text": txt})
+                continue
+
+            if bt == "input_image":
+                url = None
+                if isinstance(b.get("image_url"), dict):
+                    url = b.get("image_url", {}).get("url")
+                elif isinstance(b.get("image_url"), str):
+                    url = b.get("image_url")
+                if isinstance(url, str) and url.startswith("data:") and ";base64," in url:
+                    try:
+                        head, b64 = url.split(",", 1)
+                        # head example: data:image/png;base64
+                        media = head.split(";", 1)[0].split(":", 1)[1] if ":" in head else "image/png"
+                        a_blocks.append({
+                            "type": "image",
+                            "source": {"type": "base64", "media_type": media or "image/png", "data": b64},
+                        })
+                    except Exception:
+                        # If parsing fails, degrade gracefully to a text placeholder.
+                        a_blocks.append({"type": "text", "text": "[image attached]"})
+                else:
+                    a_blocks.append({"type": "text", "text": "[image attached]"})
+                continue
+
+            # Unknown/unsupported block -> ignore (or keep as placeholder)
+            # a_blocks.append({"type": "text", "text": f"[{bt}]"})
+
+        if not a_blocks:
+            # Anthropic requires at least one content block.
+            a_blocks = [{"type": "text", "text": ""}]
+
+        msgs.append({"role": role, "content": a_blocks})
+
+    system = "\n\n".join([s for s in system_parts if s]).strip()
+    return system, msgs
+
+
+def _anthropic_messages_create_nonstream(
+    *,
+    model: str,
+    inp: List[Dict[str, Any]],
+    max_tokens: int,
+    temperature: Optional[float] = None,
+) -> Dict[str, Any]:
+    """Call Anthropic Messages API and return a Responses-like dict used by the rest of the backend."""
+    system, messages = _responses_input_to_anthropic(inp)
+    payload: Dict[str, Any] = {
+        "model": model,
+        "max_tokens": int(max_tokens or 2048),
+        "messages": messages,
+    }
+    if system:
+        payload["system"] = system
+    if temperature is not None:
+        payload["temperature"] = float(temperature)
+
+    url = f"{ANTHROPIC_BASE_URL}/v1/messages"
+    r = requests.post(url, headers=_anthropic_headers(stream=False), data=json.dumps(payload), timeout=60)
+    if r.status_code >= 400:
+        raise RuntimeError(f"anthropic error {r.status_code}: {r.text}")
+    j = r.json()
+
+    # Extract assistant text
+    out_parts: List[str] = []
+    for c in (j.get("content") or []):
+        if isinstance(c, dict) and c.get("type") == "text":
+            t = c.get("text")
+            if isinstance(t, str):
+                out_parts.append(t)
+    text = "".join(out_parts)
+
+    stop_reason = (j.get("stop_reason") or "").strip().lower()
+    is_incomplete = stop_reason in ("max_tokens", "length")
+
+    # Build a minimal OpenAI Responses-like structure so existing UI/parsing keeps working.
+    rid = j.get("id") or ("anthropic_" + uuid.uuid4().hex)
+    resp_like: Dict[str, Any] = {
+        "id": rid,
+        "output": [
+            {
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": text}],
+            }
+        ],
+    }
+    if is_incomplete:
+        resp_like["status"] = "incomplete"
+        resp_like["incomplete_details"] = {"reason": "max_output_tokens"}
+    else:
+        resp_like["status"] = "completed"
+    return resp_like
+
+
+# ================================
 # Smart Router helpers (DeepSeek text / OpenAI web+realtime)
 # ================================
 
@@ -2970,6 +3573,40 @@ def _extract_allow_web(req: Request, body: Dict[str, Any]) -> bool:
         if hv is not None:
             return _boolish(hv)
     return True
+
+
+
+def _extract_plan(request: Request, body: Dict[str, Any]) -> str:
+    """Extract plan/tier from body, headers, or query params (raw string)."""
+    # 1) Body (preferred)
+    for k in ("plan", "tier", "subscription", "package", "mode"):
+        try:
+            v = body.get(k)
+        except Exception:
+            v = None
+        if v is not None and str(v).strip():
+            return str(v).strip()
+
+    # 2) Headers
+    for hk in ("x-chatagi-plan", "x-plan", "x-tier", "x-subscription", "x-package", "x-mode"):
+        try:
+            v = request.headers.get(hk)
+        except Exception:
+            v = None
+        if v is not None and str(v).strip():
+            return str(v).strip()
+
+    # 3) Query params
+    try:
+        qp = request.query_params
+        for qk in ("plan", "tier", "subscription"):
+            v = qp.get(qk)
+            if v is not None and str(v).strip():
+                return str(v).strip()
+    except Exception:
+        pass
+
+    return ""
 
 
 def _attachments_require_openai(attachments: List[Dict[str, Any]]) -> bool:
@@ -4240,6 +4877,89 @@ def _stream_openai_events(
     """
     model = (model or CHAT_MODEL_DEFAULT).strip() or CHAT_MODEL_DEFAULT
 
+    # Claude route: stream from Anthropic Messages API and emit OpenAI-like SSE events.
+    if _is_claude_model(model):
+        inp = _build_responses_input(messages, attachments or [])
+        if instructions:
+            inp = [{"role": "system", "content": [{"type": "input_text", "text": str(instructions)}]}] + inp
+
+        system, a_messages = _responses_input_to_anthropic(inp)
+        payload: Dict[str, Any] = {
+            "model": model,
+            "messages": a_messages,
+            "max_tokens": int(max_output_tokens or CHAT_MAX_OUTPUT_TOKENS_DEFAULT),
+            "stream": True,
+        }
+        if system:
+            payload["system"] = system
+
+        url = f"{ANTHROPIC_BASE_URL}/v1/messages"
+        rid: Optional[str] = None
+        stop_reason: Optional[str] = None
+
+        with requests.post(
+            url,
+            headers=_anthropic_headers(stream=True),
+            data=json.dumps(payload),
+            stream=True,
+            timeout=CHAT_STREAM_TIMEOUT_SEC,
+        ) as r:
+            if r.status_code >= 400:
+                raise RuntimeError(f"anthropic stream error {r.status_code}: {r.text}")
+
+            for raw in r.iter_lines(decode_unicode=True):
+                if not raw:
+                    continue
+                line = raw.strip()
+                if not line.startswith("data:"):
+                    continue
+                data = line[len("data:") :].strip()
+                if not data or data == "[DONE]":
+                    continue
+                try:
+                    ev = json.loads(data)
+                except Exception:
+                    continue
+
+                et = (ev.get("type") or "").strip()
+
+                if et == "message_start":
+                    rid = (ev.get("message") or {}).get("id") or rid or ("anthropic_" + uuid.uuid4().hex)
+                    yield {"type": "response.created", "response": {"id": rid}}
+                    continue
+
+                if et == "content_block_delta":
+                    delta = ev.get("delta") or {}
+                    if isinstance(delta, dict) and delta.get("type") == "text_delta":
+                        txt = delta.get("text")
+                        if isinstance(txt, str) and txt:
+                            yield {"type": "response.output_text.delta", "delta": txt}
+                    continue
+
+                if et == "message_delta":
+                    d = ev.get("delta") or {}
+                    if isinstance(d, dict):
+                        sr = d.get("stop_reason")
+                        if isinstance(sr, str) and sr:
+                            stop_reason = sr
+                    continue
+
+                if et == "message_stop":
+                    break
+
+        # finalize
+        yield {"type": "response.output_text.done"}
+
+        # stop_reason values: "end_turn" / "max_tokens" / etc.
+        if (stop_reason or "").strip().lower() in ("max_tokens", "length"):
+            yield {
+                "type": "response.incomplete",
+                "response": {"id": rid or ("anthropic_" + uuid.uuid4().hex), "incomplete_details": {"reason": "max_output_tokens"}},
+            }
+        else:
+            yield {"type": "response.completed", "response": {"id": rid or ("anthropic_" + uuid.uuid4().hex)}}
+        return
+
     # ---------- 1) Responses API (preferred) ----------
     r = None
     try:
@@ -5076,6 +5796,17 @@ def _openai_responses_create_nonstream(
     instructions: Optional[str] = None,
     enable_web_search: bool = False,
 ) -> Dict[str, Any]:
+    model = (model or CHAT_MODEL_DEFAULT).strip()
+
+    # Claude route: if model id starts with "claude-" use Anthropic.
+    # We return a Responses-like dict so downstream parsing (and the iOS app) stays unchanged.
+    if _is_claude_model(model):
+        return _anthropic_messages_create_nonstream(
+            model=model,
+            inp=inp,
+            max_tokens=int(max_output_tokens or 2048),
+        )
+
     url = "https://api.openai.com/v1/responses"
     payload: Dict[str, Any] = {
         "model": model,
@@ -5783,6 +6514,17 @@ def _spawn_chat_worker(
                 except Exception:
                     pass
 
+            # Structured facts extraction (async, best-effort)
+            try:
+                if last_user_text and job.full_text:
+                    threading.Thread(
+                        target=extract_and_save_memory_facts,
+                        args=(user_key, last_user_text, job.full_text),
+                        daemon=True,
+                    ).start()
+            except Exception:
+                pass
+
             if job.full_text:
                 job.push_event({
                     "type": "response.output_text.done",
@@ -5853,9 +6595,15 @@ async def chat_legacy(request: Request):
     except Exception:
         body = {}
 
-    requested_model = (body.get("model") or "").strip()
-    if not CHAT_ALLOW_CLIENT_MODEL:
-        requested_model = ""
+    client_model = (body.get("model") or "").strip()
+    requested_model = client_model
+
+    # -----------------------------
+    # Plan-based model routing (stable, env-locked)
+    plan_raw = _extract_plan(request, body)
+    client_model = (str(body.get("model") or "").strip() or str(request.headers.get("x-model") or "").strip())
+    requested_model, plan, _model_reason = _select_model_for_request(plan_raw, client_model)
+
     allow_web = _extract_allow_web(request, body)
     msgs = body.get("messages") or []
     atts = body.get("attachments") or []
@@ -5897,17 +6645,44 @@ async def chat_legacy(request: Request):
     # Ensure markdown/code fences for client-side highlight.
     messages = _prepend_style_prompt(messages)
 
+    # ✅ Inject structured long-term memory facts (query-independent)
+    if MEMORY_FACTS_ENABLED_DEFAULT:
+        try:
+            facts_ctx = memory_facts_build_prompt(user_key, limit=MEMORY_FACTS_PROMPT_LIMIT)
+        except Exception:
+            facts_ctx = ""
+        if facts_ctx:
+            insert_at = 1 if messages and (messages[0].get("role") in ("system", "developer")) else 0
+            messages.insert(insert_at, {"role": "system", "content": facts_ctx})
+
+
     # ✅ Inject vector memory context (official RAG-style: retrieve -> system)
     if MEMORY_ENABLED_DEFAULT and last_user_text:
         mem_ctx = memory_build_context(user_key, last_user_text, k=MEMORY_TOP_K_DEFAULT, min_score=MEMORY_MIN_SCORE_DEFAULT)
         if mem_ctx:
             # keep style prompt at first
-            insert_i = 1 if (messages and messages[0].get("role") == "system") else 0
+            insert_i = 1 if (messages and (messages[0].get("role") in ("system", "developer"))) else 0
+            # If we already inserted the facts memory block, put vector memory after it.
+            if insert_i < len(messages):
+                c0 = (messages[insert_i].get("content") or "") if isinstance(messages[insert_i], dict) else ""
+                if isinstance(c0, str) and c0.startswith("以下是【长期记忆】（重要事实/偏好"):
+                    insert_i += 1
             messages.insert(insert_i, {"role": "system", "content": mem_ctx})
 
     # ✅ Persist user message to conversation history (best-effort)
     if last_user_text:
-        conv_add_message(user_key, conversation_id, "user", last_user_text)
+        try:
+            conv_add_message(user_key, conversation_id, "user", last_user_text)
+        except Exception:
+            pass
+
+        # Add to long-term memory (vector DB)
+        if MEMORY_ENABLED_DEFAULT:
+            try:
+                if _should_memory_add(last_user_text):
+                    memory_add(user_key, f"用户：{last_user_text}"[:1200])
+            except Exception:
+                pass
 
     attachments: List[Dict[str, Any]] = []
     if isinstance(atts, list) and atts:
@@ -5961,6 +6736,30 @@ async def chat_legacy(request: Request):
                 instructions=instructions,
                 enable_web_search=bool(allow_web),
             )
+
+        # ✅ Persist assistant reply + memory (legacy /chat is non-stream, so we must do it here)
+        if full_text:
+            try:
+                conv_add_message(user_key, conversation_id, "assistant", full_text)
+            except Exception:
+                pass
+
+            if MEMORY_ENABLED_DEFAULT:
+                try:
+                    if _should_memory_add(full_text):
+                        memory_add(user_key, f"助手：{full_text.strip()}"[:1200])
+                except Exception:
+                    pass
+
+            # Structured facts extraction (async, best-effort)
+            try:
+                threading.Thread(
+                    target=extract_and_save_memory_facts,
+                    args=(user_key, last_user_text, full_text),
+                    daemon=True,
+                ).start()
+            except Exception:
+                pass
 
         # Optional: server-side parts + zip (commercial UX)
         try:
@@ -6040,7 +6839,7 @@ async def chat_prepare(request: Request):
     POST /chat/prepare
     JSON:
       {
-        "model": "gpt-5",
+        "model": "claude-3.5-sonnet-20240229",
         "messages": [{"role":"user","content":"..."}],
         "conversation_id": "...",        # optional
         "attachments": [...],            # optional (image/audio)
@@ -6076,8 +6875,11 @@ async def chat_prepare(request: Request):
 
     # Conversation id (client may pass it as snake_case or camelCase)
     conversation_id = (body.get("conversation_id") or body.get("conversationId") or "").strip()
+    # Plan-based model routing (stable, env-locked)
+    plan_raw = _extract_plan(request, body)
+    client_model = (str(body.get("model") or "").strip() or str(request.headers.get("x-model") or "").strip())
+    requested_model, plan, _model_reason = _select_model_for_request(plan_raw, client_model)
 
-    requested_model = (body.get("model") or "").strip()
     allow_web = _extract_allow_web(request, body)
     msgs = body.get("messages") or []
     if not isinstance(msgs, list) or not msgs:
@@ -6140,6 +6942,55 @@ async def chat_prepare(request: Request):
         # Never fail the chat because of history db
         conversation_id = conversation_id or uuid.uuid4().hex
 
+
+    # ✅ Server-side history fallback:
+    # Some clients/plans may only send the newest user message (e.g. after switching screens).
+    # If we have a conversation_id, hydrate context from our SQLite history so the model keeps continuity.
+    try:
+        if conversation_id and CHAT_HISTORY_FALLBACK_MESSAGES > 0:
+            client_len = len(messages)
+            non_system = [m for m in messages if (m.get("role") or "").strip() not in ("system", "developer")]
+            has_assistant = any((m.get("role") or "").strip() == "assistant" for m in non_system)
+
+            # Heuristic: if client sent no assistant turns and only <= 2 non-system messages,
+            # treat it as "thin context" and hydrate from DB.
+            if (not has_assistant) and (len(non_system) <= 2):
+                with _conv_conn() as con:
+                    cur = con.execute(
+                        "SELECT role, content FROM messages WHERE conversation_id=? AND user_key=? ORDER BY created_at DESC LIMIT ?",
+                        (conversation_id, user_key, CHAT_HISTORY_FALLBACK_MESSAGES),
+                    )
+                    rows = cur.fetchall()
+
+                hist = []
+                for role, content in reversed(rows):
+                    role = (role or "").strip()
+                    content = (content or "").strip()
+                    if not content:
+                        continue
+                    if role not in ("user", "assistant", "system", "developer"):
+                        continue
+                    hist.append({"role": role, "content": content})
+
+                if hist:
+                    # De-dup: if the newest DB message equals the first current non-system message, drop it.
+                    if non_system:
+                        hlast = hist[-1]
+                        first = non_system[0]
+                        if (hlast.get("role") == (first.get("role") or "").strip()) and (
+                            (hlast.get("content") or "").strip() == (first.get("content") or "").strip()
+                        ):
+                            hist = hist[:-1]
+
+                    sys_msgs = [m for m in messages if (m.get("role") or "").strip() in ("system", "developer")]
+                    messages = sys_msgs + hist + non_system
+                    log.info(
+                        "[chat-context] hydrated conv=%s client=%d hist=%d final=%d",
+                        conversation_id, client_len, len(hist), len(messages)
+                    )
+    except Exception as e:
+        log.warning("[chat-context] hydrate failed: %s", e)
+
     # Persist ONLY the newest user message to DB (avoid duplicating full history)
     if last_user_text:
         try:
@@ -6158,6 +7009,17 @@ async def chat_prepare(request: Request):
     # Prepend style prompt (markdown/code fences) for better rendering
     messages = _prepend_style_prompt(messages)
 
+    # ✅ Inject structured long-term memory facts (query-independent)
+    if MEMORY_FACTS_ENABLED_DEFAULT:
+        try:
+            facts_ctx = memory_facts_build_prompt(user_key, limit=MEMORY_FACTS_PROMPT_LIMIT)
+        except Exception:
+            facts_ctx = ""
+        if facts_ctx:
+            insert_at = 1 if messages and (messages[0].get("role") in ("system", "developer")) else 0
+            messages.insert(insert_at, {"role": "system", "content": facts_ctx})
+
+
     # Inject memory context for better recall
     if MEMORY_ENABLED_DEFAULT and last_user_text:
         try:
@@ -6166,6 +7028,11 @@ async def chat_prepare(request: Request):
             mem_ctx = ""
         if mem_ctx:
             insert_at = 1 if messages and (messages[0].get("role") in ("system", "developer")) else 0
+            # If we already inserted the facts memory block, put vector memory after it.
+            if insert_at < len(messages):
+                c0 = (messages[insert_at].get("content") or "") if isinstance(messages[insert_at], dict) else ""
+                if isinstance(c0, str) and c0.startswith("以下是【长期记忆】（重要事实/偏好"):
+                    insert_at += 1
             messages.insert(insert_at, {"role": "system", "content": mem_ctx})
 
     tts_voice = (body.get("tts_voice") or body.get("voice") or TTS_VOICE_DEFAULT).strip() or TTS_VOICE_DEFAULT
@@ -6207,6 +7074,7 @@ async def chat_prepare(request: Request):
         instructions=instructions,
         conversation_id=conversation_id,
         user_key=user_key,
+        last_user_text=last_user_text,
         memory_enabled=MEMORY_ENABLED_DEFAULT,
     )
 
@@ -7508,7 +8376,14 @@ async def session_post(req: Request):
 
     instructions, resolved_profile = _pick_realtime_instructions(req, b)
 
+    # Try primary model, then auto-fallback to keep voice stable.
     key, err = _realtime_ephemeral(model, voice, instructions=instructions)
+    if err and REALTIME_MODEL_FALLBACK and model != REALTIME_MODEL_FALLBACK:
+        key2, err2 = _realtime_ephemeral(REALTIME_MODEL_FALLBACK, voice, instructions=instructions)
+        if not err2 and key2:
+            model = REALTIME_MODEL_FALLBACK
+            key, err = key2, None
+
     if err:
         return JSONResponse({"ok": False, "error": err}, status_code=502)
 
@@ -8841,6 +9716,11 @@ if __name__ == "__main__":
         log_level="info",
         access_log=False,
     )
+
+
+
+
+
 
 
 
