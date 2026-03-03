@@ -49,6 +49,7 @@ from typing import Optional, Dict, Any, Tuple, Iterator, List
 from contextlib import asynccontextmanager
 
 import requests
+import websockets
 from fastapi import FastAPI, UploadFile, File, Form, Request, Header, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse, StreamingResponse, Response, FileResponse
 from fastapi.middleware.cors import CORSMiddleware
@@ -65,6 +66,14 @@ from routers.home_automation import (
     home_instructions_for_request as home_instructions_for_request_router,
     home_has_binding,
 )
+
+# ✅ Memory module (Plan A: dedicated long-term memory engine)
+try:
+    from memory_module import MemoryEngine, MemoryConfig as MemoryModuleConfig, should_store_memory
+except Exception:  # pragma: no cover
+    MemoryEngine = None  # type: ignore
+    MemoryModuleConfig = None  # type: ignore
+    should_store_memory = None  # type: ignore
 
 # -----------------------------
 # ✅ Home voice control instructions aligned with iOS parser
@@ -114,6 +123,13 @@ def _home_instructions_ios_protocol(req: Request, client_id: Optional[str]) -> s
 # ✅ billing / auth routers (keep your existing business logic)
 from billing import router as billing_router
 from auth import router as auth_router
+
+# ✅ Agent Loop router (高级编程版：工程内循环)
+try:
+    from agent_loop_router import router as agent_loop_router
+except Exception:
+    agent_loop_router = None
+
 
 # -----------------------------
 # Remix profile (single source of truth)
@@ -407,6 +423,229 @@ CHAT_STREAM_READ_TIMEOUT_SEC = float(os.getenv("CHAT_STREAM_READ_TIMEOUT_SEC") o
 # Enable OpenAI built-in web search tool (Responses API)
 CHAT_ENABLE_WEB_SEARCH_DEFAULT = (os.getenv("CHAT_ENABLE_WEB_SEARCH_DEFAULT") or os.getenv("CHAT_ENABLE_WEB_SEARCH") or "1").strip().lower() not in ("0","false","no")
 
+
+# -----------------------------
+# ✅ Unified Web Search Provider (replace OpenAI web_search tool when desired)
+#
+# Goal: keep "search results" consistent across models/providers.
+# - CHAT_WEB_PROVIDER=openai  -> use OpenAI built-in web_search tool (Responses API)
+# - CHAT_WEB_PROVIDER=serper  -> use Serper (Google SERP API) and inject results into the prompt
+# -----------------------------
+CHAT_WEB_PROVIDER = (os.getenv("CHAT_WEB_PROVIDER") or os.getenv("CHAT_WEB_SEARCH_PROVIDER") or os.getenv("WEB_SEARCH_PROVIDER") or "openai").strip().lower()
+
+# Optional: limit web search to specific plans (comma-separated), e.g. "ultra,pro".
+# If empty -> allow_web behaves as request flag/default.
+CHAT_WEB_ALLOWED_PLANS = (os.getenv("CHAT_WEB_ALLOWED_PLANS") or "").strip().lower()
+CHAT_WEB_ALLOWED_PLANS_SET = {p.strip() for p in CHAT_WEB_ALLOWED_PLANS.split(",") if p.strip()}
+
+def _plan_allows_web(plan: str) -> bool:
+    if not CHAT_WEB_ALLOWED_PLANS_SET:
+        return True
+    return (plan or "").strip().lower() in CHAT_WEB_ALLOWED_PLANS_SET
+
+# Claude built-in web search tool (Anthropic) config (used for Claude models when web search enabled)
+# Docs: https://platform.claude.com/docs/en/agents-and-tools/tool-use/web-search-tool
+# Tool types: web_search_20250305 (basic), web_search_20260209 (dynamic filtering; requires code_execution tool enabled)
+CLAUDE_WEB_SEARCH_TOOL_TYPE = (os.getenv("CLAUDE_WEB_SEARCH_TOOL_TYPE") or os.getenv("CLAUDE_WEB_SEARCH_TOOL_VERSION") or "web_search_20250305").strip()
+try:
+    CLAUDE_WEB_SEARCH_MAX_USES = int(os.getenv("CLAUDE_WEB_SEARCH_MAX_USES") or "5")
+except Exception:
+    CLAUDE_WEB_SEARCH_MAX_USES = 5
+CLAUDE_WEB_SEARCH_MAX_USES = max(1, min(CLAUDE_WEB_SEARCH_MAX_USES, 10))
+
+CLAUDE_WEB_SEARCH_ALLOWED_DOMAINS = (os.getenv("CLAUDE_WEB_SEARCH_ALLOWED_DOMAINS") or "").strip()
+CLAUDE_WEB_SEARCH_BLOCKED_DOMAINS = (os.getenv("CLAUDE_WEB_SEARCH_BLOCKED_DOMAINS") or "").strip()
+
+# Serper config (only used when CHAT_WEB_PROVIDER starts with "serper")
+SERPER_API_KEY = (os.getenv("SERPER_API_KEY") or os.getenv("SERPER_KEY") or "").strip()
+SERPER_TIMEOUT_SEC = float(os.getenv("SERPER_TIMEOUT_SEC") or "12")
+SERPER_GL = (os.getenv("SERPER_GL") or "").strip()   # e.g. "us"
+SERPER_HL = (os.getenv("SERPER_HL") or "").strip()   # e.g. "en"
+SERPER_DEFAULT_KIND = (os.getenv("SERPER_KIND") or os.getenv("CHAT_WEB_SERPER_KIND") or "search").strip().lower()  # "search" | "news"
+CHAT_WEB_TOPK_DEFAULT = int(os.getenv("CHAT_WEB_TOPK") or os.getenv("CHAT_WEB_K") or "6")
+CHAT_WEB_TOPK_DEFAULT = max(1, min(CHAT_WEB_TOPK_DEFAULT, 20))
+CHAT_WEB_CONTEXT_MAX_CHARS = int(os.getenv("CHAT_WEB_CONTEXT_MAX_CHARS") or "6000")
+CHAT_WEB_CONTEXT_MAX_CHARS = max(1000, min(CHAT_WEB_CONTEXT_MAX_CHARS, 20000))
+
+_SERPER_CACHE_TTL_SEC = int(os.getenv("SERPER_CACHE_TTL_SEC") or "300")
+_SERPER_CACHE_TTL_SEC = max(0, min(_SERPER_CACHE_TTL_SEC, 3600))
+_SERPER_CACHE: Dict[str, Tuple[float, List[Dict[str, Any]]]] = {}
+_SERPER_CACHE_LOCK = threading.Lock()
+
+_WEB_CTX_TAG = "[WEB_SEARCH_RESULTS]"
+
+def _should_use_openai_web_search_tool(enable: bool) -> bool:
+    if not enable:
+        return False
+    if not CHAT_ENABLE_WEB_SEARCH_DEFAULT:
+        return False
+    return CHAT_WEB_PROVIDER in ("openai", "openai_tool", "openai_web_search", "openai-web_search")
+
+def _should_use_claude_web_search_tool(enable: bool, model: str) -> bool:
+    """Whether to enable Anthropic/Claude built-in web_search tool for this request."""
+    if not enable:
+        return False
+    if not CHAT_ENABLE_WEB_SEARCH_DEFAULT:
+        return False
+    # If you've configured Serper injection, don't also enable Claude's server tool.
+    if (CHAT_WEB_PROVIDER or "").startswith("serper"):
+        return False
+    if not _is_claude_model(model or ""):
+        return False
+    return bool((CLAUDE_WEB_SEARCH_TOOL_TYPE or "").strip())
+
+def _claude_web_search_tool_def() -> Dict[str, Any]:
+    """Tool definition for Claude web search."""
+    tool: Dict[str, Any] = {
+        "type": (CLAUDE_WEB_SEARCH_TOOL_TYPE or "web_search_20250305").strip(),
+        "name": "web_search",
+        "max_uses": int(CLAUDE_WEB_SEARCH_MAX_USES or 5),
+    }
+
+    # Domain filters (optional; cannot set both allowed & blocked in same request)
+    allowed = [d.strip() for d in (CLAUDE_WEB_SEARCH_ALLOWED_DOMAINS or "").split(",") if d.strip()]
+    blocked = [d.strip() for d in (CLAUDE_WEB_SEARCH_BLOCKED_DOMAINS or "").split(",") if d.strip()]
+
+    if allowed and blocked:
+        # Prefer allow-list if both are mistakenly set
+        blocked = []
+
+    if allowed:
+        tool["allowed_domains"] = allowed
+    elif blocked:
+        tool["blocked_domains"] = blocked
+
+    return tool
+
+def _last_user_text_from_messages(messages: List[Dict[str, str]]) -> str:
+    for mm in reversed(messages or []):
+        try:
+            if str(mm.get("role") or "").strip().lower() == "user":
+                return str(mm.get("content") or "")
+        except Exception:
+            continue
+    return ""
+
+def _inject_web_context(messages: List[Dict[str, str]], ctx: str) -> List[Dict[str, str]]:
+    ctx = (ctx or "").strip()
+    if not ctx:
+        return messages
+    # avoid double-inject
+    for mm in messages or []:
+        if isinstance(mm, dict) and (mm.get("role") in ("system", "developer")):
+            c = str(mm.get("content") or "")
+            if c.startswith(_WEB_CTX_TAG):
+                return messages
+    injected = {"role": "system", "content": f"{_WEB_CTX_TAG}\n{ctx}"}
+
+    # place after existing system/developer messages
+    out = list(messages or [])
+    insert_at = 0
+    while insert_at < len(out) and str(out[insert_at].get("role") or "").strip().lower() in ("system", "developer"):
+        insert_at += 1
+    out.insert(insert_at, injected)
+    return out
+
+def _format_web_context_for_prompt(results: List[Dict[str, Any]]) -> str:
+    if not results:
+        return ""
+    lines: List[str] = []
+    lines.append("你可以使用以下【联网搜索结果】来回答用户问题。若引用具体事实，请尽量用 [1][2] 这种编号引用来源。")
+    lines.append("")
+    for i, r in enumerate(results[:CHAT_WEB_TOPK_DEFAULT], start=1):
+        title = str(r.get("title") or "").strip()
+        url = str(r.get("url") or "").strip()
+        snippet = str(r.get("snippet") or "").strip()
+        if not url:
+            continue
+        if not title:
+            title = url
+        lines.append(f"[{i}] {title}")
+        lines.append(url)
+        if snippet:
+            # avoid huge snippets
+            snippet2 = snippet.strip()
+            if len(snippet2) > 400:
+                snippet2 = snippet2[:400] + "…"
+            lines.append(snippet2)
+        lines.append("")
+    ctx = "\n".join(lines).strip()
+    if len(ctx) > CHAT_WEB_CONTEXT_MAX_CHARS:
+        ctx = ctx[:CHAT_WEB_CONTEXT_MAX_CHARS] + "…"
+    return ctx
+
+def _serper_endpoint(kind: str) -> str:
+    kind = (kind or "search").strip().lower()
+    if kind == "news":
+        return "https://google.serper.dev/news"
+    # default: web search
+    return "https://google.serper.dev/search"
+
+def _serper_web_search(query: str, *, k: int = 6, kind: Optional[str] = None) -> List[Dict[str, Any]]:
+    query = (query or "").strip()
+    if not query:
+        return []
+    if not SERPER_API_KEY:
+        raise RuntimeError("SERPER_API_KEY is missing (set env SERPER_API_KEY)")
+
+    k = max(1, min(int(k or CHAT_WEB_TOPK_DEFAULT), 20))
+    kind0 = (kind or SERPER_DEFAULT_KIND or "search").strip().lower()
+    cache_key = f"{kind0}|{k}|{SERPER_GL}|{SERPER_HL}|{query}"
+    now = time.time()
+
+    if _SERPER_CACHE_TTL_SEC > 0:
+        with _SERPER_CACHE_LOCK:
+            ent = _SERPER_CACHE.get(cache_key)
+            if ent and ent[0] > now:
+                return ent[1]
+
+    url = _serper_endpoint(kind0)
+    headers = {
+        "X-API-KEY": SERPER_API_KEY,
+        "Content-Type": "application/json",
+    }
+    payload: Dict[str, Any] = {"q": query, "num": k}
+    if SERPER_GL:
+        payload["gl"] = SERPER_GL
+    if SERPER_HL:
+        payload["hl"] = SERPER_HL
+
+    r = requests.post(url, headers=headers, json=payload, timeout=SERPER_TIMEOUT_SEC)
+    if r.status_code >= 400:
+        raise RuntimeError(f"serper_error {r.status_code}: {_short(r.text, 400)}")
+    data = r.json() if r.content else {}
+
+    # Normalize results
+    items = []
+    if kind0 == "news":
+        items = data.get("news") or []
+    else:
+        items = data.get("organic") or []
+    out: List[Dict[str, Any]] = []
+    for it in items[:k]:
+        if not isinstance(it, dict):
+            continue
+        title = str(it.get("title") or it.get("name") or "").strip()
+        url2 = str(it.get("link") or it.get("url") or "").strip()
+        snippet = str(it.get("snippet") or it.get("description") or "").strip()
+        date = str(it.get("date") or it.get("publishedDate") or "").strip()
+        if not url2:
+            continue
+        if not title:
+            title = url2
+        out.append({
+            "title": title,
+            "url": url2,
+            "snippet": snippet,
+            "date": date,
+            "provider": "serper",
+        })
+
+    if _SERPER_CACHE_TTL_SEC > 0:
+        with _SERPER_CACHE_LOCK:
+            _SERPER_CACHE[cache_key] = (now + _SERPER_CACHE_TTL_SEC, out)
+    return out
+
 # TTS for chat streaming (sentence-by-sentence)
 TTS_SPEECH_URL = "https://api.openai.com/v1/audio/speech"
 TTS_MODEL_DEFAULT = (os.getenv("TTS_MODEL") or "gpt-4o-mini-tts").strip()
@@ -515,6 +754,46 @@ MEMORY_FACTS_EXTRACT_ENABLED = (os.getenv("SOLARA_MEMORY_FACTS_EXTRACT_ENABLED")
 MEMORY_FACTS_EXTRACT_MODEL_OPENAI = (os.getenv("SOLARA_MEMORY_FACTS_EXTRACT_MODEL_OPENAI") or "gpt-4o-mini").strip()
 MEMORY_FACTS_EXTRACT_MODEL_ANTHROPIC = (os.getenv("SOLARA_MEMORY_FACTS_EXTRACT_MODEL_ANTHROPIC") or "claude-3-haiku-20240307").strip()
 MEMORY_FACTS_IMPORTANCE_MIN = int(os.getenv("SOLARA_MEMORY_FACTS_IMPORTANCE_MIN") or "2")
+
+# -----------------------------
+# ✅ Memory Engine instance (Plan A)
+# - Async write queue prevents /chat blocking (important on Render free tier)
+# - Keep DB schema compatible: memory_items + memory_facts
+# -----------------------------
+SOLARA_MEMORY_EMBED_PROVIDER = (os.getenv("SOLARA_MEMORY_EMBED_PROVIDER") or "auto").strip().lower()  # auto|openai|local
+SOLARA_MEMORY_WRITE_ASYNC = (os.getenv("SOLARA_MEMORY_WRITE_ASYNC") or "1").strip().lower() not in ("0","false","no")
+
+MEMORY_ENGINE = None
+if MemoryEngine is not None and MemoryModuleConfig is not None:
+    try:
+        MEMORY_ENGINE = MemoryEngine(
+            MemoryModuleConfig(
+                db_path=MEM_DB_PATH,
+                openai_api_key=OPENAI_API_KEY,
+                embed_model=MEMORY_EMBED_MODEL,
+                embed_provider=SOLARA_MEMORY_EMBED_PROVIDER,
+                enabled=MEMORY_ENABLED_DEFAULT,
+                max_items_per_user=MEMORY_MAX_ITEMS_PER_USER,
+                top_k_default=MEMORY_TOP_K_DEFAULT,
+                min_score_default=MEMORY_MIN_SCORE_DEFAULT,
+                context_max_chars=MEMORY_CONTEXT_MAX_CHARS,
+                item_max_chars=MEMORY_ITEM_MAX_CHARS,
+                write_async=SOLARA_MEMORY_WRITE_ASYNC,
+                facts_enabled=MEMORY_FACTS_ENABLED_DEFAULT,
+                facts_max_items_per_user=MEMORY_FACTS_MAX_ITEMS_PER_USER,
+                facts_prompt_limit=MEMORY_FACTS_PROMPT_LIMIT,
+                facts_context_max_chars=MEMORY_FACTS_CONTEXT_MAX_CHARS,
+                facts_item_max_chars=MEMORY_FACTS_ITEM_MAX_CHARS,
+                facts_extract_enabled=MEMORY_FACTS_EXTRACT_ENABLED,
+                facts_extract_model_openai=MEMORY_FACTS_EXTRACT_MODEL_OPENAI,
+                facts_importance_min=MEMORY_FACTS_IMPORTANCE_MIN,
+                min_chars=MEMORY_MIN_CHARS,
+                max_store_chars=1200,
+            )
+        )
+        MEMORY_ENGINE.init_db()
+    except Exception as _e:
+        MEMORY_ENGINE = None
 
 
 def _sanitize_user_key(key: str) -> str:
@@ -4893,6 +5172,13 @@ def _stream_openai_events(
         if system:
             payload["system"] = system
 
+        # ✅ Claude built-in web search tool (server-side)
+        # Requires web search enabled in your Anthropic Console.
+        claude_sources: Dict[str, Dict[str, str]] = {}
+        if _should_use_claude_web_search_tool(enable_web_search, model):
+            payload.setdefault("tools", [])
+            payload["tools"].append(_claude_web_search_tool_def())
+
         url = f"{ANTHROPIC_BASE_URL}/v1/messages"
         rid: Optional[str] = None
         stop_reason: Optional[str] = None
@@ -4928,6 +5214,33 @@ def _stream_openai_events(
                     yield {"type": "response.created", "response": {"id": rid}}
                     continue
 
+                # Capture Claude web_search sources (for UI favicons / sources drawer)
+                if et == "content_block_start":
+                    cb = ev.get("content_block") or {}
+                    if isinstance(cb, dict) and cb.get("type") == "web_search_tool_result":
+                        content = cb.get("content")
+                        new_sources: List[Dict[str, str]] = []
+                        if isinstance(content, list):
+                            for it in content:
+                                if not isinstance(it, dict):
+                                    continue
+                                if it.get("type") != "web_search_result":
+                                    continue
+                                url = str(it.get("url") or "").strip()
+                                if not url:
+                                    continue
+                                if url in claude_sources:
+                                    continue
+                                title = str(it.get("title") or "").strip() or url
+                                claude_sources[url] = {"url": url, "title": title}
+                                new_sources.append({"url": url, "title": title})
+                        if new_sources:
+                            yield {
+                                "type": "response.output_item.added",
+                                "item": {"type": "web_search_call", "action": {"sources": new_sources}},
+                            }
+                    continue
+
                 if et == "content_block_delta":
                     delta = ev.get("delta") or {}
                     if isinstance(delta, dict) and delta.get("type") == "text_delta":
@@ -4951,13 +5264,20 @@ def _stream_openai_events(
         yield {"type": "response.output_text.done"}
 
         # stop_reason values: "end_turn" / "max_tokens" / etc.
+        sources_list = list(claude_sources.values()) if isinstance(claude_sources, dict) else []
         if (stop_reason or "").strip().lower() in ("max_tokens", "length"):
-            yield {
-                "type": "response.incomplete",
-                "response": {"id": rid or ("anthropic_" + uuid.uuid4().hex), "incomplete_details": {"reason": "max_output_tokens"}},
+            resp_obj: Dict[str, Any] = {
+                "id": rid or ("anthropic_" + uuid.uuid4().hex),
+                "incomplete_details": {"reason": "max_output_tokens"},
             }
+            if sources_list:
+                resp_obj["sources"] = sources_list
+            yield {"type": "response.incomplete", "response": resp_obj}
         else:
-            yield {"type": "response.completed", "response": {"id": rid or ("anthropic_" + uuid.uuid4().hex)}}
+            resp_obj2: Dict[str, Any] = {"id": rid or ("anthropic_" + uuid.uuid4().hex)}
+            if sources_list:
+                resp_obj2["sources"] = sources_list
+            yield {"type": "response.completed", "response": resp_obj2}
         return
 
     # ---------- 1) Responses API (preferred) ----------
@@ -4983,7 +5303,7 @@ def _stream_openai_events(
             payload["instructions"] = instructions
 
         # ✅ Web search tool (official)
-        if enable_web_search and CHAT_ENABLE_WEB_SEARCH_DEFAULT:
+        if _should_use_openai_web_search_tool(enable_web_search):
             payload["tools"] = [{"type": "web_search"}]
             payload["tool_choice"] = "auto"
             # include sources for UI (site icons)
@@ -5820,7 +6140,7 @@ def _openai_responses_create_nonstream(
         payload["instructions"] = instructions
 
     # ✅ Web search tool (official) - only when enabled by allow_web
-    if enable_web_search and CHAT_ENABLE_WEB_SEARCH_DEFAULT:
+    if _should_use_openai_web_search_tool(enable_web_search):
         payload["tools"] = [{"type": "web_search"}]
         payload["tool_choice"] = "auto"
         payload["include"] = ["web_search_call.action.sources"]
@@ -5930,8 +6250,21 @@ def _chat_complete_full_text(
     continuations = 0
 
     prev_rid: Optional[str] = None
-    current_messages = messages
+    current_messages = list(messages or [])
     current_attachments = attachments
+
+    # ✅ External web search provider (Serper): fetch results once and inject into prompt.
+    # This keeps web results consistent across models (OpenAI/Claude/etc.) without relying on OpenAI tools.
+    if enable_web_search and CHAT_ENABLE_WEB_SEARCH_DEFAULT and CHAT_WEB_PROVIDER.startswith("serper"):
+        try:
+            q = _last_user_text_from_messages(current_messages)
+            if q.strip():
+                web_results = _serper_web_search(q, k=CHAT_WEB_TOPK_DEFAULT, kind=SERPER_DEFAULT_KIND)
+                web_ctx = _format_web_context_for_prompt(web_results)
+                if web_ctx:
+                    current_messages = _inject_web_context(current_messages, web_ctx)
+        except Exception as e:
+            log.warning("[web-search] serper failed: %s", e)
 
     while True:
         inp = _build_responses_input(current_messages, current_attachments)
@@ -6301,8 +6634,25 @@ def _spawn_chat_worker(
         tail_buf = ""
 
         try:
-            current_messages = messages
+            base_messages = list(messages or [])
             current_attachments = attachments
+
+            # ✅ External web search provider (Serper): prefetch and push sources for UI.
+            if allow_web and CHAT_ENABLE_WEB_SEARCH_DEFAULT and CHAT_WEB_PROVIDER.startswith("serper"):
+                try:
+                    q = (last_user_text or _last_user_text_from_messages(base_messages) or "").strip()
+                    if q:
+                        web_results = _serper_web_search(q, k=CHAT_WEB_TOPK_DEFAULT, kind=SERPER_DEFAULT_KIND)
+                        # Push sources to client UI (favicons)
+                        _push_sources(web_results)
+                        # Inject into prompt
+                        web_ctx = _format_web_context_for_prompt(web_results)
+                        if web_ctx:
+                            base_messages = _inject_web_context(base_messages, web_ctx)
+                except Exception as e:
+                    log.warning("[web-search] serper failed: %s", e)
+
+            current_messages = base_messages
 
             while True:
                 need_continue = False
@@ -6584,6 +6934,11 @@ app.include_router(auth_router)
 app.include_router(media_upload_router)
 app.include_router(home_automation_router)
 
+# ✅ 高级编程版：工程内循环（B方案）
+if agent_loop_router is not None:
+    app.include_router(agent_loop_router)
+
+
 # -----------------------------
 # ✅ Legacy /chat (single HTTP response, best for current iOS)
 #    Goal: NEVER truncate code. If too long -> auto-continue + optional zip download.
@@ -6605,6 +6960,10 @@ async def chat_legacy(request: Request):
     requested_model, plan, _model_reason = _select_model_for_request(plan_raw, client_model)
 
     allow_web = _extract_allow_web(request, body)
+
+    # Plan gate (optional)
+    allow_web = bool(allow_web and _plan_allows_web(plan))
+
     msgs = body.get("messages") or []
     atts = body.get("attachments") or []
 
@@ -6807,6 +7166,56 @@ async def chat_legacy(request: Request):
     except Exception as e:
         return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
 
+
+
+# -----------------------------
+# ✅ Unified web search endpoints
+# - GET /web_search?q=...&k=6            -> iOS WebSearchService (results=[{title,url}])
+# - POST /v1/search {q,k,kind}           -> developer-friendly (sources=[{title,url,snippet,date,provider}])
+# -----------------------------
+@app.get("/web_search")
+async def web_search_endpoint(q: str = "", k: int = 6, kind: str = ""):
+    q = (q or "").strip()
+    try:
+        k_int = int(k or CHAT_WEB_TOPK_DEFAULT)
+    except Exception:
+        k_int = CHAT_WEB_TOPK_DEFAULT
+    k_int = max(1, min(k_int, 20))
+    kind0 = (kind or SERPER_DEFAULT_KIND or "search").strip().lower()
+
+    if not q:
+        return {"ok": True, "results": []}
+
+    # Prefer Serper when configured (统一化)
+    if CHAT_WEB_PROVIDER.startswith("serper"):
+        try:
+            res = _serper_web_search(q, k=k_int, kind=kind0)
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=str(e))
+        results = [{"title": str(r.get("title") or r.get("url") or ""), "url": str(r.get("url") or "")} for r in res if r.get("url")]
+        return {"ok": True, "results": results}
+
+    # Fallback: if not using Serper, just return empty (avoid surprising costs)
+    return {"ok": True, "results": []}
+
+@app.post("/v1/search")
+async def v1_search(body: Dict[str, Any]):
+    q = str(body.get("q") or body.get("query") or "").strip()
+    if not q:
+        return {"ok": True, "sources": []}
+
+    try:
+        k = int(body.get("k") or body.get("top_k") or body.get("topK") or CHAT_WEB_TOPK_DEFAULT)
+    except Exception:
+        k = CHAT_WEB_TOPK_DEFAULT
+    k = max(1, min(k, 20))
+    kind = str(body.get("kind") or body.get("type") or SERPER_DEFAULT_KIND or "search").strip().lower()
+
+    if CHAT_WEB_PROVIDER.startswith("serper"):
+        srcs = _serper_web_search(q, k=k, kind=kind)
+        return {"ok": True, "provider": "serper", "sources": srcs}
+
+    return {"ok": True, "provider": CHAT_WEB_PROVIDER or "none", "sources": []}
 # ✅ Finally include home_chat_router (other endpoints like /session, /rt/intent, etc.)
 app.include_router(home_chat_router)
 
@@ -6881,6 +7290,10 @@ async def chat_prepare(request: Request):
     requested_model, plan, _model_reason = _select_model_for_request(plan_raw, client_model)
 
     allow_web = _extract_allow_web(request, body)
+
+    # Plan gate (optional)
+    allow_web = bool(allow_web and _plan_allows_web(plan))
+
     msgs = body.get("messages") or []
     if not isinstance(msgs, list) or not msgs:
         return JSONResponse({"ok": False, "error": "missing messages"}, status_code=400)
@@ -7278,6 +7691,62 @@ def memory_clear_api(request: Request):
     with _mem_conn() as con:
         cur = con.execute("DELETE FROM memory_items WHERE user_key=?", (user_key,))
     return {"ok": True, "user_key": user_key, "deleted": int(cur.rowcount or 0)}
+
+# -----------------------------
+# ✅ Memory Facts / Episodes APIs (Plan A)
+# -----------------------------
+
+@app.get("/memory/facts/list")
+def memory_facts_list_api(request: Request, limit: int = 20):
+    user_key = _derive_user_key(request, {})
+    try:
+        items = memory_facts_list(user_key, limit=int(limit))
+    except Exception:
+        items = []
+    return {"ok": True, "user_key": user_key, "items": items}
+
+@app.post("/memory/facts/add")
+async def memory_facts_add_api(request: Request):
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    user_key = _derive_user_key(request, body)
+    content = (body.get("content") or body.get("text") or "").strip()
+    if not content:
+        return JSONResponse({"ok": False, "error": "missing content"}, status_code=400)
+    tags = (body.get("tags") or "").strip()
+    try:
+        importance = int(body.get("importance") or 1)
+    except Exception:
+        importance = 1
+    try:
+        memory_facts_save(user_key, content, tags=tags, importance=importance)
+    except Exception:
+        pass
+    return {"ok": True, "user_key": user_key}
+
+@app.post("/memory/facts/clear")
+def memory_facts_clear_api(request: Request):
+    user_key = _derive_user_key(request, {})
+    try:
+        with _mem_conn() as con:
+            cur = con.execute("DELETE FROM memory_facts WHERE user_key=?", (_sanitize_user_key(user_key),))
+            deleted = int(cur.rowcount or 0)
+    except Exception:
+        deleted = 0
+    return {"ok": True, "user_key": user_key, "deleted": deleted}
+
+@app.get("/memory/episodes/list")
+def memory_episodes_list_api(request: Request, limit: int = 20):
+    user_key = _derive_user_key(request, {})
+    items = []
+    try:
+        if MEMORY_ENGINE is not None:
+            items = MEMORY_ENGINE.episode_list(user_key, limit=int(limit))
+    except Exception:
+        items = []
+    return {"ok": True, "user_key": user_key, "items": items}
 @app.post("/tts_prepare")
 async def tts_prepare(request: Request):
     """
@@ -8295,10 +8764,32 @@ async def solara_photo(req: Request, session_id: str = Form(""), image_file: Upl
 # ================================
 REALTIME_SESS_URL = "https://api.openai.com/v1/realtime/sessions"
 
-def _realtime_ephemeral(model: str, voice: str, instructions: Optional[str] = None):
+def _realtime_ephemeral(
+    model: str,
+    voice: str,
+    instructions: Optional[str] = None,
+    *,
+    tools: Optional[List[Dict[str, Any]]] = None,
+    tool_choice: Optional[Any] = None,
+    session_extra: Optional[Dict[str, Any]] = None,
+):
+    """
+    Create a Realtime session and return an ephemeral key.
+
+    Backward compatible with legacy clients (keeps model/voice/instructions behavior),
+    but also allows attaching Realtime function tools (e.g. web_search / remember).
+    """
     body: Dict[str, Any] = {"model": model, "voice": voice}
     if instructions:
         body["instructions"] = instructions
+    if tools:
+        body["tools"] = tools
+        body["tool_choice"] = tool_choice or "auto"
+    if session_extra and isinstance(session_extra, dict):
+        # Allow advanced callers to pass additional session config
+        for k, v in session_extra.items():
+            if k not in ("model", "voice"):
+                body[k] = v
 
     headers = {
         "Authorization": f"Bearer {OPENAI_API_KEY}",
@@ -8359,13 +8850,688 @@ def _pick_realtime_instructions(req: Request, body: Dict[str, Any]) -> Tuple[Opt
     # default behavior
     return _resolve_realtime_instructions(body), profile_norm
 
+
+# ------------------------------------------------------------
+# ✅ Realtime Call Upgrades (Voice + Audio/Video)
+# - Long-term memory prompt injection (read)
+# - Memory commit (write) for legacy mode
+# - WebRTC unified interface with server-side tool execution + memory auto-save
+# ------------------------------------------------------------
+
+REALTIME_CALLS_URL = "https://api.openai.com/v1/realtime/calls"
+REALTIME_SIDEBAND_WS_TPL = "wss://api.openai.com/v1/realtime?call_id={call_id}"
+
+REALTIME_CALL_MEMORY_DEFAULT = _boolish(os.getenv("REALTIME_CALL_MEMORY_DEFAULT") or "1")
+REALTIME_CALL_WEB_DEFAULT = _boolish(os.getenv("REALTIME_CALL_WEB_DEFAULT") or "1")
+REALTIME_CALL_RECENT_MEMORY_ITEMS = int(os.getenv("REALTIME_CALL_RECENT_MEMORY_ITEMS") or "6")
+REALTIME_CALL_MEMORY_MAX_CHARS = int(os.getenv("REALTIME_CALL_MEMORY_MAX_CHARS") or "2400")
+REALTIME_CALL_TRANSCRIPT_MAX_CHARS = int(os.getenv("REALTIME_CALL_TRANSCRIPT_MAX_CHARS") or "6000")
+
+
+def _mem_recent_items(user_key: str, limit: int = 6) -> List[str]:
+    """Return most recently used vector memory items (best-effort)."""
+    try:
+        uk = _sanitize_user_key(user_key)
+        lim = max(0, min(int(limit or 0), 20))
+        if lim <= 0:
+            return []
+        with _mem_conn() as con:
+            rows = con.execute(
+                "SELECT text FROM memory_items WHERE user_key=? ORDER BY last_used_at DESC LIMIT ?",
+                (uk, lim),
+            ).fetchall()
+        out: List[str] = []
+        for r in rows or []:
+            try:
+                t = str(r[0] or "").strip()
+                if t:
+                    out.append(t)
+            except Exception:
+                continue
+        return out
+    except Exception:
+        return []
+
+
+def _build_realtime_memory_block(user_key: str) -> str:
+    """Create a compact memory block to prepend to Realtime instructions."""
+    try:
+        uk = _sanitize_user_key(user_key)
+    except Exception:
+        uk = "default"
+
+    parts: List[str] = []
+
+    # Structured facts (high-signal)
+    try:
+        fp = (memory_facts_build_prompt(uk) or "").strip()
+        if fp:
+            parts.append(fp)
+    except Exception:
+        pass
+
+    # Recent vector memories (recency heuristic)
+    try:
+        items = _mem_recent_items(uk, limit=REALTIME_CALL_RECENT_MEMORY_ITEMS)
+        if items:
+            bullet = "\n".join(f"- {it}" for it in items[:REALTIME_CALL_RECENT_MEMORY_ITEMS])
+            parts.append("最近的记忆片段：\n" + bullet)
+    except Exception:
+        pass
+
+    text = "\n\n".join([p for p in parts if p and p.strip()]).strip()
+    if not text:
+        return ""
+
+    block = (
+        "\n\n"
+        "【长期记忆】\n"
+        "以下信息来自你的长期记忆，用于个性化与延续上下文。\n"
+        "如果与用户当前说法冲突，以用户当前说法为准。\n"
+        + text.strip()
+        + "\n"
+    )
+
+    if len(block) > REALTIME_CALL_MEMORY_MAX_CHARS:
+        block = block[:REALTIME_CALL_MEMORY_MAX_CHARS].rstrip() + "\n"
+    return block
+
+
+def _augment_realtime_instructions(
+    *,
+    base_instructions: Optional[str],
+    user_key: str,
+    enable_memory: bool,
+    enable_web: bool,
+) -> Optional[str]:
+    base = (base_instructions or "").strip()
+    blocks: List[str] = []
+    if base:
+        blocks.append(base)
+
+    if enable_memory and REALTIME_CALL_MEMORY_DEFAULT:
+        mb = _build_realtime_memory_block(user_key)
+        if mb:
+            blocks.append(mb.strip())
+
+    if enable_web and REALTIME_CALL_WEB_DEFAULT:
+        blocks.append(
+            "【联网功能】\n"
+            "你可以调用工具 web_search 来获取最新信息/新闻/数据。\n"
+            "优先在用户明确需要最新信息、需要引用来源或需要事实核对时使用。\n"
+            "返回时尽量给出来源标题与链接。"
+        )
+
+    out = "\n\n".join([b for b in blocks if b and b.strip()]).strip()
+    return out or None
+
+
+def _realtime_tool_web_search_def() -> Dict[str, Any]:
+    return {
+        "type": "function",
+        "name": "web_search",
+        "description": "Search the public web for up-to-date information. Use when the user asks for latest/current facts, news, prices, policies, or needs source links.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string", "description": "Search query"},
+                "k": {"type": "integer", "description": "Max results (1-10)", "default": 6},
+                "kind": {"type": "string", "description": "Optional category hint (e.g. news, general).", "default": ""},
+            },
+            "required": ["query"],
+        },
+    }
+
+
+def _realtime_tool_remember_def() -> Dict[str, Any]:
+    return {
+        "type": "function",
+        "name": "remember",
+        "description": "Save an explicit long-term memory about the user (preferences, profile, constraints). Use only when the user asks to remember something or shares stable personal info.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "text": {"type": "string", "description": "Memory to store"},
+                "importance": {"type": "integer", "minimum": 1, "maximum": 5, "default": 3},
+                "tags": {"type": "string", "description": "Optional tags", "default": ""},
+            },
+            "required": ["text"],
+        },
+    }
+
+
+def _realtime_tools(*, enable_web: bool, enable_memory: bool) -> List[Dict[str, Any]]:
+    tools: List[Dict[str, Any]] = []
+    if enable_web:
+        tools.append(_realtime_tool_web_search_def())
+    if enable_memory:
+        tools.append(_realtime_tool_remember_def())
+    return tools
+
+
+def _realtime_webrtc_session_config(
+    *,
+    model: str,
+    voice: str,
+    instructions: Optional[str],
+    enable_web: bool,
+    enable_memory: bool,
+) -> Dict[str, Any]:
+    """Session config used for POST /v1/realtime/calls (WebRTC unified interface)."""
+    sess: Dict[str, Any] = {
+        "type": "realtime",
+        "model": (model or REALTIME_MODEL_DEFAULT).strip() or REALTIME_MODEL_DEFAULT,
+        "audio": {
+            "output": {"voice": (voice or REALTIME_VOICE_DEFAULT).strip() or REALTIME_VOICE_DEFAULT},
+            "input": {
+                # Best-effort transcription guidance (not what model hears)
+                "transcription": {"model": TRANSCRIPTION_MODEL_DEFAULT},
+                # Server VAD is the most robust for WebRTC
+                "turn_detection": {"type": "server_vad"},
+            },
+        },
+    }
+    if instructions:
+        sess["instructions"] = instructions
+
+    tools = _realtime_tools(enable_web=enable_web, enable_memory=enable_memory)
+    if tools:
+        sess["tools"] = tools
+        sess["tool_choice"] = "auto"
+
+    return sess
+
+
+def _parse_realtime_call_id(location: str) -> str:
+    """Location header is usually like /v1/realtime/calls/rtc_xxx. Return rtc_xxx."""
+    loc = (location or "").strip()
+    if not loc:
+        return ""
+    # allow full URL too
+    try:
+        if "://" in loc:
+            p = urlparse(loc)
+            loc = p.path or loc
+    except Exception:
+        pass
+    # strip trailing slashes
+    loc = loc.rstrip("/")
+    # rtc_... is last segment
+    seg = loc.split("/")[-1] if "/" in loc else loc
+    if seg.startswith("rtc_") or seg.startswith("call_") or seg.startswith("sess_"):
+        return seg
+    # fallback: return last segment
+    return seg
+
+
+# -----------------------------
+# ✅ WebRTC sideband controller: execute tools + auto save memory
+# -----------------------------
+_REALTIME_CONTROLLERS: Dict[str, "RealtimeSidebandController"] = {}
+_REALTIME_CONTROLLERS_LOCK = threading.Lock()
+
+
+def _realtime_controller_start(
+    *,
+    call_id: str,
+    user_key: str,
+    profile: str,
+    enable_web: bool,
+    enable_memory: bool,
+    instructions: Optional[str],
+) -> None:
+    """Start (or reuse) a sideband controller for a WebRTC call."""
+    cid = (call_id or "").strip()
+    if not cid:
+        return
+    if not OPENAI_API_KEY:
+        return
+
+    with _REALTIME_CONTROLLERS_LOCK:
+        if cid in _REALTIME_CONTROLLERS:
+            return
+        ctrl = RealtimeSidebandController(
+            call_id=cid,
+            user_key=user_key,
+            profile=profile,
+            enable_web=enable_web,
+            enable_memory=enable_memory,
+            instructions=instructions,
+        )
+        _REALTIME_CONTROLLERS[cid] = ctrl
+
+    try:
+        asyncio.create_task(ctrl.run())
+    except Exception:
+        # If we're not in an event loop context (rare), fallback to a thread
+        def _runner():
+            asyncio.run(ctrl.run())
+        t = threading.Thread(target=_runner, daemon=True)
+        t.start()
+
+
+def _realtime_controller_stop(call_id: str) -> bool:
+    cid = (call_id or "").strip()
+    if not cid:
+        return False
+    with _REALTIME_CONTROLLERS_LOCK:
+        ctrl = _REALTIME_CONTROLLERS.get(cid)
+    if not ctrl:
+        return False
+    try:
+        asyncio.create_task(ctrl.stop())
+        return True
+    except Exception:
+        try:
+            ctrl.request_stop()
+            return True
+        except Exception:
+            return False
+
+
+def _extract_realtime_item_text(item: Dict[str, Any]) -> str:
+    """Extract readable text from a Realtime conversation message item."""
+    try:
+        content = item.get("content") or []
+        texts: List[str] = []
+        if isinstance(content, list):
+            for p in content:
+                if not isinstance(p, dict):
+                    continue
+                t = ""
+                ptype = str(p.get("type") or "").strip()
+                if ptype in ("text", "input_text"):
+                    t = str(p.get("text") or "").strip()
+                elif ptype in ("audio", "input_audio"):
+                    t = str(p.get("transcript") or p.get("text") or "").strip()
+                else:
+                    t = str(p.get("transcript") or p.get("text") or "").strip()
+                if t:
+                    texts.append(t)
+        return "\n".join(texts).strip()
+    except Exception:
+        return ""
+
+
+class RealtimeSidebandController:
+    """
+    Server-side sideband connection for WebRTC Realtime calls.
+
+    Responsibilities:
+      - Execute Realtime function tools (web_search / remember)
+      - Collect transcripts and persist to memory on call end
+
+    This is *best-effort* and must never break the call.
+    """
+
+    def __init__(
+        self,
+        *,
+        call_id: str,
+        user_key: str,
+        profile: str,
+        enable_web: bool,
+        enable_memory: bool,
+        instructions: Optional[str],
+    ):
+        self.call_id = (call_id or "").strip()
+        self.user_key = _sanitize_user_key(user_key)
+        self.profile = (profile or "default").strip()
+        self.enable_web = bool(enable_web)
+        self.enable_memory = bool(enable_memory)
+        self.instructions = (instructions or "").strip() or None
+
+        self.started_at = time.time()
+        self._stop_evt = asyncio.Event()
+        self._ws = None
+
+        self.turns: List[Dict[str, str]] = []
+        self._tool_seen: set[str] = set()
+        self._tool_args_buf: Dict[str, str] = {}
+
+    def request_stop(self) -> None:
+        try:
+            self._stop_evt.set()
+        except Exception:
+            pass
+
+    async def stop(self) -> None:
+        self.request_stop()
+        try:
+            if self._ws is not None:
+                await self._ws.close()
+        except Exception:
+            pass
+
+    async def _send(self, obj: Dict[str, Any]) -> None:
+        if not self._ws:
+            return
+        try:
+            await self._ws.send(json.dumps(obj))
+        except Exception:
+            pass
+
+    async def _tool_web_search(self, args: Dict[str, Any]) -> Dict[str, Any]:
+        q = str(args.get("query") or args.get("q") or "").strip()
+        if not q:
+            return {"ok": False, "error": "missing query", "results": []}
+        try:
+            k = int(args.get("k") or 6)
+        except Exception:
+            k = 6
+        k = max(1, min(k, 10))
+        kind = str(args.get("kind") or "").strip() or None
+
+        def _do():
+            if CHAT_WEB_PROVIDER.startswith("serper"):
+                return _serper_web_search(q, k=k, kind=kind)
+            # Fallback: still try Serper if key exists
+            return _serper_web_search(q, k=k, kind=kind)
+
+        results = await asyncio.to_thread(_do)
+        return {"ok": True, "query": q, "results": results}
+
+    async def _tool_remember(self, args: Dict[str, Any]) -> Dict[str, Any]:
+        txt = str(args.get("text") or "").strip()
+        if not txt:
+            return {"ok": False, "error": "missing text"}
+        tags = str(args.get("tags") or "").strip()
+        try:
+            imp = int(args.get("importance") or 3)
+        except Exception:
+            imp = 3
+        imp = max(1, min(imp, 5))
+
+        def _do():
+            # Store as vector memory
+            if _should_memory_add(txt):
+                memory_add(self.user_key, _short(txt, 800))
+            # Store as structured fact when enabled
+            try:
+                if MEMORY_FACTS_ENABLED_DEFAULT and imp >= MEMORY_FACTS_IMPORTANCE_MIN:
+                    memory_facts_save(self.user_key, _short(txt, 400), tags=tags, importance=imp)
+            except Exception:
+                pass
+
+        await asyncio.to_thread(_do)
+        return {"ok": True, "stored": True}
+
+    async def _handle_tool_call(self, *, call_id: str, name: str, arguments: str) -> None:
+        cid = (call_id or "").strip()
+        if not cid or cid in self._tool_seen:
+            return
+        self._tool_seen.add(cid)
+
+        args: Dict[str, Any] = {}
+        try:
+            args = json.loads(arguments or "{}") if (arguments or "").strip() else {}
+        except Exception:
+            args = {}
+
+        out: Dict[str, Any] = {"ok": False, "error": "tool_not_supported"}
+        if name == "web_search" and self.enable_web:
+            out = await self._tool_web_search(args)
+        elif name == "remember" and self.enable_memory:
+            out = await self._tool_remember(args)
+
+        # Send tool output back to the call
+        await self._send(
+            {
+                "type": "conversation.item.create",
+                "item": {
+                    "type": "function_call_output",
+                    "call_id": cid,
+                    "output": json.dumps(out, ensure_ascii=False),
+                },
+            }
+        )
+        # Trigger the model to continue (WebRTC clients often don't implement tool loop)
+        await self._send({"type": "response.create"})
+
+    async def _handle_event(self, ev: Dict[str, Any]) -> None:
+        et = str(ev.get("type") or "").strip()
+
+        # Tool arguments streaming (optional)
+        if et == "response.function_call_arguments.delta":
+            cid = str(ev.get("call_id") or "").strip()
+            if cid:
+                self._tool_args_buf[cid] = (self._tool_args_buf.get(cid) or "") + str(ev.get("delta") or "")
+            return
+
+        if et == "response.function_call_arguments.done":
+            cid = str(ev.get("call_id") or "").strip()
+            name = str(ev.get("name") or "").strip()
+            arguments = str(ev.get("arguments") or (self._tool_args_buf.get(cid) or "")).strip()
+            if cid and name:
+                await self._handle_tool_call(call_id=cid, name=name, arguments=arguments)
+            return
+
+        # Conversation items
+        if et in ("conversation.item.done", "conversation.item.created", "conversation.item.added"):
+            item = ev.get("item") or {}
+            if not isinstance(item, dict):
+                return
+
+            itype = str(item.get("type") or "").strip()
+            if itype == "message":
+                role = str(item.get("role") or "").strip()
+                txt = _extract_realtime_item_text(item)
+                if txt:
+                    self.turns.append({"role": role, "text": txt})
+            elif itype == "function_call":
+                cid = str(item.get("call_id") or "").strip()
+                name = str(item.get("name") or "").strip()
+                arguments = str(item.get("arguments") or "").strip()
+                if cid and name:
+                    await self._handle_tool_call(call_id=cid, name=name, arguments=arguments)
+
+    async def _persist_memory_on_end(self) -> None:
+        if not self.enable_memory:
+            return
+        if not self.turns:
+            return
+
+        # Build a compact transcript
+        lines: List[str] = []
+        for t in self.turns[-60:]:
+            role = t.get("role") or ""
+            text = (t.get("text") or "").strip()
+            if not text:
+                continue
+            who = "用户" if role == "user" else ("助手" if role == "assistant" else str(role))
+            lines.append(f"{who}: {text}")
+        transcript = "\n".join(lines).strip()
+        if not transcript:
+            return
+        if len(transcript) > REALTIME_CALL_TRANSCRIPT_MAX_CHARS:
+            transcript = transcript[-REALTIME_CALL_TRANSCRIPT_MAX_CHARS:]
+
+        # Best-effort store a call note + extract structured facts
+        def _do():
+            note = f"通话记录/摘要：{_short(transcript, 1200)}"
+            if _should_memory_add(note):
+                memory_add(self.user_key, note)
+
+            # Store user turns that are memory-worthy
+            for t in self.turns:
+                if (t.get("role") or "") != "user":
+                    continue
+                ut = (t.get("text") or "").strip()
+                if ut and _should_memory_add(ut):
+                    memory_add(self.user_key, _short(ut, 600))
+
+            # Structured facts from last pair (cheap)
+            last_user = ""
+            last_ai = ""
+            for t in self.turns:
+                if (t.get("role") or "") == "user" and (t.get("text") or "").strip():
+                    last_user = (t.get("text") or "").strip()
+                if (t.get("role") or "") == "assistant" and (t.get("text") or "").strip():
+                    last_ai = (t.get("text") or "").strip()
+            if last_user or last_ai:
+                extract_and_save_memory_facts(self.user_key, last_user, last_ai)
+
+        await asyncio.to_thread(_do)
+
+    async def run(self) -> None:
+        if not self.call_id:
+            return
+        url = REALTIME_SIDEBAND_WS_TPL.format(call_id=self.call_id)
+
+        headers = [
+            ("Authorization", f"Bearer {OPENAI_API_KEY}"),
+            ("OpenAI-Beta", "realtime=v1"),
+        ]
+
+        try:
+            async with websockets.connect(url, extra_headers=headers, ping_interval=20, ping_timeout=20) as ws:
+                self._ws = ws
+
+                # Ensure tools are available (some clients might start with minimal config)
+                sess_update: Dict[str, Any] = {}
+                if self.instructions:
+                    sess_update["instructions"] = self.instructions
+                tools = _realtime_tools(enable_web=self.enable_web, enable_memory=self.enable_memory)
+                if tools:
+                    sess_update["tools"] = tools
+                    sess_update["tool_choice"] = "auto"
+                if sess_update:
+                    await self._send({"type": "session.update", "session": sess_update})
+
+                async for raw in ws:
+                    if self._stop_evt.is_set():
+                        break
+                    try:
+                        ev = json.loads(raw)
+                    except Exception:
+                        continue
+                    if isinstance(ev, dict):
+                        await self._handle_event(ev)
+        except Exception as e:
+            log.info("[rt.sideband] call=%s ended (%s)", self.call_id, e)
+        finally:
+            self._ws = None
+            try:
+                await self._persist_memory_on_end()
+            except Exception:
+                pass
+            with _REALTIME_CONTROLLERS_LOCK:
+                if self.call_id in _REALTIME_CONTROLLERS:
+                    _REALTIME_CONTROLLERS.pop(self.call_id, None)
+
 @app.post("/session")
 async def session_post(req: Request):
     """
     Realtime session bootstrap.
-    - If home device is bound (POST /home/gateway_profile), this will auto return home-only assistant instructions.
-    - Otherwise falls back to your default instructions / remix instructions.
+
+    ✅ Backward compatible:
+      - JSON (application/json): returns ephemeral_key for legacy client-side connections (existing behavior)
+      - SDP  (application/sdp / text/plain): WebRTC unified interface -> server creates Realtime call and returns SDP answer
+
+    ✅ Upgrades:
+      - Realtime voice + audio/video (WebRTC) share the same Long-Term Memory prompt injection
+      - Web Search (联网功能) is exposed as a Realtime function tool (`web_search`)
+      - Optional server-side controls (sideband) for WebRTC calls to execute tools + save memories automatically
     """
+
+    ct = (req.headers.get("content-type") or "").lower()
+
+    # ------------------------------------------------------------
+    # ✅ New: WebRTC unified interface (audio/video call)
+    # Client sends SDP offer as raw body. Server returns SDP answer.
+    # ------------------------------------------------------------
+    if ("application/sdp" in ct) or ("text/plain" in ct):
+        offer_sdp = (await req.body()).decode("utf-8", errors="ignore").strip()
+        if not offer_sdp:
+            return Response("missing SDP offer", media_type="text/plain", status_code=400)
+
+        # Query params / headers for options (keep it simple for clients)
+        qp = req.query_params
+        model = (qp.get("model") or req.headers.get("x-realtime-model") or REALTIME_MODEL_DEFAULT).strip()
+        voice = (qp.get("voice") or req.headers.get("x-realtime-voice") or REALTIME_VOICE_DEFAULT).strip()
+
+        # Build a body-like dict so we can reuse existing helpers
+        b: Dict[str, Any] = {
+            "model": model,
+            "voice": voice,
+            "profile": (qp.get("profile") or qp.get("mode") or req.headers.get("x-realtime-profile") or "default").strip(),
+        }
+        # web/memory toggles (defaults: ON for WebRTC flow)
+        if "allow_web" in qp or "allowWeb" in qp or "web" in qp or "enable_web_search" in qp:
+            b["allow_web"] = qp.get("allow_web") or qp.get("allowWeb") or qp.get("web") or qp.get("enable_web_search")
+        else:
+            b["allow_web"] = True  # ✅ WebRTC 默认开启联网（sideband会执行工具，不依赖客户端）
+
+        if "enable_memory" in qp or "memory" in qp:
+            b["enable_memory"] = qp.get("enable_memory") or qp.get("memory")
+        else:
+            b["enable_memory"] = True  # ✅ WebRTC 默认开启长期记忆
+
+        user_key = _derive_user_key(req, b)
+        allow_web = bool(_extract_allow_web(req, b))  # uses existing flag parsing
+        enable_memory = _boolish(b.get("enable_memory"))
+
+        instructions, resolved_profile = _pick_realtime_instructions(req, b)
+        instructions = _augment_realtime_instructions(
+            base_instructions=instructions,
+            user_key=user_key,
+            enable_memory=enable_memory,
+            enable_web=allow_web,
+        )
+
+        # Build session config for /v1/realtime/calls (multipart form)
+        session_cfg = _realtime_webrtc_session_config(
+            model=model,
+            voice=voice,
+            instructions=instructions,
+            enable_web=allow_web,
+            enable_memory=enable_memory,
+        )
+
+        if not OPENAI_API_KEY:
+            return Response("missing OPENAI_API_KEY", media_type="text/plain", status_code=500)
+
+        try:
+            files = {
+                "sdp": ("offer.sdp", offer_sdp, "application/sdp"),
+                "session": (None, json.dumps(session_cfg), "application/json"),
+            }
+            headers = {
+                "Authorization": f"Bearer {OPENAI_API_KEY}",
+            }
+            r = requests.post(REALTIME_CALLS_URL, headers=headers, files=files, timeout=30)
+        except Exception as e:
+            return Response(f"realtime call create failed: {e}", media_type="text/plain", status_code=502)
+
+        if r.status_code >= 400:
+            return Response(f"OpenAI error {r.status_code}: {_short(r.text, 800)}", media_type="text/plain", status_code=502)
+
+        answer_sdp = (r.text or "").strip()
+        loc = (r.headers.get("Location") or r.headers.get("location") or "").strip()
+        call_id = _parse_realtime_call_id(loc)
+
+        # ✅ Auto-attach sideband controller (exec tools + store memory)
+        if call_id:
+            _realtime_controller_start(
+                call_id=call_id,
+                user_key=user_key,
+                profile=resolved_profile,
+                enable_web=allow_web,
+                enable_memory=enable_memory,
+                instructions=instructions,
+            )
+
+        headers_out: Dict[str, str] = {"X-Resolved-Profile": str(resolved_profile or "")}
+        if loc:
+            headers_out["Location"] = loc
+        if call_id:
+            headers_out["X-OpenAI-Realtime-Call-Id"] = call_id
+
+        return Response(content=answer_sdp, media_type="application/sdp", headers=headers_out)
+
+    # ------------------------------------------------------------
+    # ✅ Legacy JSON session bootstrap (existing behavior)
+    # ------------------------------------------------------------
     try:
         b = await req.json()
     except Exception:
@@ -8374,12 +9540,24 @@ async def session_post(req: Request):
     model = (b.get("model") or REALTIME_MODEL_DEFAULT).strip()
     voice = (b.get("voice") or REALTIME_VOICE_DEFAULT).strip()
 
+    user_key = _derive_user_key(req, b)
+    allow_web = bool(_extract_allow_web(req, b)) if ("allow_web" in b or "allowWeb" in b or "enable_web_search" in b) else False
+    enable_memory = _boolish(b.get("enable_memory", True))
+
     instructions, resolved_profile = _pick_realtime_instructions(req, b)
+    instructions = _augment_realtime_instructions(
+        base_instructions=instructions,
+        user_key=user_key,
+        enable_memory=enable_memory,
+        enable_web=allow_web,
+    )
 
     # Try primary model, then auto-fallback to keep voice stable.
-    key, err = _realtime_ephemeral(model, voice, instructions=instructions)
+    tools = _realtime_tools(enable_web=allow_web, enable_memory=enable_memory)
+
+    key, err = _realtime_ephemeral(model, voice, instructions=instructions, tools=tools, tool_choice=("auto" if tools else None))
     if err and REALTIME_MODEL_FALLBACK and model != REALTIME_MODEL_FALLBACK:
-        key2, err2 = _realtime_ephemeral(REALTIME_MODEL_FALLBACK, voice, instructions=instructions)
+        key2, err2 = _realtime_ephemeral(REALTIME_MODEL_FALLBACK, voice, instructions=instructions, tools=tools, tool_choice=("auto" if tools else None))
         if not err2 and key2:
             model = REALTIME_MODEL_FALLBACK
             key, err = key2, None
@@ -8387,6 +9565,8 @@ async def session_post(req: Request):
     if err:
         return JSONResponse({"ok": False, "error": err}, status_code=502)
 
+    # NOTE: legacy client-side WebSocket/WebRTC connections to OpenAI won't automatically store new memories.
+    # Use POST /realtime/memory/commit from client when the call ends to persist transcripts.
     return {
         "ok": True,
         "session_id": uuid.uuid4().hex,
@@ -8398,7 +9578,105 @@ async def session_post(req: Request):
         "voice": voice,
         "profile": resolved_profile,
         "home_bound": bool(resolved_profile == "home"),
+        "memory_enabled": bool(enable_memory),
+        "web_enabled": bool(allow_web),
+        "tools_enabled": bool(bool(tools)),
+        "memory_commit_url": "/realtime/memory/commit",
+        "web_search_url": "/web_search?q={query}&k=6",
+        "user_key_hint": user_key,
     }
+
+
+@app.post("/realtime/memory/commit")
+async def realtime_memory_commit(req: Request):
+    """
+    ✅ Manual memory commit for call transcripts.
+
+    Use this for:
+      - legacy Realtime sessions (ephemeral_key mode) where the backend cannot observe conversation
+      - any audio/video call transcript that you want to add to long-term memory
+
+    Body (JSON) examples:
+      {"transcript":"..."}
+      {"turns":[{"role":"user","text":"..."},{"role":"assistant","text":"..."}]}
+      {"session_id":"...","call_id":"...","turns":[...], "meta":{...}}
+    """
+    try:
+        body = await req.json()
+    except Exception:
+        body = {}
+
+    user_key = _derive_user_key(req, body)
+    enable_memory = _boolish(body.get("enable_memory", True))
+    if not enable_memory:
+        return {"ok": True, "skipped": True, "reason": "memory_disabled", "user_key": user_key}
+
+    turns = body.get("turns")
+    transcript = (body.get("transcript") or body.get("text") or "").strip()
+
+    # Build transcript if turns provided
+    if not transcript and isinstance(turns, list):
+        lines: List[str] = []
+        for t in turns:
+            if not isinstance(t, dict):
+                continue
+            role = str(t.get("role") or "").strip() or "user"
+            text = str(t.get("text") or t.get("content") or "").strip()
+            if not text:
+                continue
+            who = "用户" if role == "user" else ("助手" if role == "assistant" else role)
+            lines.append(f"{who}: {text}")
+        transcript = "\n".join(lines).strip()
+
+    if not transcript:
+        return JSONResponse({"ok": False, "error": "missing transcript/turns"}, status_code=400)
+
+    # Extract some per-turn user statements + store a compact call note
+    def _commit():
+        # 1) Store a compact call note
+        note = f"通话记录/摘要：{_short(transcript, 1200)}"
+        if _should_memory_add(note):
+            memory_add(user_key, note)
+
+        # 2) Store user turns that look memory-worthy
+        if isinstance(turns, list):
+            for t in turns:
+                if not isinstance(t, dict):
+                    continue
+                if str(t.get("role") or "").strip() != "user":
+                    continue
+                ut = str(t.get("text") or t.get("content") or "").strip()
+                if ut and _should_memory_add(ut):
+                    memory_add(user_key, _short(ut, 600))
+
+        # 3) Structured facts (best-effort)
+        try:
+            if isinstance(turns, list):
+                last_user = ""
+                last_ai = ""
+                for t in turns:
+                    if not isinstance(t, dict):
+                        continue
+                    role = str(t.get("role") or "").strip()
+                    text = str(t.get("text") or t.get("content") or "").strip()
+                    if role == "user" and text:
+                        last_user = text
+                    if role == "assistant" and text:
+                        last_ai = text
+                if last_user or last_ai:
+                    extract_and_save_memory_facts(user_key, last_user, last_ai)
+        except Exception:
+            pass
+
+    await asyncio.to_thread(_commit)
+
+    return {
+        "ok": True,
+        "user_key": user_key,
+        "stored": True,
+        "hint": "Call transcript committed to long-term memory.",
+    }
+
 
 def _session_key(req: Request, session_id: str) -> str:
     ip = req.client.host if req.client else "unknown"
@@ -9706,6 +10984,130 @@ try:
     V2DMMessageReq.model_rebuild()
 except Exception:
     pass
+
+# ===================================================================
+# ✅ Plan A: Memory Module Overrides
+# - Keep rest of server_session.py unchanged, but route all memory calls
+#   through the dedicated memory_module.py engine (async writes).
+# ===================================================================
+
+# Preserve legacy implementations (in case memory_module isn't available)
+_LEGACY_memory_add = globals().get('memory_add')
+_LEGACY_memory_search = globals().get('memory_search')
+_LEGACY_memory_build_context = globals().get('memory_build_context')
+_LEGACY_memory_facts_save = globals().get('memory_facts_save')
+_LEGACY_memory_facts_list = globals().get('memory_facts_list')
+_LEGACY_memory_facts_build_prompt = globals().get('memory_facts_build_prompt')
+_LEGACY_extract_and_save_memory_facts = globals().get('extract_and_save_memory_facts')
+
+def _should_memory_add(text: str) -> bool:
+    """Unified heuristic (overrides earlier duplicated definitions)."""
+    try:
+        if should_store_memory is not None:
+            return bool(should_store_memory(text, min_chars=MEMORY_MIN_CHARS))
+    except Exception:
+        pass
+    # fallback to legacy if present
+    try:
+        legacy = globals().get('_LEGACY__should_memory_add') or globals().get('__should_memory_add')
+        if callable(legacy):
+            return bool(legacy(text))
+    except Exception:
+        pass
+    t = (text or '').strip()
+    return bool(t) and len(t) >= max(8, int(MEMORY_MIN_CHARS)) and '```' not in t
+
+def memory_add(user_key: str, text: str) -> None:
+    try:
+        if MEMORY_ENGINE is not None:
+            MEMORY_ENGINE.add_vector(user_key, text)
+            return
+    except Exception:
+        pass
+    if callable(_LEGACY_memory_add):
+        try:
+            _LEGACY_memory_add(user_key, text)  # type: ignore
+        except Exception:
+            return
+
+def memory_search(user_key: str, query: str, k: int, min_score: float) -> List[Dict[str, Any]]:
+    try:
+        if MEMORY_ENGINE is not None:
+            return MEMORY_ENGINE.search_vectors(user_key, query, k=k, min_score=min_score)
+    except Exception:
+        pass
+    if callable(_LEGACY_memory_search):
+        try:
+            return _LEGACY_memory_search(user_key, query, k, min_score)  # type: ignore
+        except Exception:
+            return []
+    return []
+
+def memory_build_context(user_key: str, query: str, k: int = MEMORY_TOP_K_DEFAULT, min_score: float = MEMORY_MIN_SCORE_DEFAULT) -> str:
+    try:
+        if MEMORY_ENGINE is not None:
+            return MEMORY_ENGINE.build_vector_context(user_key, query, k=k, min_score=min_score)
+    except Exception:
+        pass
+    if callable(_LEGACY_memory_build_context):
+        try:
+            return _LEGACY_memory_build_context(user_key, query, k, min_score)  # type: ignore
+        except Exception:
+            return ""
+    return ""
+
+def memory_facts_save(user_key: str, content: str, tags: str = "", importance: int = 1) -> None:
+    try:
+        if MEMORY_ENGINE is not None:
+            MEMORY_ENGINE.facts_save(user_key, content, tags=tags, importance=importance)
+            return
+    except Exception:
+        pass
+    if callable(_LEGACY_memory_facts_save):
+        try:
+            _LEGACY_memory_facts_save(user_key, content, tags=tags, importance=importance)  # type: ignore
+        except Exception:
+            return
+
+def memory_facts_list(user_key: str, limit: int = 20) -> List[Dict[str, Any]]:
+    try:
+        if MEMORY_ENGINE is not None:
+            return MEMORY_ENGINE.facts_list(user_key, limit=limit)
+    except Exception:
+        pass
+    if callable(_LEGACY_memory_facts_list):
+        try:
+            return _LEGACY_memory_facts_list(user_key, limit)  # type: ignore
+        except Exception:
+            return []
+    return []
+
+def memory_facts_build_prompt(user_key: str, limit: int = MEMORY_FACTS_PROMPT_LIMIT) -> str:
+    try:
+        if MEMORY_ENGINE is not None:
+            return MEMORY_ENGINE.facts_build_prompt(user_key, limit=limit)
+    except Exception:
+        pass
+    if callable(_LEGACY_memory_facts_build_prompt):
+        try:
+            return _LEGACY_memory_facts_build_prompt(user_key, limit)  # type: ignore
+        except Exception:
+            return ""
+    return ""
+
+def extract_and_save_memory_facts(user_key: str, user_msg: str, ai_reply: str) -> None:
+    """Override: facts extraction via MemoryEngine (sync; caller may spawn thread)."""
+    try:
+        if MEMORY_ENGINE is not None:
+            MEMORY_ENGINE.extract_and_save_facts(user_key, user_msg, ai_reply)
+            return
+    except Exception:
+        pass
+    if callable(_LEGACY_extract_and_save_memory_facts):
+        try:
+            _LEGACY_extract_and_save_memory_facts(user_key, user_msg, ai_reply)  # type: ignore
+        except Exception:
+            return
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(
@@ -9716,6 +11118,11 @@ if __name__ == "__main__":
         log_level="info",
         access_log=False,
     )
+
+
+
+
+
 
 
 
