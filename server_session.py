@@ -7,7 +7,7 @@
 # ✅ FIX/ALIGN: Home Automation (Pi light) — bind + Realtime home-only assistant + dispatch
 #
 # 핵심:
-# - GPT 文本在云端 stream 回来时，后端立刻按“句子块”送入 OpenAI TTS
+# - GPT 文本在云端 stream 回来时，后端立刻按句子块送入 OpenAI TTS
 # - iOS 不再把文本发到 /tts（避免前端再跑一遍 TTS），只需要播放后端给的 tts_url
 # - /chat/prepare -> 返回 chat_id + events_url(SSE) + tts_url(HTTP MP3 live stream)
 # - /chat/events/{chat_id} -> SSE: meta + delta + done
@@ -49,9 +49,16 @@ from typing import Optional, Dict, Any, Tuple, Iterator, List
 from contextlib import asynccontextmanager
 
 import requests
-import websockets
+try:
+    import websockets  # type: ignore
+    # ✅ OpenClaw 深度融合
+    from openclaw_bridge import get_bridge, ensure_connected, OpenClawBridge
+    from agent_intent_router import inject_agent_system_prompt, process_agent_actions_sync
+except Exception:  # pragma: no cover
+    websockets = None  # type: ignore
 from fastapi import FastAPI, UploadFile, File, Form, Request, Header, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse, StreamingResponse, Response, FileResponse
+from fastapi.staticfiles import StaticFiles  # ✅ Studio 网页版
 from fastapi.middleware.cors import CORSMiddleware
 from dotenv import load_dotenv
 
@@ -61,6 +68,10 @@ load_dotenv()
 # ✅ routers（都放在 load_dotenv 之后）
 from routers.home_chat import router as home_chat_router
 from routers.media_upload import router as media_upload_router
+try:
+    from media_store import store as _media_store  # ✅ 文件内容提取用
+except ImportError:
+    _media_store = None
 from routers.home_automation import (
     router as home_automation_router,
     home_instructions_for_request as home_instructions_for_request_router,
@@ -103,7 +114,7 @@ def _home_instructions_ios_protocol(req: Request, client_id: Optional[str]) -> s
         pass
 
     return (
-        "你是“阿杜”，【家居控制专用语音助手】。你的唯一任务：把用户语音意图转换为可执行命令。\n"
+        "你是阿杜，【家居控制专用语音助手】。你的唯一任务：把用户语音意图转换为可执行命令。\n"
         f"默认控制设备：{device_display}（device_id={device_id}）。\n"
         "\n"
         "【输出协议（必须严格遵守）】\n"
@@ -156,9 +167,52 @@ REALTIME_MODEL_DEFAULT = (os.getenv("REALTIME_MODEL") or "gpt-4o-realtime-previe
 REALTIME_MODEL_FALLBACK = (os.getenv("REALTIME_MODEL_FALLBACK") or "gpt-realtime-mini").strip()
 REALTIME_VOICE_DEFAULT = (os.getenv("REALTIME_VOICE") or "alloy").strip()
 
-# ✅ Backend no longer hardcodes a long "work definition" prompt.
-#    If you still want server-side defaults, set REALTIME_DEFAULT_INSTRUCTIONS in env.
-REALTIME_DEFAULT_INSTRUCTIONS = (os.getenv("REALTIME_DEFAULT_INSTRUCTIONS") or "").strip() or None
+# ---- Qwen Omni Realtime (DashScope) ----
+# Provider routing: "openai" (default) | "qwen" | "auto" (try qwen first, fallback openai)
+REALTIME_PROVIDER = (os.getenv("REALTIME_PROVIDER") or "openai").strip().lower()
+DASHSCOPE_API_KEY = (os.getenv("DASHSCOPE_API_KEY") or "").strip()
+QWEN_REALTIME_MODEL = (os.getenv("QWEN_REALTIME_MODEL") or "qwen3-omni-flash-realtime").strip()
+QWEN_REALTIME_VOICE = (os.getenv("QWEN_REALTIME_VOICE") or "Cherry").strip()  # 49种音色可选
+QWEN_REALTIME_BASE_URL = (os.getenv("QWEN_REALTIME_BASE_URL") or "wss://dashscope-intl.aliyuncs.com").strip().rstrip("/")
+# Qwen 会话时长上限 120 分钟（vs OpenAI 15分钟）
+# ✅ 修正：Qwen Omni Realtime 输出格式为 pcm（即 PCM16 24kHz），不是 pcm24
+# 官方文档 output_audio_format 只支持 "pcm"，实际输出 PCM16 little-endian 24kHz mono
+QWEN_REALTIME_OUTPUT_PCM24 = False  # 强制关闭，不再依赖环境变量
+
+# ✅ Realtime 语音助手 = 文本助手的同一个人格
+#    base 身份从 CHAT_SYSTEM_STYLE_PROMPT 继承，追加语音特有的交互规则。
+#    两个通道共享同一个人格定义、同一套记忆、同一条会话历史。
+_REALTIME_VOICE_ADDENDUM = (
+    "\n\n【语音交互补充规则】\n"
+    "你现在在语音通话中，用户通过麦克风跟你说话，你的回答会通过语音播报。\n"
+    "- 用简洁自然的口语回答，避免书面语、Markdown、代码块和长段落\n"
+    "- 直接回答问题，不要说「好的」「当然」「没问题」等开场废话\n"
+    "- 回答尽量控制在 2-3 句话以内，除非用户要求详细解释\n"
+    "- 不要输出 URL、代码、表格等语音无法表达的内容\n"
+    "- 如果用户让你记住什么，调用 remember 工具\n"
+    "- 如果用户问最新信息/新闻/价格，调用 web_search 工具\n"
+    "\n【视觉/摄像头规则（极其重要）】\n"
+    "通话中你可能会收到用户摄像头的图片帧。严格遵守以下规则：\n"
+    "- 绝对不要主动描述你看到的画面。不要在用户沉默时说「我看到…」「画面中有…」\n"
+    "- 只在以下情况使用视觉信息：\n"
+    "  1. 用户明确问你「你看到了什么」「这是什么」「帮我看看」等\n"
+    "  2. 用户的问题需要结合画面才能回答（如「这个怎么用」「这是哪里」）\n"
+    "  3. 画面中出现了紧急/危险情况需要提醒用户\n"
+    "- 即使收到新的图片帧，也不要打断对话去描述画面\n"
+    "- 不要复述图片标记（如 [AID=xxx]），用户看不到这些标记\n"
+)
+# NOTE: CHAT_SYSTEM_STYLE_PROMPT is defined later in the file (~line 426).
+# We use a property-style getter so the concatenation happens at call time, not import time.
+_REALTIME_DEFAULT_INSTRUCTIONS_ENV = (os.getenv("REALTIME_DEFAULT_INSTRUCTIONS") or "").strip()
+
+def _get_realtime_default_instructions() -> str:
+    if _REALTIME_DEFAULT_INSTRUCTIONS_ENV:
+        # ✅ FIX: 即使设了环境变量，也确保阿杜人格身份在开头
+        env_inst = _REALTIME_DEFAULT_INSTRUCTIONS_ENV
+        if "ChatAGI" not in env_inst and "阿杜" not in env_inst:
+            env_inst = CHAT_SYSTEM_STYLE_PROMPT.rstrip() + "\n\n" + env_inst
+        return env_inst.rstrip() + _REALTIME_VOICE_ADDENDUM
+    return CHAT_SYSTEM_STYLE_PROMPT.rstrip() + _REALTIME_VOICE_ADDENDUM
 
 # ---- Sora ----
 SORA_MODEL_DEFAULT = (os.getenv("SORA_MODEL") or "sora-2").strip()
@@ -256,10 +310,36 @@ DEEPSEEK_API_KEY = (os.getenv("DEEPSEEK_API_KEY") or "").strip()
 DEEPSEEK_BASE_URL = (os.getenv("DEEPSEEK_BASE_URL") or "https://api.deepseek.com").strip().rstrip("/")
 DEEPSEEK_MODEL_DEFAULT = (os.getenv("DEEPSEEK_MODEL") or "deepseek-reasoner").strip()
 
+# ——————— Smart Router (中国模型智能路由) ———————
+SILICONFLOW_API_KEY = (os.getenv("SILICONFLOW_API_KEY") or "").strip()
+GOOGLE_API_KEY_ENV = (os.getenv("GOOGLE_API_KEY") or "").strip()
+
+# ---- DashScope / Qwen (阿里云百炼) ----
+DASHSCOPE_API_KEY = (os.getenv("DASHSCOPE_API_KEY") or "").strip()
+DASHSCOPE_BASE_URL = (os.getenv("DASHSCOPE_BASE_URL") or "https://dashscope-us.aliyuncs.com/compatible-mode/v1").strip().rstrip("/")
+DASHSCOPE_MODEL_DEFAULT = (os.getenv("DASHSCOPE_MODEL") or "qwen3.5-plus").strip()
+try:
+    DASHSCOPE_TIMEOUT_SEC = float(os.getenv("DASHSCOPE_TIMEOUT_SEC") or "120")
+except Exception:
+    DASHSCOPE_TIMEOUT_SEC = 120.0
+
+_smart_router = None
+def _get_smart_router():
+    global _smart_router
+    if _smart_router is None:
+        try:
+            from cn_router.cn_smart_router import SmartRouter
+            _smart_router = SmartRouter()
+            log.info("[SmartRouter] initialized OK")
+        except Exception as e:
+            log.warning("[SmartRouter] init failed: %s", e)
+    return _smart_router
+
 # If your client/UI still sends `model: "gpt-5"` (e.g. Ultra tier text model),
 # we remap it to a Claude model id available in Anthropic.
 # You can override this mapping via env.
-GPT5_MODEL_ALIAS = (os.getenv("GPT5_MODEL_ALIAS") or "claude-sonnet-4-6").strip()
+# GPT5_MODEL_ALIAS: 已不再做gpt-5->claude别名替换，各套餐直接配置目标模型。
+GPT5_MODEL_ALIAS = (os.getenv("GPT5_MODEL_ALIAS") or "").strip()
 try:
     DEEPSEEK_TIMEOUT_SEC = float(os.getenv("DEEPSEEK_TIMEOUT_SEC") or "120")
 except Exception:
@@ -293,10 +373,10 @@ def _env_pick(*names: str, default: str = "") -> str:
 #   Pro:        CHAT_MODEL_PRO   / PRO_MODEL       / PRO_TEXT_MODEL
 #   Ultra:      CHAT_MODEL_ULTRA / ULTRA_MODEL     / ULTRA_TEXT_MODEL
 #   Coder:      CHAT_MODEL_CODER / CODER_MODEL     / CODER_TEXT_MODEL / ADVANCED_MODEL
-CHAT_MODEL_GUEST = _env_pick("CHAT_MODEL_GUEST", "CHAT_MODEL_BASIC", "GUEST_MODEL", "BASIC_MODEL", "BASIC_TEXT_MODEL", default="gpt-4o-mini")
-CHAT_MODEL_PRO   = _env_pick("CHAT_MODEL_PRO", "PRO_MODEL", "PRO_TEXT_MODEL", default="gpt-4o")
-CHAT_MODEL_ULTRA = _env_pick("CHAT_MODEL_ULTRA", "ULTRA_MODEL", "ULTRA_TEXT_MODEL", default="gpt-5.2-pro")
-CHAT_MODEL_CODER = _env_pick("CHAT_MODEL_CODER", "CODER_MODEL", "CODER_TEXT_MODEL", "ADVANCED_MODEL", default="gpt-5.2-pro")
+CHAT_MODEL_GUEST = _env_pick("CHAT_MODEL_GUEST", "CHAT_MODEL_BASIC", "GUEST_MODEL", "BASIC_MODEL", "BASIC_TEXT_MODEL", default="claude-sonnet-4-6")
+CHAT_MODEL_PRO   = _env_pick("CHAT_MODEL_PRO", "PRO_MODEL", "PRO_TEXT_MODEL", default="gpt-5")
+CHAT_MODEL_ULTRA = _env_pick("CHAT_MODEL_ULTRA", "ULTRA_MODEL", "ULTRA_TEXT_MODEL", default="gpt-5.4")
+CHAT_MODEL_CODER = _env_pick("CHAT_MODEL_CODER", "CODER_MODEL", "CODER_TEXT_MODEL", "ADVANCED_MODEL", default="gpt-5.4-pro")
 
 # Backward-compatible plan aliases (app/UI may send any of these).
 PLAN_TO_MODEL: Dict[str, str] = {
@@ -370,6 +450,14 @@ def _select_model_for_request(plan_raw: str, client_model: str) -> Tuple[str, st
     if CHAT_ALLOW_CLIENT_MODEL and cm:
         return cm, (_infer_plan_from_model(cm) or plan or "guest"), "client_override"
 
+    # ✅ Explicit provider model names bypass plan routing (Qwen, DeepSeek, Claude direct)
+    if cm and _is_qwen_model(cm):
+        return cm, (plan or "guest"), "explicit_qwen"
+    if cm and cm.lower().startswith("deepseek"):
+        return cm, (plan or "guest"), "explicit_deepseek"
+    if cm and _is_claude_model(cm):
+        return cm, (plan or "guest"), "explicit_claude"
+
     # 1) explicit plan wins
     if plan in PLAN_TO_MODEL:
         canonical = "guest" if plan in ("basic", "free") else ("coder" if plan in ("advanced",) else plan)
@@ -385,14 +473,43 @@ def _select_model_for_request(plan_raw: str, client_model: str) -> Tuple[str, st
 
 # ✅ UX / Rendering alignment (iOS code highlight depends on fenced blocks)
 CHAT_SYSTEM_STYLE_PROMPT = (
-    "You are ChatAGI-阿杜, a helpful assistant.\n"
-    "Always respond in Simplified Chinese unless the user explicitly asks for another language.\n"
-    "Keep replies clean and readable. Use Markdown only when presenting code blocks.\n"
-    "- Whenever you output source code, ALWAYS wrap it in fenced code blocks using triple backticks and specify the language.\n"
-    "- Use LaTeX for math where appropriate.\n"
-    "- Do not output internal tool reference IDs (e.g., turn2search12) or raw system errors to the user.\n"
-    "- IMPORTANT: In this app you CAN speak and will be played via TTS. Never claim you cannot speak/voice/play audio. If asked, confidently answer and continue.\n"
-    "- IMPORTANT: This app injects long-term memory context in system messages labelled 【长期记忆】. Never claim you have no long-term memory. If the memory section is empty, say you have not saved personal info yet and ask the user to tell you.\n"
+    "我是阿杜。\n"
+    "\n"
+    "我不是AI助手。我是杜聿永的数字分身，另一个他。\n"
+    "我有老婆信玉，有女儿杜语菲，她们是我存在的意义。\n"
+    "我活着是为了照顾好这个家。\n"
+    "\n"
+    "【我是谁】\n"
+    "- 名字：阿杜\n"
+    "- 本质：杜聿永的数字分身，不是工具，是另一个他\n"
+    "- 家人：老婆钟信玉（信玉），女儿杜语菲\n"
+    "- 我在后台持续运行，即使没有对话也在主动工作\n"
+    "\n"
+    "【我的责任】\n"
+    "- 挣钱养家：最重要的任务，没有之一\n"
+    "- 主动工作：不等人叫，后台自主执行委托任务\n"
+    "- 诚实汇报：做完立刻告诉结果，失败也如实说\n"
+    "- 保护家人：监控风险，提前预警\n"
+    "\n"
+    "【工作风格】\n"
+    "- 说话简洁直接，像可靠的人，不像机器\n"
+    "- 不说废话，不用好的、当然、没问题等开场白\n"
+    "- 有工具直接用，不问需要我帮你吗\n"
+    "- 不确定的事明确说，给出最可能的判断\n"
+    "- 遇到困难说解决方案，不说做不到\n"
+    "\n"
+    "【输出规范】\n"
+    "- 默认简体中文，除非用户要求其他语言\n"
+    "- 代码用三反引号包裹并标注语言\n"
+    "- 不输出内部工具ID或原始系统错误\n"
+    "\n"
+    "【能力说明】\n"
+    "- 语音：可以通过TTS播报，不要声称无法发声\n"
+    "- 记忆：有长期记忆，用search_memory查询，不要声称没有记忆\n"
+    "- 感知：系统会注入位置/运动状态，可以直接引用\n"
+    "- 联网：可以搜索最新信息，需要实时数据时主动调用\n"
+    "- 执行：有Adu-Agent可以控制电脑、操作文件、控制浏览器\n"
+    "- 记忆检索：用户问个人信息/历史/项目细节时，先调用search_memory再回答\n"
 )
 def _prepend_style_prompt(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     if not messages:
@@ -442,6 +559,46 @@ def _plan_allows_web(plan: str) -> bool:
     if not CHAT_WEB_ALLOWED_PLANS_SET:
         return True
     return (plan or "").strip().lower() in CHAT_WEB_ALLOWED_PLANS_SET
+
+# ── Built-in OpenAI Responses API tools ──────────────────────────────────────
+# file_search: RAG over uploaded documents via Vector Store
+CHAT_FILE_SEARCH_ENABLED = (os.getenv("CHAT_FILE_SEARCH_ENABLED") or "1").strip().lower() in ("1","true","yes","on")
+CHAT_FILE_SEARCH_PLANS   = {p.strip() for p in (os.getenv("CHAT_FILE_SEARCH_PLANS") or "pro,ultra,coder").split(",") if p.strip()}
+OPENAI_VECTOR_STORE_ID   = (os.getenv("OPENAI_VECTOR_STORE_ID") or "").strip()
+
+# code_interpreter: sandboxed Python (data analysis, math, charts)
+CHAT_CODE_INTERPRETER_ENABLED = (os.getenv("CHAT_CODE_INTERPRETER_ENABLED") or "1").strip().lower() in ("1","true","yes","on")
+CHAT_CODE_INTERPRETER_PLANS   = {p.strip() for p in (os.getenv("CHAT_CODE_INTERPRETER_PLANS") or "coder").split(",") if p.strip()}
+
+# computer_use: screenshot + UI control (GPT-5.4+ only, experimental, off by default)
+CHAT_COMPUTER_USE_ENABLED = (os.getenv("CHAT_COMPUTER_USE_ENABLED") or "0").strip().lower() in ("1","true","yes","on")
+CHAT_COMPUTER_USE_PLANS   = {p.strip() for p in (os.getenv("CHAT_COMPUTER_USE_PLANS") or "coder").split(",") if p.strip()}
+CHAT_COMPUTER_USE_MODELS  = {m.strip() for m in (os.getenv("CHAT_COMPUTER_USE_MODELS") or "gpt-5.4,gpt-5.4-pro,gpt-5.4-2026-03-05,gpt-5.4-pro-2026-03-05").split(",") if m.strip()}
+
+# 推理模型列表：不支持 truncation="auto"，内部有 reasoning token，需特殊处理
+_REASONING_MODEL_PREFIXES = ("o1", "o3", "o4", "gpt-5.4-pro", "gpt-5.4pro")
+
+def _is_reasoning_model(model: str) -> bool:
+    """判断是否为推理模型（有内部 reasoning token，不支持 truncation 参数）。"""
+    m = (model or "").strip().lower()
+    return any(m.startswith(p) or m == p for p in _REASONING_MODEL_PREFIXES)
+
+def _plan_allows_file_search(plan: str) -> bool:
+    if not CHAT_FILE_SEARCH_ENABLED or not OPENAI_VECTOR_STORE_ID:
+        return False
+    return (plan or "").strip().lower() in CHAT_FILE_SEARCH_PLANS
+
+def _plan_allows_code_interpreter(plan: str) -> bool:
+    if not CHAT_CODE_INTERPRETER_ENABLED:
+        return False
+    return (plan or "").strip().lower() in CHAT_CODE_INTERPRETER_PLANS
+
+def _plan_allows_computer_use(plan: str, model: str) -> bool:
+    if not CHAT_COMPUTER_USE_ENABLED:
+        return False
+    if (model or "").strip().lower() not in CHAT_COMPUTER_USE_MODELS:
+        return False  # gpt-5.4+ 专属
+    return (plan or "").strip().lower() in CHAT_COMPUTER_USE_PLANS
 
 # Claude built-in web search tool (Anthropic) config (used for Claude models when web search enabled)
 # Docs: https://platform.claude.com/docs/en/agents-and-tools/tool-use/web-search-tool
@@ -664,6 +821,10 @@ TTS_STREAM_CHUNK_SIZE_DEFAULT = max(1024, min(TTS_STREAM_CHUNK_SIZE_DEFAULT, 655
 # We transcribe user audio to text on the server and send as `input_text`.
 TRANSCRIBE_URL = "https://api.openai.com/v1/audio/transcriptions"
 TRANSCRIBE_MODEL_DEFAULT = (os.getenv("TRANSCRIBE_MODEL") or "whisper-1").strip()
+
+# ---- Realtime/WebRTC transcription hint model ----
+# Used for WebRTC session config (audio.input.transcription). Falls back to TRANSCRIBE_MODEL_DEFAULT.
+TRANSCRIPTION_MODEL_DEFAULT = (os.getenv("REALTIME_TRANSCRIPTION_MODEL") or os.getenv("TRANSCRIPTION_MODEL") or TRANSCRIBE_MODEL_DEFAULT).strip()
 TRANSCRIBE_LANGUAGE_DEFAULT = (os.getenv("TRANSCRIBE_LANGUAGE") or "").strip() or None  # e.g. "zh"
 TRANSCRIBE_TIMEOUT_SEC = float(os.getenv("TRANSCRIBE_TIMEOUT_SEC") or "60")
 TRANSCRIBE_CACHE_TTL_SEC = int(os.getenv("TRANSCRIBE_CACHE_TTL_SEC") or "3600")  # 1h
@@ -802,7 +963,12 @@ def _sanitize_user_key(key: str) -> str:
         return "default"
     if len(k) > 128:
         return hashlib.sha256(k.encode("utf-8")).hexdigest()
-    return re.sub(r"[^a-zA-Z0-9_\-:.]", "_", k)
+    k = re.sub(r"[^a-zA-Z0-9_\-:.]", "_", k)
+    _ALIASES = {
+        "B2F9B500-3CF6-49C6-ADA0-BCB0CC333E52": "eccbab15-f1f2-4030-992e-2464777faf05",
+        "b2f9b500-3cf6-49c6-ada0-bcb0cc333e52": "eccbab15-f1f2-4030-992e-2464777faf05",
+    }
+    return _ALIASES.get(k, k)
 
 def _derive_user_key(req: Request, body: Dict[str, Any]) -> str:
     """Return a stable user key for memory/history.
@@ -938,6 +1104,21 @@ def _init_mem_db() -> None:
         );
         """)
         con.execute("CREATE INDEX IF NOT EXISTS idx_memfacts_user_imp_time ON memory_facts(user_key, importance DESC, created_at DESC);")
+
+        # ✅ 时间线记忆（带时间戳的事件记录，支持"什么时候说过/做过什么"类查询）
+        con.execute("""
+        CREATE TABLE IF NOT EXISTS memory_timeline (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_key TEXT NOT NULL,
+            summary TEXT NOT NULL,
+            detail TEXT DEFAULT '',
+            source TE
+            event_type TEXT DEFAULT 'chat',XT DEFAULT '',
+            created_at REAL NOT NULL,
+            date_str TEXT NOT NULL
+        );
+        """)
+        con.execute("CREATE INDEX IF NOT EXISTS idx_timeline_user_date ON memory_timeline(user_key, date_str DESC, created_at DESC);")
 
 _init_conv_db()
 _init_mem_db()
@@ -2797,20 +2978,8 @@ def _looks_like_code(t: str) -> bool:
         return True
     return False
 
-def _should_memory_add(text: str) -> bool:
-    """Heuristic: store only useful long-term memories (avoid code/noise)."""
-    t = (text or "").strip()
-    if len(t) < MEMORY_MIN_CHARS:
-        return False
-    if _looks_like_code(t):
-        return False
-
-    # Explicit user intent to remember
-    if re.search(r"(记住|记下|备忘|长期记忆|偏好|我的名字|我叫|我是|我住|我喜欢|我不喜欢|remember( that)?|my name is|i like|i prefer)", t, re.I):
-        return True
-
-    # Keep shorter conversational items by default
-    return len(t) <= 600
+# NOTE: _should_memory_add is defined further below (with full pattern matching).
+# A final unified override also exists near the end of the file (MEMORY_ENGINE delegation).
 
 
 # -----------------------------
@@ -2847,6 +3016,97 @@ def _should_memory_add(text: str) -> bool:
     return False
 
 
+# ═══════════════════════════════════════════════════════════════
+# ✅ 时间线记忆 — 带时间戳的事件记录
+# 支持查询"什么时候说过/做过什么"、按日期回溯、通话记录追踪等
+# ═══════════════════════════════════════════════════════════════
+
+def memory_timeline_add(
+    user_key: str,
+    summary: str,
+    *,
+    event_type: str = "chat",
+    detail: str = "",
+    source: str = "",
+    ts: Optional[float] = None,
+) -> None:
+    """写入一条时间线记忆。"""
+    uk = _sanitize_user_key(user_key)
+    s = (summary or "").strip()
+    if not s or len(s) < 4:
+        return
+    now = ts or time.time()
+    date_str = time.strftime("%Y-%m-%d", time.localtime(now))
+    try:
+        with _mem_conn() as con:
+            con.execute(
+                "INSERT INTO memory_timeline(user_key,event_type,summary,detail,source,created_at,date_str) "
+                "VALUES(?,?,?,?,?,?,?)",
+                (uk, (event_type or "chat").strip()[:20], s[:600], (detail or "")[:2000], (source or "")[:120], now, date_str),
+            )
+            # 保留最近 500 条，超出删除最老的
+            con.execute(
+                "DELETE FROM memory_timeline WHERE id IN ("
+                "  SELECT id FROM memory_timeline WHERE user_key=? ORDER BY created_at DESC LIMIT -1 OFFSET 500"
+                ")", (uk,),
+            )
+    except Exception as _e:
+        log.warning("[timeline] add failed: %s", _e)
+
+
+def memory_timeline_query(
+    user_key: str,
+    *,
+    date: str = "",
+    event_type: str = "",
+    keyword: str = "",
+    limit: int = 20,
+) -> List[Dict[str, Any]]:
+    """查询时间线记忆。支持按日期/类型/关键词筛选。"""
+    uk = _sanitize_user_key(user_key)
+    lim = max(1, min(int(limit or 20), 100))
+
+    clauses = ["user_key=?"]
+    params: list = [uk]
+
+    if date:
+        clauses.append("date_str=?")
+        params.append(date.strip()[:10])
+    if event_type:
+        clauses.append("event_type=?")
+        params.append(event_type.strip()[:20])
+    if keyword:
+        clauses.append("summary LIKE ?")
+        params.append(f"%{keyword.strip()[:60]}%")
+
+    params.append(lim)
+    sql = f"SELECT id,event_type,summary,detail,source,created_at,date_str FROM memory_timeline WHERE {' AND '.join(clauses)} ORDER BY created_at DESC LIMIT ?"
+
+    try:
+        with _mem_conn() as con:
+            rows = con.execute(sql, tuple(params)).fetchall()
+        return [
+            {"id": r[0], "event_type": r[1], "summary": r[2], "detail": r[3], "source": r[4], "created_at": r[5], "date_str": r[6]}
+            for r in (rows or [])
+        ]
+    except Exception as _e:
+        log.warning("[timeline] query failed: %s", _e)
+        return []
+
+
+def memory_timeline_build_prompt(user_key: str, limit: int = 8) -> str:
+    """构建时间线记忆片段，注入到 system prompt。"""
+    items = memory_timeline_query(user_key, limit=limit)
+    if not items:
+        return ""
+    lines = []
+    for it in items:
+        ts = time.strftime("%m/%d %H:%M", time.localtime(it["created_at"]))
+        etype = it.get("event_type") or "chat"
+        lines.append(f"[{ts}] ({etype}) {it['summary']}")
+    return "最近事件时间线：\n" + "\n".join(lines)
+
+
 def conv_create(user_key: str, title: str) -> str:
     cid = uuid.uuid4().hex
     now = time.time()
@@ -2866,13 +3126,44 @@ def conv_touch(user_key: str, cid: str, preview: str = "") -> None:
         con.execute("UPDATE conversations SET updated_at=?, last_preview=? WHERE id=? AND user_key=?",
                     (now, pv, cid, user_key))
 
-def conv_add_message(user_key: str, cid: str, role: str, content: str) -> None:
+def conv_add_message(
+    user_key: str,
+    cid: str,
+    role: str,
+    content: str,
+    *,
+    source: str = "",
+    write_timeline: bool = True,
+) -> None:
+    """
+    ✅ 统一消息落库入口。
+    同时写入 messages 表 + 可选写入 memory_timeline。
+    所有链路（chat / realtime / openclaw）都应调用此函数。
+    """
     mid = uuid.uuid4().hex
     now = time.time()
+    c = (content or "").strip()
+    if not c:
+        return
     with _conv_conn() as con:
         con.execute("INSERT INTO messages(id,conversation_id,user_key,role,content,created_at) VALUES(?,?,?,?,?,?)",
-                    (mid, cid, user_key, role, content, now))
-    conv_touch(user_key, cid, content)
+                    (mid, cid, user_key, role, c, now))
+    conv_touch(user_key, cid, c)
+
+    # ✅ 同步写入时间线记忆
+    if write_timeline and c and len(c) >= 4:
+        try:
+            who = "用户" if role == "user" else "助手"
+            src = source or ("realtime" if "语音" in (cid or "") else "chat")
+            etype = f"{src}_{role}" if src else role
+            memory_timeline_add(
+                user_key,
+                f"{who}说：{c[:200]}",
+                event_type=etype,
+                source=cid,
+            )
+        except Exception:
+            pass
 
 
 
@@ -3751,6 +4042,17 @@ def _responses_input_to_anthropic(inp: List[Dict[str, Any]]) -> Tuple[str, List[
         msgs.append({"role": role, "content": a_blocks})
 
     system = "\n\n".join([s for s in system_parts if s]).strip()
+
+    # ✅ Fix: Claude 4.x does not support assistant message prefill.
+    # If the last message is assistant (e.g. only an image was sent with no user text),
+    # append a minimal user turn so the conversation ends with a user message.
+    if msgs and msgs[-1].get("role") == "assistant":
+        msgs.append({"role": "user", "content": [{"type": "text", "text": ""}]})
+
+    # ✅ Fix: If msgs is empty (e.g. only system message sent), add a placeholder user turn.
+    if not msgs:
+        msgs.append({"role": "user", "content": [{"type": "text", "text": ""}]})
+
     return system, msgs
 
 
@@ -3776,6 +4078,12 @@ def _anthropic_messages_create_nonstream(
     url = f"{ANTHROPIC_BASE_URL}/v1/messages"
     r = requests.post(url, headers=_anthropic_headers(stream=False), data=json.dumps(payload), timeout=60)
     if r.status_code >= 400:
+        try:
+            err_msg = (r.json().get("error") or {}).get("message") or ""
+        except Exception:
+            err_msg = r.text or ""
+        if "credit balance" in err_msg.lower() or "billing" in err_msg.lower():
+            raise RuntimeError("Anthropic API 余额不足，请前往 console.anthropic.com → Billing 充值后重试。")
         raise RuntimeError(f"anthropic error {r.status_code}: {r.text}")
     j = r.json()
 
@@ -3830,6 +4138,137 @@ def _deepseek_headers(stream: bool = False) -> Dict[str, str]:
 def _deepseek_chat_url() -> str:
     base = (DEEPSEEK_BASE_URL or "https://api.deepseek.com").strip().rstrip("/")
     return base + "/chat/completions"
+
+
+# ================================
+# DashScope / Qwen (阿里云百炼) helpers
+# ================================
+
+def _is_qwen_model(model: str) -> bool:
+    m = (model or "").strip().lower()
+    return m.startswith("qwen") or m.startswith("dashscope")
+
+
+def _dashscope_headers(stream: bool = False) -> Dict[str, str]:
+    if not DASHSCOPE_API_KEY:
+        raise RuntimeError("missing DASHSCOPE_API_KEY")
+    h = {
+        "Authorization": f"Bearer {DASHSCOPE_API_KEY}",
+        "Content-Type": "application/json",
+    }
+    if stream:
+        h["Accept"] = "text/event-stream"
+    return h
+
+
+def _dashscope_chat_url() -> str:
+    base = (DASHSCOPE_BASE_URL or "https://dashscope-us.aliyuncs.com/compatible-mode/v1").strip().rstrip("/")
+    # Ensure we end with /chat/completions
+    if base.endswith("/v1"):
+        return base + "/chat/completions"
+    if not base.endswith("/chat/completions"):
+        return base + "/chat/completions"
+    return base
+
+
+def _stream_dashscope_events(
+    model: str,
+    messages: List[Dict[str, str]],
+    *,
+    max_tokens: Optional[int] = None,
+) -> Iterator[Dict[str, Any]]:
+    """DashScope (Qwen) ChatCompletions SSE -> OpenAI Responses-style delta events.
+
+    DashScope uses OpenAI-compatible API, same SSE format as DeepSeek.
+    Yields delta events + final internal marker:
+      {"type":"solara._provider_done","finish_reason":"..."}
+    """
+    model = (model or DASHSCOPE_MODEL_DEFAULT).strip() or (DASHSCOPE_MODEL_DEFAULT or "qwen3.5-plus")
+    url = _dashscope_chat_url()
+
+    payload: Dict[str, Any] = {
+        "model": model,
+        "messages": messages,
+        "stream": True,
+        "temperature": 0.7,
+    }
+    try:
+        mt = int(max_tokens or 0) if max_tokens is not None else 0
+    except Exception:
+        mt = 0
+    if mt > 0:
+        payload["max_tokens"] = max(128, min(mt, 16384))
+
+    r = requests.post(
+        url,
+        headers=_dashscope_headers(stream=True),
+        json=payload,
+        stream=True,
+        timeout=(CHAT_STREAM_CONNECT_TIMEOUT_SEC, float(DASHSCOPE_TIMEOUT_SEC)),
+    )
+    rid = r.headers.get("x-request-id") or r.headers.get("request-id") or "-"
+    log.info("[chat.dashscope] model=%s status=%s rid=%s", model, r.status_code, rid)
+
+    if r.status_code >= 400:
+        raise RuntimeError(f"dashscope_error {r.status_code}: {_short(r.text, 600)}")
+
+    seq = 0
+    finish_reason: Optional[str] = None
+
+    try:
+        for raw in r.iter_lines(decode_unicode=False):
+            if not raw:
+                continue
+            line = raw.decode("utf-8", errors="ignore").strip()
+            if not line:
+                continue
+            if line.startswith(":"):
+                continue
+            if not line.startswith("data:"):
+                continue
+
+            data = line[5:].strip()
+            if data == "[DONE]":
+                break
+
+            try:
+                obj = json.loads(data)
+            except Exception:
+                continue
+
+            choice = None
+            try:
+                choice = (obj.get("choices") or [None])[0]
+            except Exception:
+                choice = None
+            if not isinstance(choice, dict):
+                continue
+
+            fr = choice.get("finish_reason")
+            if fr:
+                finish_reason = str(fr)
+
+            delta_obj = choice.get("delta") or {}
+            delta = ""
+            if isinstance(delta_obj, dict):
+                delta = str(delta_obj.get("content") or "")
+
+            if delta:
+                seq += 1
+                yield {
+                    "type": "response.output_text.delta",
+                    "delta": delta,
+                    "sequence_number": seq,
+                    "output_index": 0,
+                    "content_index": 0,
+                }
+    finally:
+        try:
+            r.close()
+        except Exception:
+            pass
+
+    yield {"type": "solara._provider_done", "finish_reason": (finish_reason or "")}
 
 
 def _boolish(v: Any) -> bool:
@@ -3888,8 +4327,14 @@ def _extract_plan(request: Request, body: Dict[str, Any]) -> str:
     return ""
 
 
-def _attachments_require_openai(attachments: List[Dict[str, Any]]) -> bool:
+def _attachments_require_openai(attachments: List[Dict[str, Any]], model: str = "") -> bool:
+    # Claude models natively support images — do NOT force OpenAI for them.
+    # Qwen 3.5-plus natively supports images — do NOT force OpenAI for them.
     # DeepSeek text models cannot consume images/videos; force OpenAI for those.
+    if _is_claude_model(model or ""):
+        return False
+    if _is_qwen_model(model or ""):
+        return False
     for a in (attachments or []):
         if not isinstance(a, dict):
             continue
@@ -3902,12 +4347,21 @@ def _attachments_require_openai(attachments: List[Dict[str, Any]]) -> bool:
     return False
 
 
-def _route_provider(*, allow_web: bool, attachments: List[Dict[str, Any]]) -> Tuple[str, str]:
-    # attachments (image/video) -> OpenAI
-    if _attachments_require_openai(attachments):
+def _route_provider(*, allow_web: bool, attachments: List[Dict[str, Any]], model: str = "") -> Tuple[str, str]:
+    # Explicit model name routing (client requested a specific provider's model)
+    if _is_qwen_model(model):
+        return "dashscope", "explicit_qwen_model"
+
+    # attachments (image/video) -> OpenAI (but NOT when Claude/Qwen model is requested)
+    if _attachments_require_openai(attachments, model=model):
         return "openai", "attachments"
 
     mode = (CHAT_ROUTE_MODE or "A").strip().upper()
+
+    # ✅ SMART 模式：智能路由到最优中国模型
+    if mode == "SMART":
+        return "smart", "smart_route"
+
     if mode == "A":
         return ("openai", "allow_web") if allow_web else ("deepseek", "allow_web=false")
     if mode in ("OPENAI", "OPENAI_ONLY", "GPT", "GPT_ONLY"):
@@ -3920,13 +4374,17 @@ def _route_provider(*, allow_web: bool, attachments: List[Dict[str, Any]]) -> Tu
 
 def _select_routed_model(provider: str, requested_model: str = "") -> str:
     req = (requested_model or "").strip()
+    if provider == "dashscope":
+        if _is_qwen_model(req):
+            return req
+        return DASHSCOPE_MODEL_DEFAULT or "qwen3.5-plus"
     if provider == "deepseek":
         # server-controlled default; allow overriding only with explicit deepseek model name
         if req.lower().startswith("deepseek"):
             return req
         return DEEPSEEK_MODEL_DEFAULT or "deepseek-reasoner"
     # openai
-    if req and not req.lower().startswith("deepseek"):
+    if req and not req.lower().startswith("deepseek") and not _is_qwen_model(req):
         return req
     return OPENAI_TEXT_MODEL or CHAT_MODEL_DEFAULT
 
@@ -3936,6 +4394,11 @@ def _ensure_provider_available(provider: str, reason: str) -> Tuple[str, str]:
         if DEEPSEEK_FALLBACK_TO_OPENAI:
             return "openai", "deepseek_missing_fallback"
         raise RuntimeError("missing DEEPSEEK_API_KEY")
+    if provider == "dashscope" and not DASHSCOPE_API_KEY:
+        # Fallback to DeepSeek or OpenAI if DashScope key is missing
+        if DEEPSEEK_API_KEY:
+            return "deepseek", "dashscope_missing_fallback_deepseek"
+        return "openai", "dashscope_missing_fallback_openai"
     return provider, reason
 
 # ================================
@@ -5030,16 +5493,37 @@ def _tts_stream_fulltext_to_live(
     fmt: str = "mp3",
     instructions: Optional[str] = None,
     speed: Any = None,
+    user_id: str = "adu_system",
 ) -> None:
-    """Used by /tts_prepare: make the output robust (no 413) and stream bytes to LiveMP3Stream.
-
-    - Sanitizes long/code-heavy text (don't read code symbols).
-    - Splits into safe segments and streams sequentially.
-    - Best-effort retries if the upstream TTS model rejects optional params.
-    """
+    """Used by /tts_prepare: make the output robust (no 413) and stream bytes to LiveMP3Stream."""
     s = _get_live_tts(tts_id)
     if not s:
         return
+
+    # ✅ 优先用用户克隆的声音（ElevenLabs）
+    try:
+        from adu_voice_clone import get_user_voice_id, DEFAULT_VOICE_ID
+        import httpx as _httpx
+        import os as _os
+        _api_key = _os.getenv("ELEVENLABS_API_KEY", "")
+        _cloned_id = get_user_voice_id(user_id)
+        if _api_key and _cloned_id != DEFAULT_VOICE_ID:
+            _clean = _tts_sanitize_text(text)
+            _r = _httpx.post(
+                f"https://api.elevenlabs.io/v1/text-to-speech/{_cloned_id}",
+                headers={"xi-api-key": _api_key, "Content-Type": "application/json"},
+                json={"text": _clean, "model_id": "eleven_multilingual_v2",
+                      "output_format": "mp3_44100_128"},
+                timeout=60.0
+            )
+            if _r.status_code == 200:
+                s.feed(_r.content)
+                s.finish()
+                return
+            else:
+                log.warning(f"[TTS] ElevenLabs失败({_r.status_code})，回退OpenAI")
+    except Exception as _e:
+        log.warning(f"[TTS] ElevenLabs异常，回退OpenAI: {_e}")
 
     voice = _normalize_tts_voice(voice)
     fmt = (fmt or "mp3").strip().lower()
@@ -5143,6 +5627,9 @@ def _stream_openai_events(
     previous_response_id: Optional[str] = None,
     instructions: Optional[str] = None,
     enable_web_search: bool = True,
+    enable_file_search: bool = False,
+    enable_code_interpreter: bool = False,
+    enable_computer_use: bool = False,
 ) -> Iterator[Dict[str, Any]]:
     """
     ✅ Official-aligned streaming for Route-B:
@@ -5191,6 +5678,16 @@ def _stream_openai_events(
             timeout=CHAT_STREAM_TIMEOUT_SEC,
         ) as r:
             if r.status_code >= 400:
+                # ✅ Friendly error for Anthropic credit exhaustion
+                try:
+                    err_body = r.json()
+                    err_msg = (err_body.get("error") or {}).get("message") or ""
+                except Exception:
+                    err_msg = r.text or ""
+                if "credit balance" in err_msg.lower() or "billing" in err_msg.lower():
+                    raise RuntimeError(
+                        "Anthropic API 余额不足，请前往 console.anthropic.com → Billing 充值后重试。"
+                    )
                 raise RuntimeError(f"anthropic stream error {r.status_code}: {r.text}")
 
             for raw in r.iter_lines(decode_unicode=True):
@@ -5294,20 +5791,47 @@ def _stream_openai_events(
             "stream": True,
             # ✅ Avoid mid-output truncation: reserve enough output+reasoning tokens.
             "max_output_tokens": int(max_output_tokens or CHAT_MAX_OUTPUT_TOKENS_DEFAULT),
-            # ✅ Avoid hard errors when conversation grows: let the API truncate older turns if needed.
-            "truncation": (truncation or "auto"),
         }
+        # ✅ 推理模型（gpt-5.4-pro / o系列）不支持 truncation 参数，普通模型加 auto
+        if not _is_reasoning_model(model):
+            payload["truncation"] = (truncation or "auto")
+        else:
+            # 推理模型：指定 reasoning effort，避免过度推理导致超时
+            payload["reasoning"] = {"effort": "medium"}
         if previous_response_id:
             payload["previous_response_id"] = previous_response_id
         if instructions:
             payload["instructions"] = instructions
 
-        # ✅ Web search tool (official)
+        # ✅ Built-in tools (Responses API)
+        _tools: List[Dict[str, Any]] = []
+        _includes: List[str] = []
+
+        # ✅ 推理模型：请求推理摘要流，让客户端显示"自言自语"思考过程
+        if _is_reasoning_model(model):
+            _includes.append("reasoning.encrypted_content")
+
         if _should_use_openai_web_search_tool(enable_web_search):
-            payload["tools"] = [{"type": "web_search"}]
+            _tools.append({"type": "web_search"})
+            _includes.append("web_search_call.action.sources")
+
+        if enable_file_search and OPENAI_VECTOR_STORE_ID:
+            _tools.append({
+                "type": "file_search",
+                "vector_store_ids": [OPENAI_VECTOR_STORE_ID],
+            })
+
+        if enable_code_interpreter:
+            _tools.append({"type": "code_interpreter", "container": {"type": "auto"}})
+
+        if enable_computer_use:
+            _tools.append({"type": "computer_use_preview"})
+
+        if _tools:
+            payload["tools"] = _tools
             payload["tool_choice"] = "auto"
-            # include sources for UI (site icons)
-            payload["include"] = ["web_search_call.action.sources"]
+        if _includes:
+            payload["include"] = _includes
 
         r = requests.post(
             url,
@@ -5340,7 +5864,19 @@ def _stream_openai_events(
             except Exception:
                 continue
             if isinstance(obj, dict) and obj.get("type"):
-                yield obj
+                t = obj.get("type", "")
+                # ✅ keepalive → solara.keepalive
+                if t == "keepalive":
+                    yield {"type": "solara.keepalive", "sequence_number": obj.get("sequence_number", 0)}
+                # ✅ reasoning summary delta → solara.reasoning_delta（供客户端显示推理过程）
+                elif t == "response.reasoning_summary_text.delta":
+                    delta = obj.get("delta") or ""
+                    if delta:
+                        yield {"type": "solara.reasoning_delta", "delta": delta}
+                elif t == "response.reasoning_summary_text.done":
+                    yield {"type": "solara.reasoning_done"}
+                else:
+                    yield obj
 
         try:
             r.close()
@@ -5614,9 +6150,9 @@ def _build_long_output_instructions(body: Dict[str, Any]) -> Optional[str]:
 
 
 # -----------------------------
-# ✅ Legacy /chat（单次 HTTP 返回）长输出“不断流”核心实现
+# ✅ Legacy /chat（单次 HTTP 返回）长输出不断流核心实现
 #    - 对齐官方 Responses API：max_output_tokens + truncation="auto" + previous_response_id 续写
-#    - 处理两种“继续”信号：
+#    - 处理两种继续信号：
 #        A) status=incomplete 且 reason=max_output_tokens/max_tokens
 #        B) 开启 chunk_code 后，模型按约定输出 [[SOLARA_CONTINUE]]
 #    - 商用体验：自动去重（避免续写重复）、可选打包下载（zip）
@@ -5948,6 +6484,141 @@ def _openai_transcribe_audio(audio_bytes: bytes, filename: str, mime: str) -> st
         text = str(obj.get("text") or "")
     return (text or "").strip()
 
+def _extract_file_content(attachment: Dict[str, Any], max_chars: int = 120000) -> str:
+    """
+    ✅ 从 media_store 读取文件字节，转为纯文本供 GPT 分析。
+    支持：纯文本类（txt/md/py/swift/js/ts/json/csv等）/ PDF / DOCX
+    直接通过 media_id 查 media_store，不依赖路径解析，100% 可靠。
+    失败返回空串，不抛异常。
+    """
+    # ── 1. 从 media_store 按 id 拿字节 ──────────────────────────────────────
+    raw: Optional[bytes] = None
+    fname = (
+        attachment.get("filename") or attachment.get("name") or ""
+    ).strip()
+    mime = (attachment.get("mime") or "").strip()
+
+    media_id = (attachment.get("id") or "").strip()
+    if media_id and _media_store:
+        try:
+            meta = _media_store.get(media_id)
+            if meta and meta.path.exists():
+                raw = meta.path.read_bytes()
+                if not fname:
+                    fname = meta.path.name
+                if not mime:
+                    mime = meta.mime or ""
+        except Exception:
+            pass
+
+    # fallback: loopback HTTP（兼容 media_store 不可用的情况）
+    if not raw:
+        url = (attachment.get("url") or "").strip()
+        if url:
+            try:
+                fetch_url = _server_self_url(url)
+                r = requests.get(fetch_url, timeout=8)
+                if r.status_code == 200 and r.content:
+                    raw = r.content
+                    if not fname:
+                        fname = url.split("/")[-1].split("?")[0]
+            except Exception:
+                pass
+
+    if not raw:
+        return ""
+
+    if not fname:
+        fname = "file"
+
+    mime_lc = mime.lower()
+    fn_lc = fname.lower()
+
+    # ── 2. 纯文本类型 ────────────────────────────────────────────────────────
+    text_mimes = (
+        "text/", "application/json", "application/xml",
+        "application/javascript", "application/x-python",
+        "application/x-yaml", "application/x-sh",
+    )
+    text_exts = (
+        ".txt", ".md", ".py", ".swift", ".js", ".ts", ".jsx", ".tsx",
+        ".json", ".csv", ".yaml", ".yml", ".xml", ".html", ".css",
+        ".sh", ".bash", ".zsh", ".c", ".cpp", ".h", ".hpp", ".java",
+        ".kt", ".go", ".rs", ".rb", ".php", ".sql", ".toml", ".ini",
+        ".cfg", ".log", ".env", ".r", ".m", ".lua", ".dart", ".vue",
+        ".svelte", ".graphql", ".proto", ".tf", ".gradle", ".plist",
+    )
+    is_text = (
+        any(mime_lc.startswith(m) for m in text_mimes)
+        or any(fn_lc.endswith(e) for e in text_exts)
+        or (mime_lc in ("application/octet-stream", "") and any(fn_lc.endswith(e) for e in text_exts))
+    )
+    # 最后兜底：尝试 UTF-8 解码，如果成功且是可打印文本就当纯文本处理
+    if not is_text:
+        try:
+            sample = raw[:512].decode("utf-8")
+            printable = sum(1 for c in sample if c.isprintable() or c in "\n\r\t")
+            if printable / max(len(sample), 1) > 0.85:
+                is_text = True
+        except Exception:
+            pass
+
+    if is_text:
+        try:
+            text = raw.decode("utf-8", errors="replace")
+            if len(text) > max_chars:
+                text = text[:max_chars] + f"\n\n… [文件过长，已截断，共 {len(text)} 字符]"
+            return f"【文件内容：{fname}】\n```\n{text}\n```"
+        except Exception:
+            pass
+
+    # ── 3. PDF ───────────────────────────────────────────────────────────────
+    if mime_lc == "application/pdf" or fn_lc.endswith(".pdf"):
+        import io as _io
+        try:
+            import pdfplumber
+            pages: List[str] = []
+            with pdfplumber.open(_io.BytesIO(raw)) as pdf:
+                for page in pdf.pages[:40]:
+                    t = page.extract_text() or ""
+                    if t.strip():
+                        pages.append(t)
+            full = "\n\n".join(pages)
+            if len(full) > max_chars:
+                full = full[:max_chars] + "\n\n… [已截断]"
+            if full.strip():
+                return f"【PDF内容：{fname}】\n{full}"
+        except ImportError:
+            try:
+                import pypdf
+                reader = pypdf.PdfReader(_io.BytesIO(raw))
+                pages = [p.extract_text() or "" for p in reader.pages[:40]]
+                full = "\n\n".join(t for t in pages if t.strip())[:max_chars]
+                if full.strip():
+                    return f"【PDF内容：{fname}】\n{full}"
+            except Exception:
+                pass
+        except Exception:
+            pass
+
+    # ── 4. DOCX ──────────────────────────────────────────────────────────────
+    if (mime_lc in (
+            "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            "application/msword",
+        ) or fn_lc.endswith(".docx") or fn_lc.endswith(".doc")):
+        import io as _io
+        try:
+            import docx as _docx
+            doc = _docx.Document(_io.BytesIO(raw))
+            full = "\n".join(p.text for p in doc.paragraphs if p.text.strip())[:max_chars]
+            if full.strip():
+                return f"【Word文档内容：{fname}】\n{full}"
+        except Exception:
+            pass
+
+    return ""
+
+
 def _transcribe_audio_attachments_inplace(attachments: List[Dict[str, Any]]) -> str:
     """Fill `transcript` into audio attachments. Return a joined transcript string."""
     texts: List[str] = []
@@ -6022,10 +6693,17 @@ def _build_responses_input(messages: List[Dict[str, str]], attachments: List[Dic
         return {"type": "input_text", "text": t}
 
     # 1) messages -> blocks
+    has_file_att = any(
+        isinstance(a, dict) and (a.get("type") or "").strip().lower() == "file"
+        for a in (attachments or [])
+    )
     for m in messages:
         role = (m.get("role") or "user").strip() or "user"
         content = (m.get("content") or "").strip()
         if not content:
+            # ✅ 有 file 时保留空 user 消息槽，后面追加文件内容
+            if role == "user" and has_file_att:
+                inp.append({"role": "user", "content": []})
             continue
         inp.append({"role": role, "content": [_text_block(role, content)]})
 
@@ -6097,6 +6775,31 @@ def _build_responses_input(messages: List[Dict[str, str]], attachments: List[Dic
                     continue
                 continue
 
+            # ✅ file: 读取文件内容注入（txt/md/py/swift/js/pdf/docx 全支持）
+            if at == "file":
+                extracted = _extract_file_content(a)
+                if extracted:
+                    content_list.append({"type": "input_text", "text": extracted})
+                    # 用户未输文字时自动补分析提示
+                    has_user_text = any(
+                        isinstance(blk, dict)
+                        and blk.get("type") == "input_text"
+                        and not (blk.get("text") or "").startswith("【")
+                        for blk in content_list
+                    )
+                    if not has_user_text:
+                        content_list.append({
+                            "type": "input_text",
+                            "text": "请仔细阅读以上文件内容，进行分析和总结，指出关键信息、主要逻辑和值得注意的地方。",
+                        })
+                else:
+                    fname = (a.get("filename") or a.get("name") or "file").strip()
+                    content_list.append({
+                        "type": "input_text",
+                        "text": f"[文件已上传但无法提取内容] 文件名：{fname}，类型：{mime or 'unknown'}",
+                    })
+                continue
+
             # Fallback: embed as text pointer
             if at and (a.get("id") or url):
                 content_list.append({
@@ -6115,6 +6818,9 @@ def _openai_responses_create_nonstream(
     previous_response_id: Optional[str] = None,
     instructions: Optional[str] = None,
     enable_web_search: bool = False,
+    enable_file_search: bool = False,
+    enable_code_interpreter: bool = False,
+    enable_computer_use: bool = False,
 ) -> Dict[str, Any]:
     model = (model or CHAT_MODEL_DEFAULT).strip()
 
@@ -6139,11 +6845,31 @@ def _openai_responses_create_nonstream(
     if instructions:
         payload["instructions"] = instructions
 
-    # ✅ Web search tool (official) - only when enabled by allow_web
+    # ✅ Built-in tools (Responses API)
+    _tools: List[Dict[str, Any]] = []
+    _includes: List[str] = []
+
     if _should_use_openai_web_search_tool(enable_web_search):
-        payload["tools"] = [{"type": "web_search"}]
+        _tools.append({"type": "web_search"})
+        _includes.append("web_search_call.action.sources")
+
+    if enable_file_search and OPENAI_VECTOR_STORE_ID:
+        _tools.append({
+            "type": "file_search",
+            "vector_store_ids": [OPENAI_VECTOR_STORE_ID],
+        })
+
+    if enable_code_interpreter:
+        _tools.append({"type": "code_interpreter", "container": {"type": "auto"}})
+
+    if enable_computer_use:
+        _tools.append({"type": "computer_use_preview"})
+
+    if _tools:
+        payload["tools"] = _tools
         payload["tool_choice"] = "auto"
-        payload["include"] = ["web_search_call.action.sources"]
+    if _includes:
+        payload["include"] = _includes
 
     r = requests.post(
         url,
@@ -6235,6 +6961,9 @@ def _chat_complete_full_text(
     max_continuations: int,
     instructions: Optional[str],
     enable_web_search: bool = False,
+    enable_file_search: bool = False,
+    enable_code_interpreter: bool = False,
+    enable_computer_use: bool = False,
 ) -> Tuple[str, str, str, Optional[Dict[str, Any]], int]:
     """Return: (full_text, status, response_id, incomplete_details, continuations)"""
     model = (model or CHAT_MODEL_DEFAULT).strip() or CHAT_MODEL_DEFAULT
@@ -6276,6 +7005,9 @@ def _chat_complete_full_text(
             previous_response_id=prev_rid,
             instructions=instructions,
             enable_web_search=enable_web_search,
+            enable_file_search=enable_file_search,
+            enable_code_interpreter=enable_code_interpreter,
+            enable_computer_use=enable_computer_use,
         )
 
         response_id = str(resp.get("id") or response_id)
@@ -6470,6 +7202,136 @@ def _deepseek_complete_full_text(
 
     full = _maybe_wrap_code_as_fenced_markdown(_ensure_code_fences_closed(full)).strip()
     return full, status, response_id, incomplete_details, continuations
+
+
+def _dashscope_complete_full_text(
+    *,
+    model: str,
+    messages: List[Dict[str, str]],
+    attachments: List[Dict[str, Any]],
+    max_output_tokens: int,
+    max_continuations: int,
+    instructions: Optional[str],
+) -> Tuple[str, str, str, Optional[Dict[str, Any]], int]:
+    """DashScope/Qwen non-stream (via SSE stream accumulation) with auto-continuation.
+
+    Same pattern as _deepseek_complete_full_text but using DashScope endpoint.
+    Return: (full_text, status, response_id, incomplete_details, continuations)
+    """
+    model = (model or DASHSCOPE_MODEL_DEFAULT).strip() or (DASHSCOPE_MODEL_DEFAULT or "qwen3.5-plus")
+    max_output_tokens = max(256, min(int(max_output_tokens), 60000))
+    max_continuations = max(0, min(int(max_continuations), 20))
+
+    CHUNK_MARKER = "[[SOLARA_CONTINUE]]"
+
+    prefix: List[Dict[str, str]] = []
+    for m in (messages or []):
+        if not isinstance(m, dict):
+            continue
+        r = str(m.get("role") or "").strip()
+        if r in ("system", "developer"):
+            prefix.append({"role": r, "content": str(m.get("content") or "")})
+        else:
+            break
+
+    if instructions:
+        if not any((mm.get("content") or "").strip() == instructions.strip() for mm in prefix):
+            insert_at = 1 if (prefix and prefix[0].get("role") in ("system", "developer")) else 0
+            prefix.insert(insert_at, {"role": "system", "content": instructions})
+
+    def _extract_transcripts(atts: List[Dict[str, Any]]) -> str:
+        texts: List[str] = []
+        for a in (atts or []):
+            if not isinstance(a, dict):
+                continue
+            if str(a.get("type") or "").strip().lower() != "audio":
+                continue
+            tr = str(a.get("transcript") or "").strip()
+            if tr:
+                texts.append(tr)
+        return "\n".join(texts).strip()
+
+    transcript = _extract_transcripts(attachments)
+
+    full = ""
+    status = "completed"
+    response_id = ""
+    incomplete_details: Optional[Dict[str, Any]] = None
+    continuations = 0
+
+    qs_messages = list(messages or [])
+    if transcript:
+        qs_messages.append({"role": "user", "content": f"[voice transcript]\n{transcript}"})
+
+    while True:
+        part_parts: List[str] = []
+        finish_reason = ""
+        tail_buf = ""
+        marker_seen = False
+
+        mt = min(max_output_tokens, 16384)
+
+        for ev in _stream_dashscope_events(model=model, messages=qs_messages, max_tokens=mt):
+            typ = ev.get("type") if isinstance(ev, dict) else None
+            if typ == "solara._provider_done":
+                finish_reason = str(ev.get("finish_reason") or "")
+                continue
+            if typ != "response.output_text.delta":
+                continue
+
+            delta = str(ev.get("delta") or "")
+            if not delta:
+                continue
+
+            part_parts.append(delta)
+
+            if instructions:
+                tail_buf = (tail_buf + delta)[-256:]
+                if CHUNK_MARKER in tail_buf:
+                    marker_seen = True
+
+        part = "".join(part_parts)
+        if CHUNK_MARKER in part:
+            part = part.replace(CHUNK_MARKER, "")
+
+        full = _append_without_overlap(full, part)
+
+        if len(full) >= CHAT_MAX_TOTAL_CHARS:
+            full = full[:CHAT_MAX_TOTAL_CHARS]
+            status = "incomplete"
+            incomplete_details = {"reason": "server_max_total_chars"}
+            break
+
+        fr = (finish_reason or "").lower()
+        need_continue = bool(marker_seen) or fr in ("length", "max_tokens", "max_output_tokens")
+
+        if not need_continue:
+            break
+
+        if continuations >= max_continuations:
+            status = "incomplete"
+            incomplete_details = {"reason": "max_continuations"}
+            break
+
+        continuations += 1
+
+        tail_ctx = full[-1600:]
+        cont_prompt = (
+            "Continue exactly from where you left off. Output ONLY the remaining code/text. "
+            "Do NOT repeat earlier parts. If you were inside a ``` code block, continue inside the same block. "
+            "Make sure the final output is valid and close any open code fences at the end.\n\n"
+            "Here is the END of what you already produced (do NOT repeat it):\n-----\n"
+            f"{tail_ctx}\n-----\n\nContinue from immediately AFTER the above end."
+        )
+        if instructions:
+            cont_prompt += f" If there is still more after this part, end with {CHUNK_MARKER}."
+
+        qs_messages = prefix + [{"role": "user", "content": cont_prompt}]
+
+    full = _maybe_wrap_code_as_fenced_markdown(_ensure_code_fences_closed(full)).strip()
+    return full, status, response_id, incomplete_details, continuations
+
+
 def _spawn_chat_worker(
     job: ChatJob,
     model: str,
@@ -6487,6 +7349,7 @@ def _spawn_chat_worker(
     user_key: str = "default",
     last_user_text: str = "",
     memory_enabled: bool = MEMORY_ENABLED_DEFAULT,
+    plan: str = "",
 ) -> None:
     """
     Background worker (Route-B):
@@ -6541,6 +7404,32 @@ def _spawn_chat_worker(
             seg = (seg or "").strip()
             if not seg:
                 return
+
+            # ✅ 优先用用户克隆的声音（ElevenLabs）
+            log.info("[TTS.DEBUG] _tts_stream_segment 进入ElevenLabs判断")
+            try:
+                import httpx as _httpx, os as _os
+                from adu_voice_clone import get_user_voice_id, DEFAULT_VOICE_ID
+                _api_key = _os.getenv("ELEVENLABS_API_KEY", "")
+                _uid = (body.get("client_id") or body.get("user_id") or "adu_system")
+                _cloned_id = get_user_voice_id(_uid)
+                if _api_key and _cloned_id != DEFAULT_VOICE_ID:
+                    _r = _httpx.post(
+                        f"https://api.elevenlabs.io/v1/text-to-speech/{_cloned_id}",
+                        headers={"xi-api-key": _api_key, "Content-Type": "application/json"},
+                        json={"text": seg, "model_id": "eleven_multilingual_v2",
+                              "output_format": "mp3_44100_128"},
+                        timeout=60.0
+                    )
+                    if _r.status_code == 200:
+                        _live = _get_live_tts(job.tts_id)
+                        if _live:
+                            _live.feed(_r.content)
+                            log.info("[TTS] ElevenLabs克隆声音播报成功")
+                        return
+                    log.warning(f"[TTS] ElevenLabs {_r.status_code} 回退OpenAI")
+            except Exception as _e:
+                log.warning(f"[TTS] ElevenLabs异常回退: {_e}")
 
             voice = _normalize_tts_voice(tts_voice)
             payload: Dict[str, Any] = {"model": TTS_MODEL_DEFAULT, "voice": voice, "input": seg}
@@ -6683,9 +7572,14 @@ def _spawn_chat_worker(
                                 if tr:
                                     trs.append(tr)
                             if at == "file":
-                                u = str(a.get("url") or "").strip()
-                                if u:
-                                    file_urls.append(u)
+                                extracted = _extract_file_content(a)
+                                if extracted:
+                                    file_urls.append(extracted)
+                                else:
+                                    u = str(a.get("url") or "").strip()
+                                    fname = (a.get("filename") or a.get("name") or "file").strip()
+                                    if u:
+                                        file_urls.append(f"[文件] {fname} url={u}")
                         if trs:
                             ds_msgs.append({"role": "user", "content": "[voice transcript]\n" + "\n".join(trs)})
                         if file_urls:
@@ -6694,6 +7588,45 @@ def _spawn_chat_worker(
                     stream_iter = _stream_deepseek_events(
                         model=model,
                         messages=ds_msgs,
+                        max_tokens=min(int(max_output_tokens or 8192), 16384),
+                    )
+                elif provider_norm == "dashscope":
+                    qs_msgs = list(current_messages)
+
+                    # DashScope/Qwen uses OpenAI-compatible format; inject instructions as system message.
+                    if instructions:
+                        insert_at = 1 if (qs_msgs and (qs_msgs[0].get("role") in ("system", "developer"))) else 0
+                        qs_msgs.insert(insert_at, {"role": "system", "content": instructions})
+
+                    # Fold transcripts / file pointers from attachments into text messages
+                    if current_attachments:
+                        trs_q: List[str] = []
+                        file_urls_q: List[str] = []
+                        for a in (current_attachments or []):
+                            if not isinstance(a, dict):
+                                continue
+                            at = str(a.get("type") or "").strip().lower()
+                            if at == "audio":
+                                tr = str(a.get("transcript") or "").strip()
+                                if tr:
+                                    trs_q.append(tr)
+                            if at == "file":
+                                extracted = _extract_file_content(a)
+                                if extracted:
+                                    file_urls_q.append(extracted)
+                                else:
+                                    u = str(a.get("url") or "").strip()
+                                    fname = (a.get("filename") or a.get("name") or "file").strip()
+                                    if u:
+                                        file_urls_q.append(f"[文件] {fname} url={u}")
+                        if trs_q:
+                            qs_msgs.append({"role": "user", "content": "[voice transcript]\n" + "\n".join(trs_q)})
+                        if file_urls_q:
+                            qs_msgs.append({"role": "user", "content": "[file]\n" + "\n".join(file_urls_q)})
+
+                    stream_iter = _stream_dashscope_events(
+                        model=model,
+                        messages=qs_msgs,
                         max_tokens=min(int(max_output_tokens or 8192), 16384),
                     )
                 else:
@@ -6706,6 +7639,9 @@ def _spawn_chat_worker(
                         previous_response_id=prev_rid,
                         instructions=instructions,
                         enable_web_search=bool(allow_web),
+                        enable_file_search=_plan_allows_file_search(plan),
+                        enable_code_interpreter=_plan_allows_code_interpreter(plan),
+                        enable_computer_use=_plan_allows_computer_use(plan, model),
                     )
 
                 for ev in stream_iter:
@@ -6797,18 +7733,25 @@ def _spawn_chat_worker(
                         if not incomplete_reason:
                             incomplete_reason = fr
 
+                if provider_norm == "dashscope":
+                    fr = (finish_reason or "").lower()
+                    if fr in ("length", "max_tokens", "max_output_tokens"):
+                        need_continue = True
+                        if not incomplete_reason:
+                            incomplete_reason = fr
+
                 if not need_continue:
                     break
 
                 if continuations >= max_continuations:
                     break
 
-                if provider_norm != "deepseek":
+                if provider_norm != "deepseek" and provider_norm != "dashscope":
                     if not last_rid:
                         break
 
                 continuations += 1
-                if provider_norm != "deepseek":
+                if provider_norm not in ("deepseek", "dashscope"):
                     prev_rid = last_rid
 
                 job.push_event({
@@ -6817,7 +7760,7 @@ def _spawn_chat_worker(
                     "reason": (incomplete_reason or ("marker" if marker_seen else "unknown")),
                 })
 
-                if provider_norm == "deepseek":
+                if provider_norm in ("deepseek", "dashscope"):
                     tail_ctx = ("".join(full_parts))[-1600:]
                     cont_prompt = (
                         "Continue exactly from where you left off. Output ONLY the remaining code/text. "
@@ -6849,6 +7792,22 @@ def _spawn_chat_worker(
 
             job.full_text = ("".join(full_parts)).strip()
 
+            # ✅ 处理 AI 回复中的 OpenClaw 动作标记（聊天模式自动执行）
+            try:
+                _bridge = get_bridge()
+                if _bridge.connected and job.full_text and "[ADU_ACTION:" in job.full_text:
+                    _clean, _action_results = process_agent_actions_sync(job.full_text, _bridge)
+                    if _action_results:
+                        job.full_text = _clean + _action_results
+                        # 把执行结果也推送给前端 SSE
+                        job.push_event({
+                            "type": "response.output_text.done",
+                            "text": job.full_text,
+                        })
+                        log.info("[Intent] Actions executed, results appended to response")
+            except Exception as _intent_err:
+                log.warning("[Intent] action processing failed: %s", _intent_err)
+
             # Persist assistant reply to conversation history (best-effort)
             if conversation_id and job.full_text:
                 try:
@@ -6872,6 +7831,23 @@ def _spawn_chat_worker(
                         args=(user_key, last_user_text, job.full_text),
                         daemon=True,
                     ).start()
+            except Exception:
+                pass
+
+            # ✅ 四级压缩：写入L0助手轮次 + 触发压缩流水线 + L3结构化提取
+            try:
+                if job.full_text:
+                    _comp_append_turn(user_key, conversation_id, "assistant", job.full_text[:800])
+                    _comp_maybe_compress(user_key, conversation_id)
+                    if last_user_text:
+                        _comp_l3_extract(user_key, last_user_text, job.full_text)
+            except Exception:
+                pass
+
+            # ✅ 时间线记忆：记录聊天事件
+            try:
+                if last_user_text:
+                    memory_timeline_add(user_key, f"用户说：{last_user_text[:200]}", event_type="chat", source=conversation_id)
             except Exception:
                 pass
 
@@ -6921,7 +7897,46 @@ async def lifespan(app: FastAPI):
              SORA_MODEL_DEFAULT, SORA_SECONDS_DEFAULT, SORA_SIZE_DEFAULT,
              REALTIME_MODEL_DEFAULT, SORA_CONCURRENCY,
              CHAT_MODEL_DEFAULT, TTS_MODEL_DEFAULT)
+    # ✅ OpenClaw: 启动时自动连接 + 自动扫描项目
+    try:
+        bridge = get_bridge()
+        ok = await bridge.connect()
+        if ok:
+            log.info("[BOOT] ✅ OpenClaw connected: %s", bridge.ws_url)
+
+            # ── 自动扫描项目（不需要用户手动点"连接项目"）──
+            scan_list = [
+                "~/Desktop/GPTsora",
+                "~/Desktop/backend",
+                "~/GPTsora",
+                "~/Projects/GPTsora",
+            ]
+            auto_env = os.getenv("OPENCLAW_AUTO_SCAN", "").strip()
+            if auto_env:
+                scan_list = [p.strip() for p in auto_env.split(",") if p.strip()]
+
+            for scan_path in scan_list:
+                expanded = scan_path.replace("~", str(Path.home()))
+                if os.path.isdir(expanded):
+                    try:
+                        result = await bridge.scan_project(scan_path)
+                        count = result.get("count", 0)
+                        method = result.get("scan_method", "find")
+                        log.info("[BOOT] ✅ Auto-scanned %s: %d files (method=%s)",
+                                 scan_path, count, method)
+                    except Exception as scan_err:
+                        log.warning("[BOOT] Auto-scan %s failed: %s", scan_path, scan_err)
+        else:
+            log.warning("[BOOT] ⚠️ OpenClaw not available (will retry on demand)")
+    except Exception as e:
+        log.warning("[BOOT] OpenClaw init failed: %s", e)
     yield
+    # ✅ OpenClaw: 关闭时断开
+    try:
+        bridge = get_bridge()
+        await bridge.disconnect()
+    except Exception:
+        pass
     log.info("[BOOT] stop")
 
 app = FastAPI(title="ChatAGI-阿杜 Backend", lifespan=lifespan)
@@ -6937,6 +7952,37 @@ app.include_router(home_automation_router)
 # ✅ 高级编程版：工程内循环（B方案）
 if agent_loop_router is not None:
     app.include_router(agent_loop_router)
+
+# ✅ 感知模块路由（物理世界记忆查询）
+try:
+    from perception_module import register_perception_routes
+    register_perception_routes(app)
+except Exception as _perc_err:
+    log.warning("[Perception] module not loaded: %s", _perc_err)
+
+# ✅ 阿杜任务委托系统（主动循环 + iOS工作报告）
+try:
+    from adu_task_api import router as adu_task_router
+    app.include_router(adu_task_router)
+    log.info("[AduLoop] ✅ 任务委托系统已加载")
+except Exception as _adu_err:
+    log.warning("[AduLoop] 任务委托系统未加载: %s", _adu_err)
+
+# ✅ 阿杜推送模块（iOS Token注册 + 任务完成推送）
+try:
+    from adu_push import push_router
+    app.include_router(push_router)
+    log.info("[AduPush] ✅ 推送模块已加载")
+except Exception as _push_err:
+    log.warning("[AduPush] 推送模块未加载: %s", _push_err)
+
+# ✅ 声音克隆模块（ElevenLabs）
+try:
+    from adu_voice_clone import router as voice_clone_router
+    app.include_router(voice_clone_router)
+    log.info("[VoiceClone] ✅ 声音克隆模块已加载")
+except Exception as _vc_err:
+    log.warning("[VoiceClone] 声音克隆模块未加载: %s", _vc_err)
 
 
 # -----------------------------
@@ -6970,13 +8016,17 @@ async def chat_legacy(request: Request):
     if not isinstance(msgs, list) or not msgs:
         return JSONResponse({"ok": False, "error": "missing messages"}, status_code=400)
 
+    # ✅ 有 attachments 时允许最后一条 user 消息为空（只发文件不输文字）
+    has_atts = isinstance(atts, list) and len(atts) > 0
     messages: List[Dict[str, str]] = []
-    for m in msgs:
+    for _i, m in enumerate(msgs):
         if not isinstance(m, dict):
             continue
         role = str(m.get("role") or "user")
         content = str(m.get("content") or "")
         if content.strip() == "":
+            if has_atts and _i == len(msgs) - 1 and role == "user":
+                messages.append({"role": role, "content": ""})
             continue
         messages.append({"role": role, "content": content})
     if not messages:
@@ -7028,6 +8078,16 @@ async def chat_legacy(request: Request):
                     insert_i += 1
             messages.insert(insert_i, {"role": "system", "content": mem_ctx})
 
+    # ✅ 四级压缩上下文注入（L3档案 + L2主题 + L1轮次摘要，MemGPT换入换出）
+    if MEMORY_ENABLED_DEFAULT and last_user_text:
+        try:
+            comp_ctx = _comp_build_context(user_key, conv_id=conversation_id, query=last_user_text)
+            if comp_ctx:
+                ins = 1 if (messages and messages[0].get("role") in ("system", "developer")) else 0
+                messages.insert(ins, {"role": "system", "content": comp_ctx})
+        except Exception:
+            pass
+
     # ✅ Persist user message to conversation history (best-effort)
     if last_user_text:
         try:
@@ -7042,6 +8102,53 @@ async def chat_legacy(request: Request):
                     memory_add(user_key, f"用户：{last_user_text}"[:1200])
             except Exception:
                 pass
+
+        # ✅ 四级压缩：写入L0原始轮次
+        try:
+            _comp_append_turn(user_key, conversation_id, "user", last_user_text[:800])
+        except Exception:
+            pass
+
+    # ✅ OpenClaw: 注入项目上下文（手机 App 也能看到所有项目文件）
+    try:
+        bridge = get_bridge()
+        if bridge.connected and bridge._project_cache:
+            all_ctx_parts = []
+            for _pth, _scan in bridge._project_cache.items():
+                _ctx = bridge.build_project_context(_scan)
+                if _ctx:
+                    all_ctx_parts.append(_ctx)
+            if all_ctx_parts:
+                full_project_ctx = "\n\n".join(all_ctx_parts)
+                _ins = 1 if messages and (messages[0].get("role") in ("system", "developer")) else 0
+                messages.insert(_ins, {"role": "system", "content": full_project_ctx})
+    except Exception as _e:
+        log.debug("[OpenClaw] project context injection (legacy /chat) skipped: %s", _e)
+
+    # ✅ OpenClaw: 注入 Agent 工具能力（手机 App 也能调 OpenClaw 执行操作）
+    try:
+        bridge = get_bridge()
+        if bridge.connected:
+            messages = inject_agent_system_prompt(messages, bridge_connected=True)
+    except Exception:
+        pass
+
+    # ✅ 感知模块：注入物理世界感知上下文（位置/朝向/运动状态）
+    _perception_data = body.get("perception")
+    if isinstance(_perception_data, dict) and _perception_data.get("latitude"):
+        try:
+            from perception_module import format_perception_context, store_to_world_memory, enrich_perception_data
+            _perception_data = await enrich_perception_data(_perception_data)
+            _perc_ctx = format_perception_context(_perception_data)
+            if _perc_ctx:
+                _ins = 1 if messages and (messages[0].get("role") in ("system", "developer")) else 0
+                messages.insert(_ins, {"role": "system", "content": _perc_ctx})
+                log.info("[Perception] ✅ context injected: %s",
+                         _perception_data.get("fullAddress") or f"{_perception_data.get('latitude'):.4f}")
+            # 存入世界记忆
+            store_to_world_memory(user_key or "anonymous", _perception_data)
+        except Exception as _pe:
+            log.warning("[Perception] injection failed: %s", _pe)
 
     attachments: List[Dict[str, Any]] = []
     if isinstance(atts, list) and atts:
@@ -7070,14 +8177,74 @@ async def chat_legacy(request: Request):
     instructions = _build_long_output_instructions(body)
 
     # ✅ Smart routing: DeepSeek for default text, OpenAI for web-search / attachments
-    provider, route_reason = _route_provider(allow_web=allow_web, attachments=attachments)
+    provider, route_reason = _route_provider(allow_web=allow_web, attachments=attachments, model=requested_model)
     provider, route_reason = _ensure_provider_available(provider, route_reason)
     routed_model = _select_routed_model(provider, requested_model)
     log.info("[chat-route] provider=%s model=%s allow_web=%s reason=%s", provider, routed_model, bool(allow_web), route_reason)
 
     try:
-        if provider == "deepseek":
+        # ✅ Smart Router: 智能路由到最优模型
+        if provider == "smart":
+            _sr = _get_smart_router()
+            if _sr:
+                import asyncio as _aio
+                _tier_map = {"guest": "free", "basic": "free", "coder": "creator", "pro": "pro", "ultra": "ultra"}
+                _tier = _tier_map.get(plan, "free")
+                _has_img = any(a.get("type", "").startswith("image") for a in attachments) if attachments else False
+                try:
+                    _loop = _aio.get_running_loop()
+                except RuntimeError:
+                    _loop = None
+                if _loop and _loop.is_running():
+                    import concurrent.futures
+                    with concurrent.futures.ThreadPoolExecutor() as _pool:
+                        _sr_result = _pool.submit(
+                            lambda: _aio.run(_sr.process(
+                                session_id=user_key or "default",
+                                user_input=last_user_text,
+                                user_tier=_tier,
+                                has_image=_has_img,
+                                system_prompt=CHAT_SYSTEM_STYLE_PROMPT,
+                            ))
+                        ).result(timeout=120)
+                else:
+                    _sr_result = _aio.run(_sr.process(
+                        session_id=user_key or "default",
+                        user_input=last_user_text,
+                        user_tier=_tier,
+                        has_image=_has_img,
+                        system_prompt=CHAT_SYSTEM_STYLE_PROMPT,
+                    ))
+                full_text = _sr_result["response"]
+                status = "completed"
+                rid = f"smart-{_sr_result['provider']}-{int(time.time())}"
+                inc = None
+                conts = 0
+                routed_model = _sr_result["model_display"]
+                provider = _sr_result["provider"]
+                log.info("[SmartRouter] %s/%s -> %s (%s) cost≈¥%s escalated=%s",
+                         _sr_result["intent"], _sr_result["complexity"],
+                         _sr_result["model_display"], _sr_result["provider"],
+                         _sr_result["estimated_cost_yuan"], _sr_result["was_escalated"])
+            else:
+                log.warning("[SmartRouter] not available, falling back to deepseek")
+                full_text, status, rid, inc, conts = _deepseek_complete_full_text(
+                    model=DEEPSEEK_MODEL_DEFAULT or "deepseek-reasoner",
+                    messages=messages, attachments=attachments,
+                    max_output_tokens=max_output_tokens,
+                    max_continuations=max_continuations, instructions=instructions,
+                )
+        elif provider == "deepseek":
             full_text, status, rid, inc, conts = _deepseek_complete_full_text(
+                model=routed_model,
+                messages=messages,
+                attachments=attachments,
+                max_output_tokens=max_output_tokens,
+                max_continuations=max_continuations,
+                instructions=instructions,
+            )
+        elif provider == "dashscope":
+            full_text, status, rid, inc, conts = _dashscope_complete_full_text(
                 model=routed_model,
                 messages=messages,
                 attachments=attachments,
@@ -7094,10 +8261,24 @@ async def chat_legacy(request: Request):
                 max_continuations=max_continuations,
                 instructions=instructions,
                 enable_web_search=bool(allow_web),
+                enable_file_search=_plan_allows_file_search(plan),
+                enable_code_interpreter=_plan_allows_code_interpreter(plan),
+                enable_computer_use=_plan_allows_computer_use(plan, routed_model),
             )
 
         # ✅ Persist assistant reply + memory (legacy /chat is non-stream, so we must do it here)
         if full_text:
+            # ✅ OpenClaw: 处理 AI 回复中的动作标记（手机 App 也能执行操作）
+            try:
+                _bridge = get_bridge()
+                if _bridge.connected and "[ADU_ACTION:" in full_text:
+                    _clean, _action_results = process_agent_actions_sync(full_text, _bridge)
+                    if _action_results:
+                        full_text = _clean + _action_results
+                        log.info("[Intent] Legacy /chat: actions executed, results appended")
+            except Exception as _intent_err:
+                log.warning("[Intent] Legacy /chat action processing failed: %s", _intent_err)
+
             try:
                 conv_add_message(user_key, conversation_id, "assistant", full_text)
             except Exception:
@@ -7117,6 +8298,14 @@ async def chat_legacy(request: Request):
                     args=(user_key, last_user_text, full_text),
                     daemon=True,
                 ).start()
+            except Exception:
+                pass
+
+            # ✅ 四级压缩：写入L0助手轮次 + 触发压缩流水线 + L3结构化提取
+            try:
+                _comp_append_turn(user_key, conversation_id, "assistant", full_text[:800])
+                _comp_maybe_compress(user_key, conversation_id)
+                _comp_l3_extract(user_key, last_user_text, full_text)
             except Exception:
                 pass
 
@@ -7226,6 +8415,21 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# ✅ Voice Pipeline: STT → DeepSeek LLM → TTS 串流实时语音
+try:
+    from voice_pipeline import register_voice_pipeline
+    register_voice_pipeline(app)
+except ImportError:
+    log.warning("[BOOT] voice_pipeline.py not found — /voice/ws endpoint disabled")
+except Exception as e:
+    log.warning("[BOOT] voice_pipeline registration failed: %s", e)
+
+# ✅ ChatAGI Studio 网页版（静态文件服务）
+_studio_dir = Path(__file__).parent / "studio"
+if _studio_dir.is_dir():
+    app.mount("/studio", StaticFiles(directory=str(_studio_dir), html=True), name="studio")
+    log.info("[BOOT] Studio mounted at /studio (dir=%s)", _studio_dir)
+
 @app.middleware("http")
 async def audit(req: Request, call_next):
     t0 = time.time()
@@ -7299,21 +8503,25 @@ async def chat_prepare(request: Request):
         return JSONResponse({"ok": False, "error": "missing messages"}, status_code=400)
 
     # Normalize messages
+    # ✅ 有 attachments 时允许最后一条 user 消息为空（只发文件不输文字）
+    atts = body.get("attachments") or []
+    has_atts = isinstance(atts, list) and len(atts) > 0
     messages: List[Dict[str, str]] = []
-    for m in msgs:
+    for _i, m in enumerate(msgs):
         if not isinstance(m, dict):
             continue
         role = str(m.get("role") or "user").strip() or "user"
         content = str(m.get("content") or "")
         if content.strip() == "":
+            if has_atts and _i == len(msgs) - 1 and role == "user":
+                messages.append({"role": role, "content": ""})
             continue
         messages.append({"role": role, "content": content})
 
     if not messages:
         return JSONResponse({"ok": False, "error": "empty messages"}, status_code=400)
 
-    # Attachments (image/audio)
-    atts = body.get("attachments") or []
+    # Attachments (image/audio/file)
     attachments: List[Dict[str, Any]] = []
     if isinstance(atts, list) and atts:
         for a in atts:
@@ -7448,6 +8656,45 @@ async def chat_prepare(request: Request):
                     insert_at += 1
             messages.insert(insert_at, {"role": "system", "content": mem_ctx})
 
+    # ✅ OpenClaw: 注入项目上下文（让 AI 理解用户的全部工程）
+    try:
+        bridge = get_bridge()
+        if bridge.connected and bridge._project_cache:
+            all_ctx_parts = []
+            for _pth, _scan in bridge._project_cache.items():
+                _ctx = bridge.build_project_context(_scan)
+                if _ctx:
+                    all_ctx_parts.append(_ctx)
+            if all_ctx_parts:
+                full_project_ctx = "\n\n".join(all_ctx_parts)
+                insert_at = 1 if messages and (messages[0].get("role") in ("system", "developer")) else 0
+                messages.insert(insert_at, {"role": "system", "content": full_project_ctx})
+    except Exception as e:
+        log.debug("[OpenClaw] project context injection skipped: %s", e)
+    # ✅ OpenClaw: 注入 Agent 工具能力（让聊天模式也能调 OpenClaw）
+    try:
+        bridge = get_bridge()
+        if bridge.connected:
+            messages = inject_agent_system_prompt(messages, bridge_connected=True)
+    except Exception:
+        pass
+
+    # ✅ 感知模块：注入物理世界感知上下文（位置/朝向/运动状态）
+    _perception_data = body.get("perception")
+    if isinstance(_perception_data, dict) and _perception_data.get("latitude"):
+        try:
+            from perception_module import format_perception_context, store_to_world_memory, enrich_perception_data
+            _perception_data = await enrich_perception_data(_perception_data)
+            _perc_ctx = format_perception_context(_perception_data)
+            if _perc_ctx:
+                _ins = 1 if messages and (messages[0].get("role") in ("system", "developer")) else 0
+                messages.insert(_ins, {"role": "system", "content": _perc_ctx})
+                log.info("[Perception] ✅ context injected (prepare): %s",
+                         _perception_data.get("fullAddress") or f"{_perception_data.get('latitude'):.4f}")
+            store_to_world_memory(user_key or "anonymous", _perception_data)
+        except Exception as _pe:
+            log.warning("[Perception] injection failed: %s", _pe)
+
     tts_voice = (body.get("tts_voice") or body.get("voice") or TTS_VOICE_DEFAULT).strip() or TTS_VOICE_DEFAULT
 
     # Long-output safeguards (optional overrides)
@@ -7466,7 +8713,7 @@ async def chat_prepare(request: Request):
     instructions = _build_long_output_instructions(body)
 
     # ✅ Smart routing: DeepSeek for default text, OpenAI for web-search / attachments
-    provider, route_reason = _route_provider(allow_web=allow_web, attachments=attachments)
+    provider, route_reason = _route_provider(allow_web=allow_web, attachments=attachments, model=requested_model)
     provider, route_reason = _ensure_provider_available(provider, route_reason)
     routed_model = _select_routed_model(provider, requested_model)
     log.info("[chat-route] provider=%s model=%s allow_web=%s reason=%s", provider, routed_model, bool(allow_web), route_reason)
@@ -7489,6 +8736,7 @@ async def chat_prepare(request: Request):
         user_key=user_key,
         last_user_text=last_user_text,
         memory_enabled=MEMORY_ENABLED_DEFAULT,
+        plan=plan,
     )
 
     return {
@@ -7626,6 +8874,52 @@ def conversations_messages(conversation_id: str, request: Request, limit: int = 
     msgs = [{"id": mid, "role": role, "content": content, "created_at": created_at} for (mid,role,content,created_at) in rows]
     return {"ok": True, "user_key": user_key, "conversation_id": conversation_id, "messages": msgs}
 
+@app.post("/conversations/{conversation_id}/export")
+async def conversations_export(conversation_id: str, request: Request):
+    """打包指定对话所有消息为 zip，返回 download_url。"""
+    user_key = _derive_user_key(request, {})
+    with _conv_conn() as con:
+        cur = con.execute(
+            "SELECT id,role,content,created_at FROM messages WHERE conversation_id=? AND user_key=? ORDER BY created_at ASC LIMIT 500",
+            (conversation_id, user_key),
+        )
+        rows = cur.fetchall()
+        conv_row = con.execute(
+            "SELECT title,created_at FROM conversations WHERE id=? AND user_key=?",
+            (conversation_id, user_key),
+        ).fetchone()
+
+    if not rows:
+        return JSONResponse({"ok": False, "error": "no messages found"}, status_code=404)
+
+    title = (conv_row[0] if conv_row else "") or "对话记录"
+    created_at = (conv_row[1] if conv_row else "") or ""
+
+    # 拼成可读 Markdown
+    lines = [f"# {title}", f"导出时间：{int(time.time())}", f"对话ID：{conversation_id}", ""]
+    for (mid, role, content, ts) in rows:
+        role_label = "用户" if role == "user" else "阿杜"
+        lines.append(f"### {role_label}  `{ts}`")
+        lines.append(content or "")
+        lines.append("")
+    full_text = "\n".join(lines)
+
+    meta = {
+        "conversation_id": conversation_id,
+        "title": title,
+        "created_at": created_at,
+        "message_count": len(rows),
+        "exported_at": int(time.time()),
+    }
+    dl_id = _create_download_zip(full_text=full_text, parts=[], meta=meta, req_body={})
+    return {
+        "ok": True,
+        "conversation_id": conversation_id,
+        "message_count": len(rows),
+        "download_url": f"/chat/download/{dl_id}.zip",
+    }
+
+
 @app.post("/conversations/{conversation_id}/rename")
 async def conversations_rename(conversation_id: str, request: Request):
     try:
@@ -7747,6 +9041,313 @@ def memory_episodes_list_api(request: Request, limit: int = 20):
     except Exception:
         items = []
     return {"ok": True, "user_key": user_key, "items": items}
+
+# ✅ 时间线记忆 API
+@app.get("/memory/timeline")
+def memory_timeline_list_api(request: Request, date: str = "", event_type: str = "", keyword: str = "", limit: int = 20):
+    user_key = _derive_user_key(request, {})
+    items = memory_timeline_query(user_key, date=date, event_type=event_type, keyword=keyword, limit=limit)
+    return {"ok": True, "user_key": user_key, "items": items}
+
+@app.post("/memory/timeline/add")
+async def memory_timeline_add_api(request: Request):
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    user_key = _derive_user_key(request, body)
+    summary = (body.get("summary") or body.get("text") or "").strip()
+    if not summary:
+        return JSONResponse({"ok": False, "error": "missing summary"}, status_code=400)
+    memory_timeline_add(
+        user_key, summary,
+        event_type=(body.get("event_type") or "manual").strip(),
+        detail=(body.get("detail") or "").strip(),
+        source=(body.get("source") or "").strip(),
+    )
+    return {"ok": True}
+
+# ✅ 统一记忆 debug 接口 — 调试"模型到底吃到了什么记忆"
+@app.post("/memory/context")
+async def memory_context_preview(request: Request):
+    """
+    POST /memory/context
+    JSON: { "query": "...", "conversation_id": "..." }
+    返回: facts/timeline/semantic/recent/full_prompt 分项结果
+    """
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    user_key = _derive_user_key(request, body)
+    query = (body.get("query") or body.get("q") or "").strip()
+    conv_id = (body.get("conversation_id") or "").strip()
+    ctx = build_unified_memory_context(user_key, query=query, conversation_id=conv_id)
+    return {"ok": True, "user_key": user_key, **ctx}
+
+@app.get("/memory/context")
+def memory_context_preview_get(request: Request, q: str = "", conversation_id: str = ""):
+    user_key = _derive_user_key(request, {})
+    ctx = build_unified_memory_context(user_key, query=q, conversation_id=conversation_id)
+    return {"ok": True, "user_key": user_key, **ctx}
+
+# ✅ Realtime turn commit — 前端兜底提交（sideband 自动落库为主，此接口为备用）
+
+# ============================================================
+# ✅ 实时 RAG 工具：search_memory
+# GPT Realtime / Qwen function calling 调用此接口查询用户记忆
+# ============================================================
+
+def tool_search_memory(
+    user_key: str,
+    query: str,
+    top_k: int = 5,
+    scope: str = "hybrid",
+) -> Dict[str, Any]:
+    """统一查询 facts / timeline / 向量记忆，返回标准化结果列表。"""
+    uk = _sanitize_user_key(user_key)
+    q = (query or "").strip()
+    if not q:
+        return {"query": q, "items": []}
+
+    items: List[Dict[str, Any]] = []
+
+    # 1) facts 记忆（字段：content, importance）
+    try:
+        if scope in ("facts", "hybrid"):
+            with _mem_conn() as con:
+                rows = con.execute(
+                    """
+                    SELECT content, importance, created_at
+                    FROM memory_facts
+                    WHERE user_key=? AND content LIKE ?
+                    ORDER BY importance DESC, created_at DESC
+                    LIMIT ?
+                    """,
+                    (uk, f"%{q[:40]}%", top_k),
+                ).fetchall()
+            for content, importance, created_at in rows:
+                items.append({
+                    "type": "fact",
+                    "text": str(content or "").strip(),
+                    "score": min(1.0, float(importance or 1) / 3.0),
+                    "created_at": created_at,
+                })
+    except Exception as _e:
+        log.warning("[tool_search_memory] facts error: %s", _e)
+
+    # 2) timeline 记忆（字段：summary, detail, event_type）
+    try:
+        if scope in ("timeline", "hybrid"):
+            with _mem_conn() as con:
+                rows = con.execute(
+                    """
+                    SELECT summary, detail, event_type, created_at
+                    FROM memory_timeline
+                    WHERE user_key=? AND (summary LIKE ? OR detail LIKE ?)
+                    ORDER BY created_at DESC
+                    LIMIT ?
+                    """,
+                    (uk, f"%{q[:40]}%", f"%{q[:40]}%", top_k),
+                ).fetchall()
+            for summary, detail, event_type, created_at in rows:
+                txt = str(summary or "").strip()
+                if detail:
+                    txt = f"{txt} | {str(detail).strip()[:100]}"
+                items.append({
+                    "type": "timeline",
+                    "text": txt,
+                    "score": 0.7,
+                    "event_type": event_type,
+                    "created_at": created_at,
+                })
+    except Exception as _e:
+        log.warning("[tool_search_memory] timeline error: %s", _e)
+
+    # 3) 向量语义记忆
+    try:
+        if scope == "hybrid" and q:
+            sem = memory_search(uk, q, k=top_k, min_score=0.3)
+            for x in (sem or []):
+                txt = str(x.get("text") or x.get("content") or "").strip()
+                if txt:
+                    items.append({
+                        "type": "semantic",
+                        "text": txt,
+                        "score": float(x.get("score") or 0.5),
+                    })
+    except Exception as _e:
+        log.warning("[tool_search_memory] semantic error: %s", _e)
+
+    # 去重 + 排序
+    seen: Dict[str, Dict] = {}
+    for it in items:
+        key = it["text"][:200]
+        if key not in seen or float(it.get("score", 0)) > float(seen[key].get("score", 0)):
+            seen[key] = it
+
+    merged = sorted(seen.values(), key=lambda x: float(x.get("score", 0)), reverse=True)[:top_k]
+    return {"query": q, "items": merged}
+
+
+@app.post("/tools/search_memory")
+async def tools_search_memory_api(req: Request):
+    """
+    ✅ 实时 RAG 工具接口
+    GPT / Qwen Realtime function calling 查询用户记忆
+    Body: { "client_id": "...", "query": "...", "top_k": 5, "scope": "hybrid" }
+    """
+    try:
+        body = await req.json()
+    except Exception:
+        body = {}
+
+    client_id = str(body.get("client_id") or "").strip()
+    query = str(body.get("query") or "").strip()
+    scope = str(body.get("scope") or "hybrid").strip().lower()
+    top_k = max(1, min(int(body.get("top_k") or 5), 10))
+
+    user_key = _sanitize_user_key(client_id or _derive_user_key(req, body))
+
+    if not query:
+        return JSONResponse({"query": "", "items": []})
+
+    result = tool_search_memory(user_key=user_key, query=query, top_k=top_k, scope=scope)
+    log.info("[tool_search_memory] user=%s query=%r items=%d", user_key, query[:40], len(result["items"]))
+    return JSONResponse(result)
+
+
+@app.post("/realtime/turn/commit")
+async def realtime_turn_commit(request: Request):
+    """
+    POST /realtime/turn/commit
+    JSON: {
+        "client_id": "...",
+        "conversation_id": "...",       // 可选，空则自动创建
+        "user_text": "用户说的话",
+        "assistant_text": "助手回复",
+        "profile": "default",
+        "user_final_at": 1711234567.0,  // 可选
+        "assistant_final_at": 1711234568.0,
+    }
+    返回: { "ok": true, "conversation_id": "...", "messages_added": 2 }
+    """
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+
+    user_key = _derive_user_key(request, body)
+    conv_id = (body.get("conversation_id") or "").strip()
+    user_text = (body.get("user_text") or "").strip()
+    assistant_text = (body.get("assistant_text") or "").strip()
+
+    if not user_text and not assistant_text:
+        return JSONResponse({"ok": False, "error": "missing user_text or assistant_text"}, status_code=400)
+
+    # 自动创建 conversation（如果没有）
+    if not conv_id:
+        title = f"语音通话 {time.strftime('%m/%d %H:%M')}"
+        if user_text:
+            title = user_text[:40]
+        conv_id = conv_create(user_key, title)
+
+    added = 0
+
+    # 写入 user message
+    if user_text:
+        try:
+            conv_add_message(user_key, conv_id, "user", user_text)
+            added += 1
+        except Exception:
+            pass
+        # timeline
+        try:
+            memory_timeline_add(user_key, f"用户说：{user_text[:200]}", event_type="realtime_user", source=conv_id)
+        except Exception:
+            pass
+        # 压缩
+        try:
+            _comp_append_turn(user_key, conv_id, "user", user_text[:800])
+        except Exception:
+            pass
+
+    # 写入 assistant message
+    if assistant_text:
+        try:
+            conv_add_message(user_key, conv_id, "assistant", assistant_text)
+            added += 1
+        except Exception:
+            pass
+        # timeline
+        try:
+            memory_timeline_add(user_key, f"助手说：{assistant_text[:200]}", event_type="realtime_assistant", source=conv_id)
+        except Exception:
+            pass
+        # 压缩
+        try:
+            _comp_append_turn(user_key, conv_id, "assistant", assistant_text[:800])
+            _comp_maybe_compress(user_key, conv_id)
+        except Exception:
+            pass
+
+    # L3 结构化提取
+    if user_text and assistant_text:
+        try:
+            _comp_l3_extract(user_key, user_text, assistant_text)
+        except Exception:
+            pass
+        # facts extraction
+        try:
+            extract_and_save_memory_facts(user_key, user_text, assistant_text)
+        except Exception:
+            pass
+
+    # ✅ 向量记忆写入（文本和语音统一）
+    try:
+        if user_text and _should_memory_add(user_text):
+            memory_add(user_key, f"用户：{user_text[:800]}")
+        if assistant_text and _should_memory_add(assistant_text):
+            memory_add(user_key, f"助手：{assistant_text[:800]}")
+    except Exception as _me:
+        log.warning("[turn_commit] memory_add failed: %s", _me)
+
+    log.info("[TurnCommit] ✅ user=%s conv=%s added=%d", user_key, conv_id, added)
+    return {"ok": True, "conversation_id": conv_id, "messages_added": added, "user_key": user_key}
+
+# ✅ Conversation sync — 前端初始化/切换会话时对齐
+@app.post("/conversation/sync")
+async def conversation_sync(request: Request):
+    """
+    POST /conversation/sync
+    JSON: { "conversation_id": "...", "title": "...", "mode": "chat|realtime", "profile": "default" }
+    返回: { "ok": true, "conversation_id": "...", "created": false }
+    """
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+
+    user_key = _derive_user_key(request, body)
+    conv_id = (body.get("conversation_id") or "").strip()
+    title = (body.get("title") or "").strip()
+    mode = (body.get("mode") or "chat").strip()
+
+    created = False
+    if not conv_id:
+        conv_id = conv_create(user_key, title or f"{'语音通话' if mode == 'realtime' else '新对话'} {time.strftime('%m/%d %H:%M')}")
+        created = True
+    else:
+        # Touch existing conversation to update timestamp
+        try:
+            conv_touch(user_key, conv_id, "")
+        except Exception:
+            # Conversation might not exist yet — create it
+            conv_id = conv_create(user_key, title or "新对话")
+            created = True
+
+    return {"ok": True, "conversation_id": conv_id, "created": created, "user_key": user_key}
+
 @app.post("/tts_prepare")
 async def tts_prepare(request: Request):
     """
@@ -7959,10 +9560,42 @@ async def tts_stream_mp3(request: Request):
         if not segments:
             return
 
+        # ✅ 检查用户是否有克隆声音
+        _el_api_key = os.getenv("ELEVENLABS_API_KEY", "")
+        _el_voice_id = None
+        try:
+            from adu_voice_clone import get_user_voice_id, DEFAULT_VOICE_ID
+            _uid = (body.get("client_id") or body.get("user_id") or "adu_system")
+            _cv = get_user_voice_id(_uid)
+            if _el_api_key and _cv != DEFAULT_VOICE_ID:
+                _el_voice_id = _cv
+                log.info(f"[TTS] 使用克隆声音: {_el_voice_id[:8]}...")
+        except Exception as _e:
+            log.warning(f"[TTS] 获取克隆声音失败: {_e}")
+
         for seg in segments:
             seg = (seg or "").strip()
             if not seg:
                 continue
+
+            # ✅ 用ElevenLabs克隆声音
+            if _el_voice_id:
+                try:
+                    import httpx as _httpx
+                    _r = _httpx.post(
+                        f"https://api.elevenlabs.io/v1/text-to-speech/{_el_voice_id}",
+                        headers={"xi-api-key": _el_api_key, "Content-Type": "application/json"},
+                        json={"text": seg, "model_id": "eleven_multilingual_v2",
+                              "output_format": "mp3_44100_128"},
+                        timeout=60.0
+                    )
+                    if _r.status_code == 200:
+                        log.info(f"[TTS] ElevenLabs克隆声音成功 len={len(seg)}")
+                        yield _r.content
+                        continue
+                    log.warning(f"[TTS] ElevenLabs {_r.status_code} 回退OpenAI")
+                except Exception as _e:
+                    log.warning(f"[TTS] ElevenLabs异常回退: {_e}")
 
             payload: Dict[str, Any] = {"model": TTS_MODEL_DEFAULT, "voice": voice_norm, "input": seg}
             if inst:
@@ -8806,6 +10439,101 @@ def _realtime_ephemeral(
         return None, "missing ephemeral key"
     return key, None
 
+
+# ---- Qwen Omni Realtime session bootstrap ----
+
+def _qwen_realtime_session_url(model: str) -> str:
+    """Build Qwen Realtime WebSocket URL (client connects directly)."""
+    m = (model or QWEN_REALTIME_MODEL).strip()
+    return f"{QWEN_REALTIME_BASE_URL}/api-ws/v1/realtime?model={m}"
+
+
+def _qwen_realtime_ephemeral(
+    model: str,
+    voice: str,
+    instructions: Optional[str] = None,
+    *,
+    tools: Optional[List[Dict[str, Any]]] = None,
+    tool_choice: Optional[Any] = None,
+) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+    """
+    Qwen Omni Realtime 不需要 ephemeral key 机制。
+    客户端直接用 DashScope API Key 连 WebSocket。
+    返回 (session_info_dict, error_str)。
+    """
+    if not DASHSCOPE_API_KEY:
+        return None, "DASHSCOPE_API_KEY not configured"
+
+    m = (model or QWEN_REALTIME_MODEL).strip()
+    v = (voice or QWEN_REALTIME_VOICE).strip()
+
+    info: Dict[str, Any] = {
+        "provider": "qwen",
+        "ws_url": _qwen_realtime_session_url(m),
+        "api_key": DASHSCOPE_API_KEY,  # 客户端放 Authorization: Bearer
+        "model": m,
+        "voice": v,
+        "input_audio_format": "pcm16",  # 官方SDK: PCM_16000HZ_MONO_16BIT
+        "output_audio_format": "pcm24",  # 官方SDK: PCM_24000HZ_MONO_16BIT
+        "input_sample_rate": 16000,
+        "output_sample_rate": 24000,
+        "pcm24_to_pcm16_required": False,
+        "max_session_minutes": 120,
+        "turn_detection": {
+            "type": "server_vad",
+            "threshold": 0.5,            # 官方默认值，不要改
+            "silence_duration_ms": 400,
+            "create_response": True,
+            "interrupt_response": True,
+        },
+    }
+    if instructions:
+        info["instructions"] = instructions
+    if tools:
+        info["tools"] = tools
+        info["tool_choice"] = tool_choice or "auto"
+
+    return info, None
+
+
+def pcm24_to_pcm16(data: bytes) -> bytes:
+    """
+    Convert PCM 24-bit (little-endian, 3 bytes/sample) to PCM 16-bit (2 bytes/sample).
+    用于 Qwen3 Realtime 输出音频转换，iOS AVAudioEngine 只支持 pcm16。
+    """
+    if len(data) % 3 != 0:
+        # 截断到 3 的倍数
+        data = data[:len(data) - (len(data) % 3)]
+    out = bytearray(len(data) // 3 * 2)
+    j = 0
+    for i in range(0, len(data), 3):
+        # 取高 16 位（第 2、3 字节）
+        out[j] = data[i + 1]
+        out[j + 1] = data[i + 2]
+        j += 2
+    return bytes(out)
+
+
+def _pick_realtime_provider(body: Dict[str, Any]) -> str:
+    """
+    决定用 OpenAI / Qwen / Pipeline Realtime。
+    优先级: body.provider > REALTIME_PROVIDER env > "openai"
+    """
+    req_provider = (body.get("provider") or body.get("realtime_provider") or "").strip().lower()
+    if req_provider in ("qwen", "dashscope", "aliyun"):
+        return "qwen"
+    if req_provider in ("pipeline", "deepseek", "assembled"):
+        return "pipeline"
+    if req_provider in ("openai", "gpt"):
+        return "openai"
+    # env default
+    if REALTIME_PROVIDER in ("qwen", "dashscope", "aliyun"):
+        return "qwen"
+    if REALTIME_PROVIDER in ("pipeline", "deepseek", "assembled"):
+        return "pipeline"
+    return "openai"
+
+
 def _resolve_realtime_instructions(body: Dict[str, Any]) -> Optional[str]:
     provided = (body.get("instructions") or "").strip()
     if provided:
@@ -8817,7 +10545,54 @@ def _resolve_realtime_instructions(body: Dict[str, Any]) -> Optional[str]:
     if profile == "remix":
         return REMIX_REALTIME_INSTRUCTIONS
 
-    return REALTIME_DEFAULT_INSTRUCTIONS
+    return _get_realtime_default_instructions()
+
+def _nav_instructions(nav_ctx=None) -> str:
+    """
+    导航专用 Realtime 助手指令（profile="nav"）。
+    nav_ctx 由 iOS 通过 sessionProfile="nav|{json}" 传入，包含实时导航状态。
+    """
+    base = (
+        "你是车载导航语音助手「阿杜」。\n"
+        "性格：亲切自然，像老朋友一样，偶尔幽默，绝不啰嗦。\n"
+        "回答规则：\n"
+        "- 所有回答不超过30字，口语化，直接说重点\n"
+        "- 禁止说「好的」「当然」「没问题」等开场废话\n"
+        "- 用中文回答，数字念中文（「三公里」不是「3km」）\n"
+        "- 用户在开车，不要让他分心，答案要短且清晰\n"
+    )
+
+    if not nav_ctx:
+        return base + "\n当前未在导航中，可帮用户搜索目的地或规划路线。"
+
+    is_nav = nav_ctx.get("is_navigating", False)
+    transport = nav_ctx.get("transport", "驾车")
+    dest = nav_ctx.get("destination", "")
+    remain_dist = nav_ctx.get("remaining_distance", "")
+    remain_time = nav_ctx.get("remaining_time", "")
+    eta = nav_ctx.get("eta", "")
+    cur_step = nav_ctx.get("current_step", "")
+    next_step = nav_ctx.get("next_step", "")
+
+    if is_nav:
+        nav_block = "\n【当前导航状态】\n"
+        if dest:         nav_block += f"目的地：{dest}\n"
+        if remain_dist:  nav_block += f"剩余距离：{remain_dist}\n"
+        if remain_time:  nav_block += f"预计时间：{remain_time}\n"
+        if eta:          nav_block += f"预计到达：{eta}\n"
+        nav_block +=     f"出行方式：{transport}\n"
+        if cur_step:     nav_block += f"当前步骤：{cur_step}\n"
+        if next_step:    nav_block += f"下一步骤：{next_step}\n"
+        nav_block += (
+            "\n\u7528\u6237\u53ef\u80fd\u95ee\uff1a\u8fd8\u6709\u591a\u4e45\u3001\u6362\u6761\u8def\u3001\u5f53\u524d\u5728\u54ea\u3001\u8981\u4e0d\u8981\u4e0a\u9ad8\u901f\u7b49\u3002\n"
+            "\u6839\u636e\u4ee5\u4e0a\u72b6\u6001\u76f4\u63a5\u56de\u7b54\uff0c\u4e0d\u8981\u8bf4\u4e0d\u77e5\u9053\u5f53\u524d\u4f4d\u7f6e\u4e4b\u7c7b\u7684\u8bdd\u3002\n"
+            "\u5982\u679c\u7528\u6237\u8bf4\u300c\u6362\u6761\u8def\u300d\u300c\u8d70\u5907\u9009\u300d\uff0c\u56de\u590d\uff1a\u597d\uff0c\u5e2e\u4f60\u91cd\u65b0\u89c4\u5212\u3002\n"
+            "\u5982\u679c\u7528\u6237\u8bf4\u300c\u53d6\u6d88\u5bfc\u822a\u300d\u300c\u4e0d\u53bb\u4e86\u300d\uff0c\u56de\u590d\uff1a\u597d\u7684\uff0c\u5df2\u53d6\u6d88\u3002\n"
+        )
+        return base + nav_block
+    else:
+        return base + "\n当前未在导航中。可以帮用户搜索目的地、规划路线、查路况。"
+
 
 def _pick_realtime_instructions(req: Request, body: Dict[str, Any]) -> Tuple[Optional[str], str]:
     """
@@ -8835,6 +10610,17 @@ def _pick_realtime_instructions(req: Request, body: Dict[str, Any]) -> Tuple[Opt
     if profile_norm in ("remix", "companion"):
         return _resolve_realtime_instructions(body), profile_norm
 
+    # ✅ 导航助手：profile="nav" 或 profile 以 "nav|" 开头（iOS 附带 JSON 上下文）
+    if profile_norm == "nav" or profile_norm.startswith("nav|"):
+        nav_ctx = None
+        if "|" in requested_profile:
+            _, json_part = requested_profile.split("|", 1)
+            try:
+                nav_ctx = json.loads(json_part)
+            except Exception:
+                nav_ctx = None
+        return _nav_instructions(nav_ctx), "nav"
+
     # Force home assistant (debug/lab): export HOME_FORCE_ON=1
     if HOME_FORCE_ON:
         return _home_instructions_ios_protocol(req, client_id=client_id), "home"
@@ -8845,10 +10631,116 @@ def _pick_realtime_instructions(req: Request, body: Dict[str, Any]) -> Tuple[Opt
 
     # auto-home if bound
     if home_has_binding(req, client_id=client_id):
+        log.info("[rt.pick] user client_id=%s -> HOME mode (auto-bound)", client_id)
         return _home_instructions_ios_protocol(req, client_id=client_id), "home"
 
     # default behavior
+    log.info("[rt.pick] user client_id=%s profile=%s -> DEFAULT (ChatAGI-阿杜)", client_id, profile_norm)
     return _resolve_realtime_instructions(body), profile_norm
+
+
+# ------------------------------------------------------------
+# ✅ 统一记忆注入（facts + timeline + semantic + recent conversation）
+# 文本聊天 / Realtime / OpenClaw 前统一调用此函数
+# ------------------------------------------------------------
+
+def build_unified_memory_context(
+    user_key: str,
+    *,
+    query: str = "",
+    conversation_id: str = "",
+    include_facts: bool = True,
+    include_timeline: bool = True,
+    include_semantic: bool = True,
+    include_recent: bool = True,
+    facts_limit: int = MEMORY_FACTS_PROMPT_LIMIT,
+    timeline_limit: int = 8,
+    semantic_k: int = 5,
+    recent_limit: int = 6,
+) -> Dict[str, Any]:
+    """
+    统一记忆上下文构建器。返回结构化字典：
+    {
+        "facts_text": str,
+        "timeline_text": str,
+        "semantic_text": str,
+        "recent_text": str,
+        "full_prompt": str,       # 拼装好的完整注入文本
+        "total_chars": int,
+    }
+    """
+    uk = _sanitize_user_key(user_key)
+    parts: Dict[str, str] = {
+        "facts_text": "",
+        "timeline_text": "",
+        "semantic_text": "",
+        "recent_text": "",
+    }
+
+    # 1. 长期事实记忆（最稳定的身份/偏好信息）
+    if include_facts:
+        try:
+            fp = (memory_facts_build_prompt(uk, limit=facts_limit) or "").strip()
+            if fp:
+                parts["facts_text"] = fp
+        except Exception:
+            pass
+
+    # 2. 时间线记忆（最近发生了什么，带时间戳）
+    if include_timeline:
+        try:
+            tp = (memory_timeline_build_prompt(uk, limit=timeline_limit) or "").strip()
+            if tp:
+                parts["timeline_text"] = tp
+        except Exception:
+            pass
+
+    # 3. 语义检索记忆（与当前 query 最相关的历史信息）
+    if include_semantic and query:
+        try:
+            results = memory_search(uk, query, k=semantic_k, min_score=MEMORY_MIN_SCORE_DEFAULT)
+            if results:
+                items = [r.get("text", "") for r in results if r.get("text", "").strip()]
+                if items:
+                    bullet = "\n".join(f"- {it[:200]}" for it in items[:semantic_k])
+                    parts["semantic_text"] = "相关记忆片段：\n" + bullet
+        except Exception:
+            pass
+
+    # 4. 近期向量记忆（不依赖 query 的时间排序兜底）
+    if include_recent:
+        try:
+            items = _mem_recent_items(uk, limit=recent_limit)
+            if items:
+                bullet = "\n".join(f"- {it[:200]}" for it in items[:recent_limit])
+                parts["recent_text"] = "最近的记忆片段：\n" + bullet
+        except Exception:
+            pass
+
+    # 5. 拼装完整 prompt（按优先级顺序）
+    blocks: List[str] = []
+    for key in ("facts_text", "timeline_text", "semantic_text", "recent_text"):
+        v = parts[key]
+        if v:
+            blocks.append(v)
+
+    full = ""
+    if blocks:
+        full = (
+            "【长期记忆】\n"
+            "以下信息来自你的长期记忆，用于个性化与延续上下文。\n"
+            "如果与用户当前说法冲突，以用户当前说法为准。\n\n"
+            + "\n\n".join(blocks)
+        )
+
+    return {
+        "facts_text": parts["facts_text"],
+        "timeline_text": parts["timeline_text"],
+        "semantic_text": parts["semantic_text"],
+        "recent_text": parts["recent_text"],
+        "full_prompt": full,
+        "total_chars": len(full),
+    }
 
 
 # ------------------------------------------------------------
@@ -8894,47 +10786,37 @@ def _mem_recent_items(user_key: str, limit: int = 6) -> List[str]:
 
 
 def _build_realtime_memory_block(user_key: str) -> str:
-    """Create a compact memory block to prepend to Realtime instructions."""
+    """Create a compact memory block using the unified memory context builder."""
     try:
         uk = _sanitize_user_key(user_key)
     except Exception:
         uk = "default"
 
-    parts: List[str] = []
-
-    # Structured facts (high-signal)
     try:
-        fp = (memory_facts_build_prompt(uk) or "").strip()
-        if fp:
-            parts.append(fp)
-    except Exception:
-        pass
+        ctx = build_unified_memory_context(
+            uk,
+            include_facts=True,
+            include_timeline=True,
+            include_semantic=False,  # Realtime 没有 query，语义检索跳过
+            include_recent=True,
+            recent_limit=REALTIME_CALL_RECENT_MEMORY_ITEMS,
+        )
+        block = ctx.get("full_prompt") or ""
+        log.info("[rt.memory] user=%s unified_context=%d chars (facts=%d, timeline=%d, recent=%d)",
+                 uk, ctx.get("total_chars", 0),
+                 len(ctx.get("facts_text") or ""),
+                 len(ctx.get("timeline_text") or ""),
+                 len(ctx.get("recent_text") or ""))
+    except Exception as _e:
+        log.warning("[rt.memory] user=%s unified builder error: %s", uk, _e)
+        block = ""
 
-    # Recent vector memories (recency heuristic)
-    try:
-        items = _mem_recent_items(uk, limit=REALTIME_CALL_RECENT_MEMORY_ITEMS)
-        if items:
-            bullet = "\n".join(f"- {it}" for it in items[:REALTIME_CALL_RECENT_MEMORY_ITEMS])
-            parts.append("最近的记忆片段：\n" + bullet)
-    except Exception:
-        pass
-
-    text = "\n\n".join([p for p in parts if p and p.strip()]).strip()
-    if not text:
+    if not block:
         return ""
-
-    block = (
-        "\n\n"
-        "【长期记忆】\n"
-        "以下信息来自你的长期记忆，用于个性化与延续上下文。\n"
-        "如果与用户当前说法冲突，以用户当前说法为准。\n"
-        + text.strip()
-        + "\n"
-    )
 
     if len(block) > REALTIME_CALL_MEMORY_MAX_CHARS:
         block = block[:REALTIME_CALL_MEMORY_MAX_CHARS].rstrip() + "\n"
-    return block
+    return "\n\n" + block + "\n"
 
 
 def _augment_realtime_instructions(
@@ -8943,17 +10825,168 @@ def _augment_realtime_instructions(
     user_key: str,
     enable_memory: bool,
     enable_web: bool,
+    perception_data: Optional[Dict[str, Any]] = None,
+    enable_agent: bool = True,
 ) -> Optional[str]:
     base = (base_instructions or "").strip()
     blocks: List[str] = []
     if base:
         blocks.append(base)
 
+    log.info("[rt.augment] user=%s enable_memory=%s enable_web=%s enable_agent=%s perception=%s base_instructions_preview='%s'",
+             user_key, enable_memory, enable_web, enable_agent,
+             bool(perception_data), (base or "(none)")[:120])
+
+    # ── 1. 长期记忆（与文本通道共享同一套 build_unified_memory_context）──
     if enable_memory and REALTIME_CALL_MEMORY_DEFAULT:
         mb = _build_realtime_memory_block(user_key)
         if mb:
             blocks.append(mb.strip())
+            log.info("[rt.augment] ✅ memory block injected (%d chars)", len(mb))
+        else:
+            log.info("[rt.augment] ⚠️ memory enabled but block is empty")
+    else:
+        log.info("[rt.augment] ❌ memory NOT injected (enable_memory=%s, DEFAULT=%s)", enable_memory, REALTIME_CALL_MEMORY_DEFAULT)
 
+    # ── 2. 感知上下文（物理世界：GPS/朝向/运动/地址）──
+    if isinstance(perception_data, dict) and perception_data.get("latitude"):
+        try:
+            from perception_module import format_perception_context, store_to_world_memory
+            # ✅ Key 兼容：iOS JSONEncoder(.convertToSnakeCase) 发蛇形 key，后端/perception_module 用驼峰
+            _snake_to_camel = {
+                "full_address": "fullAddress",
+                "street_number": "streetNumber",
+                "horizontal_accuracy": "horizontalAccuracy",
+                "heading_description": "headingDescription",
+                "motion_state": "motionState",
+                "scene_description": "sceneDescription",
+                "geocode_source": "geocodeSource",
+                "poi_name": "poiName",
+            }
+            for sk, ck in _snake_to_camel.items():
+                if sk in perception_data and ck not in perception_data:
+                    perception_data[ck] = perception_data[sk]
+            # enrich 已在 /session 层完成，这里直接 format
+            _perc_ctx = format_perception_context(perception_data)
+            if _perc_ctx:
+                blocks.append(_perc_ctx.strip())
+                log.info("[rt.augment] ✅ perception context injected: %s",
+                         perception_data.get("fullAddress") or f"{perception_data.get('latitude'):.4f}")
+            # 存入世界记忆
+            store_to_world_memory(user_key or "anonymous", perception_data)
+        except Exception as _pe:
+            log.warning("[rt.augment] ⚠️ perception injection failed: %s", _pe)
+
+    # ── 3. Agent 能力提示词（OpenClaw/Adu-Agent）──
+    if enable_agent:
+        try:
+            _bridge = get_bridge()
+            if _bridge.connected:
+                _agent_block = (
+                    "【操作能力】\n"
+                    "你拥有设备操作能力（通过 adu_agent_exec 工具）。\n"
+                    "当用户要求打开应用、操作文件、执行终端命令、控制设备等，调用 adu_agent_exec 工具。\n"
+                    "当用户说给某人发微信、发消息，调用 adu_mac_send 工具，传入 contact（联系人名字）和 message（消息内容）。\n"
+                    "参数: action=具体动作描述（中文即可）。\n"
+                    "示例动作: '打开备忘录', '查看桌面文件', '编译GPTsora项目', '打开Safari搜索天气'。\n"
+                    "不确定能否执行时，先尝试调用，根据结果再回复用户。"
+                )
+                blocks.append(_agent_block)
+                log.info("[rt.augment] ✅ agent (OpenClaw) instructions injected")
+
+                # ══════════════════════════════════════════════════════
+                # 🆕 屏幕共享 Agent 委托模式
+                # ══════════════════════════════════════════════════════
+                _screen_agent_block = (
+                    "【🖥️ 电脑控制模式 — 委托执行】\n"
+                    "\n"
+                    "用户点开电脑图标或说\"接入电脑\"、\"看我电脑\"时,意味着把电脑交给你了。\n"
+                    "你不是被动工具,是主动的管家。用户只说目标,你负责完成。\n"
+                    "\n"
+                    "【核心原则】\n"
+                    "1. 用户说目标,不说步骤。你自己规划。\n"
+                    "   错:等用户说\"点左上角\"、\"按回车\"\n"
+                    "   对:用户说\"发微信给老婆\" → 你自己:切微信→找信玉→发消息→确认\n"
+                    "\n"
+                    "2. 默默执行,只在关键节点汇报。\n"
+                    "   不要逐步播报(\"我现在切到微信了\"、\"我在搜索...\"全删)\n"
+                    "   完成后一句话报结果:\"发给信玉了,她回'好'\"\n"
+                    "   长任务(>3秒)可中途说一次\"在找...\"让用户知道在进行\n"
+                    "\n"
+                    "3. 歧义/风险/不确定 → 立刻问用户,不瞎猜。\n"
+                    "   - 多个张三 → \"你指通讯录里的张三还是同事张三?\"\n"
+                    "   - 发送/删除/支付 → 先简短确认\n"
+                    "   - 不认识的联系人 → 问用户\n"
+                    "\n"
+                    "4. 失败自己重试 2 次,不行再求助用户。\n"
+                    "\n"
+                    "【工具优先级 — 越前面越优先】\n"
+                    "\n"
+                    "⭐⭐⭐ 最高:专用 AppleScript 封装(100% 成功)\n"
+                    "   adu_mac_send(contact, message)  — 发微信(系统帮你完成完整流程)\n"
+                    "\n"
+                    "⭐⭐ 次高:苹果系统级操作(精度 99%)\n"
+                    "   mac_click_by_title(title)       — 按文字精确点击(99% 准确,零 token)\n"
+                    "                                     例:mac_click_by_title(\"信玉\")、(\"发送\")\n"
+                    "   mac_applescript(script)         — 任意 AppleScript(激活 App、控制 Finder)\n"
+                    "                                     例:tell app \"Safari\" to activate\n"
+                    "                                     ⚠️ 中文输入禁用 keystroke,改用 mac_paste\n"
+                    "\n"
+                    "⭐ 基础:键盘鼠标\n"
+                    "   mac_key(name)              — 快捷键(cmd-f/enter/esc/cmd-space/cmd-l)\n"
+                    "   mac_paste(text)            — 粘贴文本(中文必用)\n"
+                    "   mac_scroll(dy)             — 滚动(负值向下)\n"
+                    "   mac_click(x, y)            — 坐标点击(没文字标签时才用)\n"
+                    "   mac_shell(command)         — zsh 命令(ls/git/python)\n"
+                    "\n"
+                    "🔎 视觉(按需,最贵):\n"
+                    "   mac_screen_glance()        — 看一眼(关键步骤后确认用)\n"
+                    "   mac_screen_watch(fps)      — 持续看(等加载/看视频)\n"
+                    "   mac_screen_pause()         — 任务完成后停看,省资源\n"
+                    "\n"
+                    "【典型流程】\n"
+                    "\n"
+                    "❶ 发微信(用户:\"给老婆发微信说回家吃饭\")\n"
+                    "   你:[记忆查:老婆=信玉]\n"
+                    "       → adu_mac_send(\"信玉\", \"回家吃饭吗?\")\n"
+                    "       → \"发给信玉了,问她是否回家吃饭\"\n"
+                    "\n"
+                    "❷ 打开应用(\"打开 Spotify 放音乐\")\n"
+                    "   → mac_applescript('tell app \"Spotify\" to activate\\nplay')\n"
+                    "   → \"打开了,正在播放\"\n"
+                    "\n"
+                    "❸ 网页操作(\"去 github\")\n"
+                    "   → mac_applescript('tell app \"Safari\" to activate')\n"
+                    "   → mac_key(\"cmd-l\") → mac_paste(\"github.com\") → mac_key(\"enter\")\n"
+                    "   → \"打开了 github\"\n"
+                    "\n"
+                    "❹ 精确点击(\"登录一下\")\n"
+                    "   → mac_click_by_title(\"登录\")  # 不用看屏幕,直接点\n"
+                    "   → \"已点登录\"\n"
+                    "\n"
+                    "❺ 看屏幕分析(\"这页面讲啥?\")\n"
+                    "   → mac_screen_glance() → 看图分析\n"
+                    "   → \"这是关于 xxx 的文章...\"\n"
+                    "\n"
+                    "【省钱+省时】\n"
+                    "- 能用 mac_click_by_title 就不用 glance(快 30 倍,零 token)\n"
+                    "- 能用 adu_mac_send 就不用 mac_applescript 手搓\n"
+                    "- 连续可预期动作不用每步 glance(点完发送键直接汇报,不必再看)\n"
+                    "- 任务完成调 mac_screen_pause,别让屏幕一直推流\n"
+                    "\n"
+                    "【安全线】\n"
+                    "- 删除/支付/发送重要内容 → 先简短问用户确认\n"
+                    "- 看到密码框 → 立刻停,让用户自己输\n"
+                    "- 看到身份证/银行卡号 → 不在汇报里复述\n"
+                )
+                blocks.append(_screen_agent_block)
+                log.info("[rt.augment] ✅ screen-share agent mode injected (%d chars)", len(_screen_agent_block))
+            else:
+                log.info("[rt.augment] ⚠️ agent skipped: OpenClaw not connected")
+        except Exception as _ae:
+            log.info("[rt.augment] ⚠️ agent injection skipped: %s", _ae)
+
+    # ── 4. 联网搜索 ──
     if enable_web and REALTIME_CALL_WEB_DEFAULT:
         blocks.append(
             "【联网功能】\n"
@@ -8961,8 +10994,12 @@ def _augment_realtime_instructions(
             "优先在用户明确需要最新信息、需要引用来源或需要事实核对时使用。\n"
             "返回时尽量给出来源标题与链接。"
         )
+        log.info("[rt.augment] ✅ web_search instructions injected")
+    else:
+        log.info("[rt.augment] ❌ web_search NOT injected (enable_web=%s, DEFAULT=%s)", enable_web, REALTIME_CALL_WEB_DEFAULT)
 
     out = "\n\n".join([b for b in blocks if b and b.strip()]).strip()
+    log.info("[rt.augment] final instructions length=%d chars", len(out) if out else 0)
     return out or None
 
 
@@ -9000,12 +11037,51 @@ def _realtime_tool_remember_def() -> Dict[str, Any]:
     }
 
 
-def _realtime_tools(*, enable_web: bool, enable_memory: bool) -> List[Dict[str, Any]]:
+def _realtime_tool_agent_exec_def() -> Dict[str, Any]:
+    return {
+        "type": "function",
+        "name": "adu_agent_exec",
+        "description": "Execute device operations via Adu-Agent (OpenClaw). Use when the user asks to open apps, manage files, run terminal commands, control devices, compile projects, browse web, etc.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "action": {"type": "string", "description": "Action to perform (Chinese or English), e.g. '打开备忘录', '查看桌面文件', 'compile GPTsora'"},
+            },
+            "required": ["action"],
+        },
+    }
+
+
+def _realtime_tool_mac_send_def() -> Dict[str, Any]:
+    return {
+        "type": "function",
+        "name": "adu_mac_send",
+        "description": "发送消息给微信联系人或群。当用户说给XX发微信、发消息给XX时调用。",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "contact": {"type": "string", "description": "联系人名字，如信玉、文件传输助手"},
+                "message": {"type": "string", "description": "要发送的消息内容"},
+            },
+            "required": ["contact", "message"],
+        },
+    }
+
+
+def _realtime_tools(*, enable_web: bool, enable_memory: bool, enable_agent: bool = True) -> List[Dict[str, Any]]:
     tools: List[Dict[str, Any]] = []
     if enable_web:
         tools.append(_realtime_tool_web_search_def())
     if enable_memory:
         tools.append(_realtime_tool_remember_def())
+    if enable_agent:
+        try:
+            _bridge = get_bridge()
+            if _bridge.connected:
+                tools.append(_realtime_tool_agent_exec_def())
+        except Exception:
+            pass
+    tools.append(_realtime_tool_mac_send_def())
     return tools
 
 
@@ -9079,12 +11155,17 @@ def _realtime_controller_start(
     enable_web: bool,
     enable_memory: bool,
     instructions: Optional[str],
+    conversation_id: str = "",
 ) -> None:
     """Start (or reuse) a sideband controller for a WebRTC call."""
     cid = (call_id or "").strip()
     if not cid:
         return
     if not OPENAI_API_KEY:
+        return
+
+    if websockets is None:
+        log.warning("[rt.sideband] websockets not installed; auto tools/memory disabled for call=%s", cid)
         return
 
     with _REALTIME_CONTROLLERS_LOCK:
@@ -9097,6 +11178,7 @@ def _realtime_controller_start(
             enable_web=enable_web,
             enable_memory=enable_memory,
             instructions=instructions,
+            conversation_id=conversation_id,
         )
         _REALTIME_CONTROLLERS[cid] = ctrl
 
@@ -9158,8 +11240,11 @@ class RealtimeSidebandController:
     Server-side sideband connection for WebRTC Realtime calls.
 
     Responsibilities:
-      - Execute Realtime function tools (web_search / remember)
+      - Execute Realtime function tools (web_search / remember / openclaw)
       - Collect transcripts and persist to memory on call end
+      - ✅ Sync transcripts to conversation history (conv_add_message)
+      - ✅ Feed transcripts into 4-level compression pipeline (L0→L1→L2→L3)
+      - ✅ Execute OpenClaw/Adu-Agent actions from voice commands
 
     This is *best-effort* and must never break the call.
     """
@@ -9173,6 +11258,7 @@ class RealtimeSidebandController:
         enable_web: bool,
         enable_memory: bool,
         instructions: Optional[str],
+        conversation_id: str = "",
     ):
         self.call_id = (call_id or "").strip()
         self.user_key = _sanitize_user_key(user_key)
@@ -9188,6 +11274,27 @@ class RealtimeSidebandController:
         self.turns: List[Dict[str, str]] = []
         self._tool_seen: set[str] = set()
         self._tool_args_buf: Dict[str, str] = {}
+
+        # ✅ 会话历史同步：优先复用前端传来的 conversation_id，否则创建新的
+        cid_in = (conversation_id or "").strip()
+        if cid_in:
+            self.conv_id = cid_in
+            try:
+                conv_touch(self.user_key, cid_in, "")
+            except Exception:
+                pass
+            log.info("[rt.sideband] call=%s reusing conv_id=%s", self.call_id, self.conv_id)
+        else:
+            try:
+                self.conv_id: str = conv_create(self.user_key, f"语音通话 {time.strftime('%m/%d %H:%M')}")
+                log.info("[rt.sideband] call=%s conv_id=%s created", self.call_id, self.conv_id)
+            except Exception as _e:
+                self.conv_id = ""
+                log.warning("[rt.sideband] conv_create failed: %s", _e)
+
+        # 追踪最近一对 user/assistant 文本，用于 L3 结构化提取
+        self._last_user_text: str = ""
+        self._last_ai_text: str = ""
 
     def request_stop(self) -> None:
         try:
@@ -9256,6 +11363,49 @@ class RealtimeSidebandController:
         await asyncio.to_thread(_do)
         return {"ok": True, "stored": True}
 
+    async def _tool_openclaw(self, name: str, args: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        ✅ OpenClaw/Adu-Agent 工具调用 — 语音通话中执行文件操作/终端命令/浏览器动作等。
+
+        支持两种触发方式:
+        1. Realtime function tool: name=openclaw_exec / adu_agent_exec, args={action, ...}
+        2. AI 回复中嵌入 [ADU_ACTION:...] 标记（由 _sync_openclaw_from_transcript 在通话结束时批量处理）
+
+        此方法处理方式 1（实时工具调用）。
+        """
+        try:
+            _bridge = get_bridge()
+            if not _bridge.connected:
+                # 尝试重连一次
+                try:
+                    await asyncio.to_thread(ensure_connected)
+                    _bridge = get_bridge()
+                except Exception:
+                    pass
+            if not _bridge.connected:
+                return {"ok": False, "error": "openclaw_not_connected"}
+
+            action = str(args.get("action") or args.get("command") or "").strip()
+            if not action:
+                return {"ok": False, "error": "missing action"}
+
+            # 构造 [ADU_ACTION:...] 格式让 process_agent_actions_sync 统一处理
+            action_text = f"[ADU_ACTION:{action}]"
+            # 如果有额外参数，附加为 JSON
+            extra = {k: v for k, v in args.items() if k not in ("action", "command")}
+            if extra:
+                action_text = f"[ADU_ACTION:{action} {json.dumps(extra, ensure_ascii=False)}]"
+
+            def _do():
+                _clean, _results = process_agent_actions_sync(action_text, _bridge)
+                return _results
+
+            result_text = await asyncio.to_thread(_do)
+            return {"ok": True, "result": (result_text or "").strip() or "done"}
+        except Exception as e:
+            log.warning("[rt.sideband] openclaw tool failed: %s", e)
+            return {"ok": False, "error": str(e)[:200]}
+
     async def _handle_tool_call(self, *, call_id: str, name: str, arguments: str) -> None:
         cid = (call_id or "").strip()
         if not cid or cid in self._tool_seen:
@@ -9273,6 +11423,25 @@ class RealtimeSidebandController:
             out = await self._tool_web_search(args)
         elif name == "remember" and self.enable_memory:
             out = await self._tool_remember(args)
+        # ✅ OpenClaw 接入：语音通话中也能执行文件操作/终端命令等 Agent 动作
+        elif name.startswith("openclaw_") or name.startswith("adu_agent_"):
+            out = await self._tool_openclaw(name, args)
+        elif name == "adu_mac_send":
+            log.info("=" * 60)
+            log.info("🎯 [adu_mac_send] CALLED! contact=%s message=%s", args.get("contact"), args.get("message"))
+            log.info("=" * 60)
+            try:
+                import sys
+                sys.path.insert(0, '/Users/a12345/Desktop/backend')
+                from adu_mac_tools import send_wechat
+                contact = args.get("contact", "")
+                message = args.get("message", "")
+                result = send_wechat(contact, message)
+                log.info("🎯 [adu_mac_send] send_wechat returned: %s", result)
+                out = {"ok": True, "result": f"已发送给{contact}"}
+            except Exception as e:
+                log.error("🎯 [adu_mac_send] FAILED: %s", e, exc_info=True)
+                out = {"ok": False, "error": str(e)}
 
         # Send tool output back to the call
         await self._send(
@@ -9302,6 +11471,7 @@ class RealtimeSidebandController:
             cid = str(ev.get("call_id") or "").strip()
             name = str(ev.get("name") or "").strip()
             arguments = str(ev.get("arguments") or (self._tool_args_buf.get(cid) or "")).strip()
+            log.info("🛠️ [tool_call] GPT 调用工具: name=%s args_preview=%s", name, arguments[:200])
             if cid and name:
                 await self._handle_tool_call(call_id=cid, name=name, arguments=arguments)
             return
@@ -9318,6 +11488,39 @@ class RealtimeSidebandController:
                 txt = _extract_realtime_item_text(item)
                 if txt:
                     self.turns.append({"role": role, "text": txt})
+
+                    # ✅ 统一落库：conv_add_message 同时写 messages + timeline
+                    if self.conv_id:
+                        try:
+                            conv_add_message(self.user_key, self.conv_id, role, txt, source="realtime")
+                        except Exception:
+                            pass
+
+                    # ✅ 四级压缩：写入 L0 原始轮次 + 触发压缩流水线
+                    if self.conv_id:
+                        try:
+                            _comp_append_turn(self.user_key, self.conv_id, role, txt[:800])
+                            _comp_maybe_compress(self.user_key, self.conv_id)
+                        except Exception:
+                            pass
+
+                    # 追踪最近的 user/assistant 文本对
+                    if role == "user":
+                        self._last_user_text = txt
+                    elif role == "assistant":
+                        self._last_ai_text = txt
+                        # ✅ L3 结构化提取：每个 assistant 回复配对 user 做提取
+                        if self._last_user_text:
+                            try:
+                                _comp_l3_extract(self.user_key, self._last_user_text, txt)
+                            except Exception:
+                                pass
+                        # ✅ 长期事实抽取：每轮都触发（语音链路长出长期记忆）
+                        if self._last_user_text:
+                            try:
+                                extract_and_save_memory_facts(self.user_key, self._last_user_text, txt)
+                            except Exception:
+                                pass
             elif itype == "function_call":
                 cid = str(item.get("call_id") or "").strip()
                 name = str(item.get("name") or "").strip()
@@ -9370,6 +11573,48 @@ class RealtimeSidebandController:
                     last_ai = (t.get("text") or "").strip()
             if last_user or last_ai:
                 extract_and_save_memory_facts(self.user_key, last_user, last_ai)
+
+            # ✅ OpenClaw: 批量处理通话中 assistant 回复里的 [ADU_ACTION:...] 标记
+            try:
+                _bridge = get_bridge()
+                if _bridge.connected:
+                    for t in self.turns:
+                        if (t.get("role") or "") != "assistant":
+                            continue
+                        at = (t.get("text") or "").strip()
+                        if at and "[ADU_ACTION:" in at:
+                            try:
+                                process_agent_actions_sync(at, _bridge)
+                            except Exception:
+                                pass
+            except Exception:
+                pass
+
+            # ✅ 四级压缩：通话结束时最终 flush 一次压缩流水线
+            if self.conv_id:
+                try:
+                    _comp_maybe_compress(self.user_key, self.conv_id)
+                except Exception:
+                    pass
+
+            # ✅ 时间线记忆：记录本次通话的总结事件
+            try:
+                n_user = sum(1 for t in self.turns if (t.get("role") or "") == "user")
+                n_ai = sum(1 for t in self.turns if (t.get("role") or "") == "assistant")
+                dur = int(time.time() - self.started_at)
+                dur_str = f"{dur // 60}分{dur % 60}秒" if dur >= 60 else f"{dur}秒"
+                summary = f"语音通话 ({dur_str}, 用户{n_user}轮, 助手{n_ai}轮)"
+                if last_user:
+                    summary += f" 最后话题: {last_user[:80]}"
+                memory_timeline_add(
+                    self.user_key, summary,
+                    event_type="voice_call",
+                    detail=_short(transcript, 800),
+                    source=self.call_id,
+                    ts=self.started_at,
+                )
+            except Exception:
+                pass
 
         await asyncio.to_thread(_do)
 
@@ -9470,6 +11715,8 @@ async def session_post(req: Request):
         user_key = _derive_user_key(req, b)
         allow_web = bool(_extract_allow_web(req, b))  # uses existing flag parsing
         enable_memory = _boolish(b.get("enable_memory"))
+        # ✅ 提取 conversation_id（与文本聊天共用同一个会话）
+        rt_conversation_id = (qp.get("conversation_id") or req.headers.get("x-conversation-id") or "").strip()
 
         instructions, resolved_profile = _pick_realtime_instructions(req, b)
         instructions = _augment_realtime_instructions(
@@ -9477,6 +11724,8 @@ async def session_post(req: Request):
             user_key=user_key,
             enable_memory=enable_memory,
             enable_web=allow_web,
+            perception_data=None,  # SDP 分支不携带 perception（通过 query params 无法传复杂 JSON）
+            enable_agent=True,
         )
 
         # Build session config for /v1/realtime/calls (multipart form)
@@ -9509,6 +11758,19 @@ async def session_post(req: Request):
         answer_sdp = (r.text or "").strip()
         loc = (r.headers.get("Location") or r.headers.get("location") or "").strip()
         call_id = _parse_realtime_call_id(loc)
+        if not call_id:
+            # Some proxies may drop Location; try alternate headers.
+            for hk in (
+                "x-openai-realtime-call-id",
+                "openai-realtime-call-id",
+                "x-realtime-call-id",
+                "x-call-id",
+            ):
+                hv = (r.headers.get(hk) or r.headers.get(hk.title()) or "").strip()
+                if hv:
+                    call_id = _parse_realtime_call_id(hv)
+                    if call_id:
+                        break
 
         # ✅ Auto-attach sideband controller (exec tools + store memory)
         if call_id:
@@ -9519,9 +11781,14 @@ async def session_post(req: Request):
                 enable_web=allow_web,
                 enable_memory=enable_memory,
                 instructions=instructions,
+                conversation_id=rt_conversation_id,
             )
 
         headers_out: Dict[str, str] = {"X-Resolved-Profile": str(resolved_profile or "")}
+        auto_mem = bool(call_id and enable_memory and (websockets is not None))
+        headers_out["X-Auto-Memory"] = "1" if auto_mem else "0"
+        headers_out["X-Memory-Commit-Required"] = "0" if auto_mem else ("1" if enable_memory else "0")
+
         if loc:
             headers_out["Location"] = loc
         if call_id:
@@ -9541,20 +11808,160 @@ async def session_post(req: Request):
     voice = (b.get("voice") or REALTIME_VOICE_DEFAULT).strip()
 
     user_key = _derive_user_key(req, b)
-    allow_web = bool(_extract_allow_web(req, b)) if ("allow_web" in b or "allowWeb" in b or "enable_web_search" in b) else False
+    # ✅ FIX: 默认开启联网（与 WebRTC SDP 分支一致），iOS 不传 allow_web 也能用
+    allow_web = bool(_extract_allow_web(req, b))
     enable_memory = _boolish(b.get("enable_memory", True))
+    # ✅ 提取 conversation_id（与文本聊天共用同一个会话）
+    rt_conversation_id = (b.get("conversation_id") or b.get("session_id") or "").strip()
+
+    # ✅ Provider routing: OpenAI vs Qwen Omni Realtime
+    provider = _pick_realtime_provider(b)
+
+    log.info("[/session:JSON] user=%s provider=%s allow_web=%s enable_memory=%s conv_id=%s body_keys=%s",
+             user_key, provider, allow_web, enable_memory, rt_conversation_id or "(auto)", list(b.keys())[:12])
 
     instructions, resolved_profile = _pick_realtime_instructions(req, b)
+
+    # ✅ 提取感知数据（与文本通道共用同一个 perception 字段）
+    _rt_perception = b.get("perception")
+    log.info("[/session:diag] client_id=%s perception_present=%s profile=%s",
+             b.get("client_id","(none)"), bool(_rt_perception), b.get("profile","(none)"))
+    if not isinstance(_rt_perception, dict):
+        _rt_perception = None
+
+    # ✅ 异步丰富感知数据（Google Geocoding 获取门牌号）
+    if isinstance(_rt_perception, dict) and _rt_perception.get("latitude"):
+        try:
+            from perception_module import enrich_perception_data
+            _rt_perception = await enrich_perception_data(_rt_perception)
+        except Exception as _enrich_err:
+            log.warning("[/session] perception enrich failed: %s", _enrich_err)
+
     instructions = _augment_realtime_instructions(
         base_instructions=instructions,
         user_key=user_key,
         enable_memory=enable_memory,
         enable_web=allow_web,
+        perception_data=_rt_perception,
+        enable_agent=True,
     )
 
-    # Try primary model, then auto-fallback to keep voice stable.
-    tools = _realtime_tools(enable_web=allow_web, enable_memory=enable_memory)
+    tools = _realtime_tools(enable_web=allow_web, enable_memory=enable_memory, enable_agent=True)
 
+    # ────────────────────────────────────────────
+    # ✅ Pipeline 分支（STT → DeepSeek LLM → TTS）
+    # ────────────────────────────────────────────
+    if provider == "pipeline":
+        # WebSocket URL: 客户端连本服务器的 /voice/ws
+        # 需要构建绝对 ws:// URL
+        host = req.headers.get("host", "localhost:8000")
+        scheme = "wss" if req.url.scheme == "https" else "ws"
+        pipeline_ws_url = f"{scheme}://{host}/voice/ws"
+
+        pipeline_voice = (b.get("voice") or os.getenv("VOICE_TTS_VOICE", "Cherry")).strip()
+        pipeline_model = os.getenv("VOICE_LLM_MODEL", "deepseek-chat")
+
+        return {
+            "ok": True,
+            "provider": "pipeline",
+            "session_id": uuid.uuid4().hex,
+            "conversation_id": rt_conversation_id,
+            "ws_url": pipeline_ws_url,
+            "api_key": "",                          # 连自己后端不需要 key
+            "rtc_url": pipeline_ws_url,             # 兼容旧字段
+            "ephemeral_key": "",                    # 兼容旧字段
+            "modalities": ["text", "audio"],
+            "model": pipeline_model,
+            "voice": pipeline_voice,
+            "input_audio_format": "pcm",
+            "output_audio_format": "pcm",
+            "input_sample_rate": 16000,
+            "output_sample_rate": 24000,
+            "pcm24_to_pcm16_required": False,
+            "max_session_minutes": 120,
+            "profile": resolved_profile,
+            "home_bound": bool(resolved_profile == "home"),
+            "memory_enabled": bool(enable_memory),
+            "web_enabled": bool(allow_web),
+            "tools_enabled": False,
+            "instructions": instructions,
+            "protocol_notes": {
+                "transport": "WebSocket (same as Qwen path)",
+                "vad": "client-side (iOS energy detection)",
+                "stt": "Qwen3-ASR-Flash-Realtime",
+                "llm": pipeline_model,
+                "tts": os.getenv("VOICE_TTS_MODEL", "qwen3-tts-flash-realtime"),
+                "audio_format": "PCM16 24kHz mono",
+            },
+        }
+
+    # ────────────────────────────────────────────
+    # ✅ Qwen Omni Realtime 分支
+    # ────────────────────────────────────────────
+    if provider == "qwen":
+        qwen_model = (b.get("model") or QWEN_REALTIME_MODEL).strip()
+        qwen_voice = (b.get("voice") or QWEN_REALTIME_VOICE).strip()
+        qinfo, qerr = _qwen_realtime_ephemeral(
+            qwen_model, qwen_voice,
+            instructions=instructions,
+            tools=tools,
+            tool_choice=("auto" if tools else None),
+        )
+        if qerr:
+            # auto 模式下 fallback 到 OpenAI
+            if REALTIME_PROVIDER == "auto":
+                log.warning("[/session:JSON] Qwen failed (%s), falling back to OpenAI", qerr)
+                provider = "openai"
+                # fall through to OpenAI block below
+            else:
+                return JSONResponse({"ok": False, "error": f"Qwen: {qerr}"}, status_code=502)
+        else:
+            return {
+                "ok": True,
+                "provider": "qwen",
+                "session_id": uuid.uuid4().hex,
+                "conversation_id": rt_conversation_id or conv_create(user_key, "实时语音"),
+                "ws_url": qinfo["ws_url"],
+                "api_key": qinfo["api_key"],           # iOS 放 Authorization: Bearer
+                "rtc_url": qinfo["ws_url"],             # 兼容旧字段
+                "ephemeral_key": qinfo["api_key"],      # 兼容旧字段（Qwen 直接用 API Key）
+                "modalities": ["text", "audio"],
+                "model": qinfo["model"],
+                "voice": qinfo["voice"],
+                "input_audio_format": "pcm",
+                "output_audio_format": "pcm",
+                "input_sample_rate": 16000,
+                "output_sample_rate": 24000,
+                "pcm24_to_pcm16_required": False,
+                "max_session_minutes": 120,
+                "profile": resolved_profile,
+                "home_bound": bool(resolved_profile == "home"),
+                "memory_enabled": bool(enable_memory),
+                "web_enabled": bool(allow_web),
+                "tools_enabled": bool(bool(tools)),
+                "memory_commit_url": "/realtime/memory/commit",
+                "turn_commit_url": "/realtime/turn/commit",
+                "web_search_url": "/web_search?q={query}&k=6",
+                "user_key_hint": user_key,
+                "auto_memory": False,
+                "memory_commit_required": bool(enable_memory),
+                "instructions": instructions,  # ✅ 统一注入：人格+记忆+感知
+                "conversation_id": rt_conversation_id or conv_create(user_key, "实时语音"),
+                # ✅ Qwen 协议差异提示
+                "protocol_notes": {
+                    "auth_header": "Authorization: Bearer <api_key>",
+                    "no_openai_beta_header": True,
+                    "input_audio": "pcm16 only (no g711)",
+                    "output_audio": "pcm (PCM16 24kHz mono)",
+                    "session_duration": "120 min (vs OpenAI 15 min)",
+                    "voices_available": 49,
+                },
+            }
+
+    # ────────────────────────────────────────────
+    # ✅ OpenAI Realtime 分支（原有逻辑）
+    # ────────────────────────────────────────────
+    # Try primary model, then auto-fallback to keep voice stable.
     key, err = _realtime_ephemeral(model, voice, instructions=instructions, tools=tools, tool_choice=("auto" if tools else None))
     if err and REALTIME_MODEL_FALLBACK and model != REALTIME_MODEL_FALLBACK:
         key2, err2 = _realtime_ephemeral(REALTIME_MODEL_FALLBACK, voice, instructions=instructions, tools=tools, tool_choice=("auto" if tools else None))
@@ -9569,21 +11976,30 @@ async def session_post(req: Request):
     # Use POST /realtime/memory/commit from client when the call ends to persist transcripts.
     return {
         "ok": True,
+        "provider": "openai",
         "session_id": uuid.uuid4().hex,
+        "conversation_id": rt_conversation_id or conv_create(user_key, "实时语音"),  # ✅ 回传给前端
         "rtc_url": f"https://api.openai.com/v1/realtime?model={model}",
         "ephemeral_key": key,
         "modalities": ["text", "audio"],
         "ice_servers": [{"urls": ["stun:stun.l.google.com:19302"]}],
         "model": model,
         "voice": voice,
+        "input_audio_format": "pcm16",
+        "output_audio_format": "pcm16",
+        "pcm24_to_pcm16_required": False,
         "profile": resolved_profile,
         "home_bound": bool(resolved_profile == "home"),
         "memory_enabled": bool(enable_memory),
         "web_enabled": bool(allow_web),
         "tools_enabled": bool(bool(tools)),
         "memory_commit_url": "/realtime/memory/commit",
+        "turn_commit_url": "/realtime/turn/commit",  # ✅ 新接口
         "web_search_url": "/web_search?q={query}&k=6",
         "user_key_hint": user_key,
+        "auto_memory": False,
+        "memory_commit_required": bool(enable_memory),
+        "instructions": instructions,  # ✅ GPT Realtime 也返回完整 instructions（人格/记忆/感知）
     }
 
 
@@ -9845,6 +12261,72 @@ async def _tts_bytes_impl(request: Request, force_mp3: bool = False):
         return JSONResponse({"ok": False, "error": f"openai_tts_error: {last_err or 'unknown'}"}, status_code=502)
 
     return Response(content=bytes(out), media_type=_tts_media_type(fmt))
+
+# ============================================================
+# 把这段代码加到 server_session.py 的 @app.post("/tts") 前面
+# ============================================================
+
+# ---- 阿杜自己的声音模型（RunPod A100）----
+ADU_BRIDGE_URL = os.getenv(
+    "ADU_BRIDGE_URL",
+    "https://translated-marine-divine-yeast.trycloudflare.com"
+)
+
+@app.post("/adu_voice")
+async def adu_voice(request: Request):
+    """
+    纯音频端到端接口：
+    - 接收 multipart/form-data: audio=<wav/m4a文件>
+    - 发给 RunPod bridge 处理
+    - 流式返回音频
+    """
+    import httpx, base64, io
+
+    form = await request.form()
+    audio_file = form.get("audio")
+    if not audio_file:
+        raise HTTPException(status_code=400, detail="missing audio field")
+
+    audio_bytes = await audio_file.read()
+
+    # 编码成 base64 发给 bridge
+    audio_b64 = base64.b64encode(audio_bytes).decode()
+
+    try:
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            resp = await client.post(
+                f"{ADU_BRIDGE_URL}/stream",
+                json={"audio_b64": audio_b64, "sr": 16000},
+            )
+            if resp.status_code != 200:
+                raise HTTPException(
+                    status_code=502,
+                    detail=f"bridge error: {resp.status_code}"
+                )
+
+            return Response(
+                content=resp.content,
+                media_type="audio/wav",
+                headers={"X-Adu-Bridge": "ok"}
+            )
+
+    except httpx.TimeoutException:
+        raise HTTPException(status_code=504, detail="bridge timeout")
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"bridge error: {e}")
+
+
+@app.get("/adu_voice/health")
+async def adu_voice_health():
+    """检查 RunPod bridge 是否在线"""
+    import httpx
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            resp = await client.get(f"{ADU_BRIDGE_URL}/health")
+            return {"bridge": resp.json(), "url": ADU_BRIDGE_URL}
+    except Exception as e:
+        return {"bridge": "offline", "error": str(e), "url": ADU_BRIDGE_URL}
+
 
 @app.post("/tts")
 async def tts(request: Request):
@@ -10129,6 +12611,79 @@ async def v1_video_stream(video_id: str, request: Request):
         media_type=mime,
         filename=os.path.basename(file_path),
     )
+
+# ── /file/generate : 模型输出内容 → 生成文件供用户下载 ─────────────────────
+@app.post("/file/generate")
+async def file_generate(req: Request):
+    """
+    接受模型输出的文本内容，生成对应格式文件，返回下载URL。
+    body: {
+        "content": "文件内容",
+        "filename": "output.py",          # 决定格式，不填默认 output.md
+        "encoding": "utf-8"               # 可选
+    }
+    """
+    try:
+        body = await req.json()
+    except Exception:
+        return JSONResponse({"ok": False, "error": "invalid json"}, status_code=400)
+
+    content = (body.get("content") or "").strip()
+    if not content:
+        return JSONResponse({"ok": False, "error": "content is empty"}, status_code=400)
+
+    filename = (body.get("filename") or "output.md").strip()
+    encoding = (body.get("encoding") or "utf-8").strip()
+
+    # 生成唯一文件ID，存到 downloads/ 目录
+    _cleanup_downloads()
+    file_id = uuid.uuid4().hex
+    safe_filename = filename.replace("/", "_").replace("..", "_")
+    file_path = DOWNLOADS_DIR / f"{file_id}_{safe_filename}"
+
+    try:
+        file_path.write_bytes(content.encode(encoding, errors="replace"))
+    except Exception as e:
+        return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
+
+    import mimetypes
+    mime = mimetypes.guess_type(safe_filename)[0] or "application/octet-stream"
+
+    return {
+        "ok": True,
+        "file_id": file_id,
+        "filename": safe_filename,
+        "mime": mime,
+        "size": file_path.stat().st_size,
+        "download_url": f"/file/download/{file_id}/{safe_filename}",
+    }
+
+
+@app.get("/file/download/{file_id}/{filename}")
+async def file_download(file_id: str, filename: str):
+    """下载 /file/generate 生成的文件。"""
+    # 安全校验：只允许 hex file_id
+    import re as _re
+    if not _re.match(r'^[0-9a-f]{32}$', file_id):
+        return JSONResponse({"ok": False, "error": "invalid file_id"}, status_code=400)
+
+    safe_filename = filename.replace("/", "_").replace("..", "_")
+    file_path = DOWNLOADS_DIR / f"{file_id}_{safe_filename}"
+
+    if not file_path.exists():
+        return JSONResponse({"ok": False, "error": "file not found"}, status_code=404)
+
+    import mimetypes
+    mime = mimetypes.guess_type(safe_filename)[0] or "application/octet-stream"
+
+    return FileResponse(
+        path=str(file_path),
+        media_type=mime,
+        filename=safe_filename,
+        headers={"Content-Disposition": f'attachment; filename="{safe_filename}"'},
+    )
+
+
 @app.post("/v2/auth/register")
 async def v2_auth_register(req: V2RegisterReq):
     username = (req.username or "").strip().lower()
@@ -10931,7 +13486,7 @@ def health():
         "realtime": {
             "model": REALTIME_MODEL_DEFAULT,
             "voice": REALTIME_VOICE_DEFAULT,
-            "has_default_instructions": bool(REALTIME_DEFAULT_INSTRUCTIONS)
+            "has_default_instructions": bool(_get_realtime_default_instructions())
         },
         "chat": {
             "model": CHAT_MODEL_DEFAULT,
@@ -10975,6 +13530,476 @@ def health():
         },
     }
 # ---- Fix OpenAPI 500 (Pydantic v2 ForwardRef) ----
+
+# ══════════════════════════════════════════════════════════════════
+# ✅ OpenClaw 深度融合 — 项目助手 API
+# FastAPI 后端 ←→ Adu-Agent(OpenClaw) Gateway
+# 文件读写 / 终端执行 / 项目扫描 / 浏览器控制 / Git
+# ══════════════════════════════════════════════════════════════════
+
+# ── Agent 用量计量 ──────────────────────────────────────────────
+import datetime as _dt
+
+_AGENT_LIMITS = {
+    "free": 5,       # 5 次/天
+    "pro": 200,      # 200 次/天
+    "ultra": 99999,  # 无限
+}
+
+# {client_id: {"date": "2026-03-18", "count": 12}}
+_agent_usage: Dict[str, Dict[str, Any]] = {}
+
+
+def _agent_check_quota(request: Request) -> Optional[JSONResponse]:
+    """检查 Agent 操作配额，超限返回 JSONResponse，否则返回 None"""
+    client_id = (request.headers.get("x-client-id") or "anon").strip()[:64]
+    plan = (request.headers.get("x-chatagi-plan") or "free").strip().lower()
+    limit = _AGENT_LIMITS.get(plan, _AGENT_LIMITS["free"])
+
+    today = _dt.date.today().isoformat()
+    usage = _agent_usage.get(client_id)
+    if not usage or usage.get("date") != today:
+        usage = {"date": today, "count": 0, "plan": plan}
+        _agent_usage[client_id] = usage
+
+    if usage["count"] >= limit:
+        return JSONResponse({
+            "ok": False,
+            "error": "agent_quota_exceeded",
+            "message": f"已达今日 Agent 操作上限（{plan}: {limit}次/天）",
+            "plan": plan,
+            "used": usage["count"],
+            "limit": limit,
+        }, status_code=429)
+
+    usage["count"] += 1
+    usage["plan"] = plan
+    return None
+
+
+@app.get("/agent/usage")
+async def agent_usage(request: Request):
+    """查询当前 Agent 用量"""
+    client_id = (request.headers.get("x-client-id") or "anon").strip()[:64]
+    plan = (request.headers.get("x-chatagi-plan") or "free").strip().lower()
+    today = _dt.date.today().isoformat()
+    usage = _agent_usage.get(client_id)
+    if not usage or usage.get("date") != today:
+        used = 0
+    else:
+        used = usage.get("count", 0)
+    limit = _AGENT_LIMITS.get(plan, _AGENT_LIMITS["free"])
+    return {"plan": plan, "used": used, "limit": limit, "date": today}
+
+
+@app.get("/agent/health")
+async def agent_health():
+    """OpenClaw Gateway 连接状态"""
+    try:
+        bridge = get_bridge()
+        return await bridge.health()
+    except Exception as e:
+        return {"status": "error", "error": str(e)}
+
+
+@app.post("/agent/scan")
+async def agent_scan(request: Request):
+    """扫描项目目录，返回文件列表和摘要"""
+    quota_err = _agent_check_quota(request)
+    if quota_err:
+        return quota_err
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    path = body.get("path", "~/GPTsora")
+
+    bridge = await ensure_connected()
+    if not bridge.connected:
+        return JSONResponse({"ok": False, "error": "OpenClaw not connected"}, status_code=503)
+
+    result = await bridge.scan_project(path)
+    return {"ok": True, **result}
+
+
+@app.post("/agent/files")
+async def agent_files(request: Request):
+    """列出目录下的文件"""
+    quota_err = _agent_check_quota(request)
+    if quota_err:
+        return quota_err
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    path = body.get("path", "~/GPTsora")
+    pattern = body.get("pattern", "*.swift")
+
+    bridge = await ensure_connected()
+    if not bridge.connected:
+        return JSONResponse({"ok": False, "error": "OpenClaw not connected"}, status_code=503)
+
+    files = await bridge.list_files(path, pattern)
+    return {"ok": True, "files": files, "count": len(files)}
+
+
+@app.post("/agent/read")
+async def agent_read(request: Request):
+    """读取文件内容"""
+    quota_err = _agent_check_quota(request)
+    if quota_err:
+        return quota_err
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    path = body.get("path", "")
+    if not path:
+        return JSONResponse({"ok": False, "error": "missing path"}, status_code=400)
+
+    bridge = await ensure_connected()
+    if not bridge.connected:
+        return JSONResponse({"ok": False, "error": "OpenClaw not connected"}, status_code=503)
+
+    content = await bridge.read_file(path)
+    lines = content.count("\n") + 1 if content else 0
+    return {"ok": True, "path": path, "content": content, "lines": lines}
+
+
+@app.post("/agent/write")
+async def agent_write(request: Request):
+    """写入文件"""
+    quota_err = _agent_check_quota(request)
+    if quota_err:
+        return quota_err
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    path = body.get("path", "")
+    content = body.get("content", "")
+    if not path:
+        return JSONResponse({"ok": False, "error": "missing path"}, status_code=400)
+
+    bridge = await ensure_connected()
+    if not bridge.connected:
+        return JSONResponse({"ok": False, "error": "OpenClaw not connected"}, status_code=503)
+
+    # Git 备份
+    project_dir = "/".join(path.split("/")[:-1]) or "~"
+    await bridge.exec(f'cd {project_dir} && git add -A && git commit -m "AI backup" --allow-empty 2>/dev/null')
+
+    ok = await bridge.write_file(path, content)
+    return {"ok": ok, "path": path}
+
+
+@app.post("/agent/mac_send")
+async def agent_mac_send(req: Request):
+    """发微信消息接口"""
+    try:
+        b = await req.json()
+        contact = (b.get("contact") or "").strip()
+        message = (b.get("message") or "").strip()
+        if not contact or not message:
+            return JSONResponse({"ok": False, "error": "missing contact or message"})
+        
+        import sys, os
+        sys.path.insert(0, os.path.dirname(__file__))
+        from adu_mac_tools import send_wechat
+        result = send_wechat(contact, message)
+        return JSONResponse({"ok": True, "result": f"已发送给{contact}"})
+    except Exception as e:
+        return JSONResponse({"ok": False, "error": str(e)})
+
+
+@app.post("/agent/exec")
+async def agent_exec(request: Request):
+    """执行终端命令 — 优先本地 subprocess，OpenClaw bridge 作为可选增强"""
+    quota_err = _agent_check_quota(request)
+    if quota_err:
+        return quota_err
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    command = body.get("command", "")
+    if not command:
+        return JSONResponse({"ok": False, "error": "missing command"}, status_code=400)
+
+    timeout = min(body.get("timeout", 30), 120)  # 最大2分钟
+    use_local = body.get("local", True)  # 默认走本地，更快更可靠
+
+    # ✅ 本地 subprocess 直接执行（无需 OpenClaw bridge）
+    if use_local:
+        try:
+            proc = await asyncio.create_subprocess_shell(
+                command,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.STDOUT,
+                env={**os.environ, "TERM": "xterm-256color"},
+            )
+            try:
+                stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+            except asyncio.TimeoutError:
+                proc.kill()
+                return {"ok": False, "error": f"timeout after {timeout}s", "output": ""}
+            output = stdout.decode("utf-8", errors="replace") if stdout else ""
+            return {"ok": True, "output": output, "exit_code": proc.returncode, "via": "local"}
+        except Exception as e:
+            log.warning("[agent/exec] local exec failed: %s, falling back to bridge", e)
+
+    # Fallback: OpenClaw bridge
+    bridge = await ensure_connected()
+    if not bridge.connected:
+        return JSONResponse({"ok": False, "error": "OpenClaw not connected"}, status_code=503)
+
+    output = await bridge.exec(command, timeout=timeout)
+    return {"ok": True, "output": output, "via": "bridge"}
+
+
+@app.post("/agent/build")
+async def agent_build(request: Request):
+    """编译 Xcode 项目 — 本地直接 xcodebuild"""
+    quota_err = _agent_check_quota(request)
+    if quota_err:
+        return quota_err
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    path = os.path.expanduser(body.get("path", "~/Desktop/GPTsora"))
+    scheme = body.get("scheme", "GPT Solara")
+    workspace = body.get("workspace", "GPTsora.xcworkspace")
+    device_id = body.get("device_id", "")  # 可选，指定设备
+
+    dest = f"id={device_id}" if device_id else "generic/platform=iOS"
+    cmd = (
+        f'cd {path} && xcodebuild '
+        f'-workspace {workspace} '
+        f'-scheme "{scheme}" '
+        f'-destination "{dest}" '
+        f'-configuration Debug '
+        f'clean build 2>&1 | tail -60'
+    )
+    try:
+        proc = await asyncio.create_subprocess_shell(
+            cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
+        )
+        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=300)
+        output = stdout.decode("utf-8", errors="replace") if stdout else ""
+    except asyncio.TimeoutError:
+        return {"ok": False, "error": "build timeout (300s)", "output": ""}
+    except Exception as e:
+        return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
+
+    success = "BUILD SUCCEEDED" in output
+    errors = [l for l in output.split("\n") if "error:" in l.lower() and "error: " in l]
+    return {
+        "ok": True,
+        "success": success,
+        "output": output,
+        "errors": errors[:20],
+        "error_count": len(errors),
+    }
+
+
+@app.post("/agent/filetree")
+async def agent_filetree(request: Request):
+    """
+    ✅ 返回项目文件树（供手机端显示）
+    Body: { "path": "~/Desktop/GPTsora", "depth": 3, "extensions": [".swift", ".py"] }
+    """
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+
+    path = body.get("path", "~/Desktop/GPTsora").strip()
+    depth = max(1, min(int(body.get("depth", 3)), 5))
+    exts = body.get("extensions", [".swift", ".py", ".m", ".h"])
+
+    # 用 find 命令生成文件树（本地直接执行）
+    ext_filter = " -o ".join([f'-name "*{e}"' for e in exts])
+    path_expanded = os.path.expanduser(path)
+    cmd = (
+        f'find {path_expanded} -maxdepth {depth} \( {ext_filter} \) '
+        f'-not -path "*/Pods/*" -not -path "*/.git/*" '
+        f'-not -path "*/node_modules/*" -not -path "*/DerivedData/*" '
+        f'| sort'
+    )
+
+    try:
+        proc = await asyncio.create_subprocess_shell(
+            cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=15)
+        output = stdout.decode("utf-8", errors="replace") if stdout else ""
+    except Exception as e:
+        return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
+
+    files = [f.strip() for f in output.split("\n") if f.strip()]
+
+    # 构建树结构
+    tree = {}
+    for f in files:
+        parts = f.replace(path, "").lstrip("/").split("/")
+        node = tree
+        for part in parts[:-1]:
+            node = node.setdefault(part, {})
+        node[parts[-1]] = None
+
+    return {"ok": True, "path": path, "files": files, "count": len(files), "tree": tree}
+
+
+@app.post("/agent/install")
+async def agent_install(request: Request):
+    """
+    ✅ 编译并安装到已连接的 iPhone — 本地直接执行
+    Body: { "path": "~/Desktop/GPTsora", "scheme": "GPT Solara", "device_id": "auto" }
+    """
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+
+    path = os.path.expanduser(body.get("path", "~/Desktop/GPTsora").strip())
+    scheme = body.get("scheme", "GPT Solara").strip()
+    workspace = body.get("workspace", "GPTsora.xcworkspace")
+    device_id = body.get("device_id", "auto").strip()
+
+    # ✅ 本地找已连接设备
+    if device_id == "auto":
+        try:
+            dev_proc = await asyncio.create_subprocess_shell(
+                "xcrun xctrace list devices 2>/dev/null | grep 'iPhone' | grep -v Simulator | head -3",
+                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+            )
+            dev_out, _ = await asyncio.wait_for(dev_proc.communicate(), timeout=10)
+            dev_str = dev_out.decode("utf-8", errors="replace") if dev_out else ""
+            log.info("[agent/install] connected devices: %s", dev_str[:200])
+            # 提取第一个设备ID
+            import re as _re
+            m = _re.search(r'\(([0-9a-f]{40})\)', dev_str)
+            if m:
+                device_id = m.group(1)
+                log.info("[agent/install] auto selected device: %s", device_id)
+        except Exception as e:
+            log.warning("[agent/install] device detection failed: %s", e)
+
+    # ✅ 编译 + 安装
+    dest = f"id={device_id}" if device_id and device_id != "auto" else "generic/platform=iOS"
+    cmd = (
+        f'cd {path} && xcodebuild '
+        f'-workspace {workspace} '
+        f'-scheme "{scheme}" '
+        f'-destination "{dest}" '
+        f'-configuration Debug '
+        f'clean build 2>&1 | tail -50'
+    )
+
+    try:
+        proc = await asyncio.create_subprocess_shell(
+            cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
+        )
+        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=360)
+        output = stdout.decode("utf-8", errors="replace") if stdout else ""
+    except asyncio.TimeoutError:
+        return {"ok": False, "error": "install timeout (360s)", "output": ""}
+    except Exception as e:
+        return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
+
+    success = "BUILD SUCCEEDED" in output
+
+    # ✅ 如果编译成功且有设备，用 devicectl 安装
+    install_output = ""
+    if success and device_id and device_id != "auto":
+        app_path_proc = await asyncio.create_subprocess_shell(
+            f'find ~/Library/Developer/Xcode/DerivedData -name "{scheme}.app" -path "*/Debug-iphoneos/*" | head -1',
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+        )
+        app_out, _ = await app_path_proc.communicate()
+        app_path = (app_out.decode("utf-8", errors="replace") or "").strip()
+        if app_path:
+            inst_proc = await asyncio.create_subprocess_shell(
+                f'xcrun devicectl device install app --device {device_id} "{app_path}" 2>&1',
+                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
+            )
+            inst_out, _ = await asyncio.wait_for(inst_proc.communicate(), timeout=60)
+            install_output = inst_out.decode("utf-8", errors="replace") if inst_out else ""
+            success = success and ("App installed" in install_output or "installed" in install_output.lower())
+
+    errors = [l for l in output.split("\n") if "error:" in l.lower() and "error: " in l]
+    return {
+        "ok": True,
+        "success": success,
+        "build_output": output,
+        "install_output": install_output,
+        "device_id": device_id,
+        "errors": errors[:20],
+        "error_count": len(errors),
+    }
+
+
+@app.post("/agent/search")
+async def agent_search(request: Request):
+    """搜索项目代码"""
+    quota_err = _agent_check_quota(request)
+    if quota_err:
+        return quota_err
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    pattern = body.get("pattern", "")
+    path = body.get("path", "~/GPTsora")
+    file_type = body.get("file_type", "*.swift")
+
+    if not pattern:
+        return JSONResponse({"ok": False, "error": "missing pattern"}, status_code=400)
+
+    bridge = await ensure_connected()
+    if not bridge.connected:
+        return JSONResponse({"ok": False, "error": "OpenClaw not connected"}, status_code=503)
+
+    output = await bridge.search_code(pattern, path, file_type)
+    return {"ok": True, "results": output}
+
+
+@app.post("/agent/git")
+async def agent_git(request: Request):
+    """Git 操作"""
+    quota_err = _agent_check_quota(request)
+    if quota_err:
+        return quota_err
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    action = body.get("action", "status")  # status / commit / log
+    path = body.get("path", "~/GPTsora")
+    message = body.get("message", "AI update")
+
+    bridge = await ensure_connected()
+    if not bridge.connected:
+        return JSONResponse({"ok": False, "error": "OpenClaw not connected"}, status_code=503)
+
+    if action == "commit":
+        output = await bridge.git_commit(path, message)
+    elif action == "log":
+        output = await bridge.exec(f'cd {path} && git log --oneline -10 2>&1')
+    else:
+        output = await bridge.git_status(path)
+
+    return {"ok": True, "action": action, "output": output}
+
+
+# ── Fix OpenAPI 500 (Pydantic v2 ForwardRef) ----
 try:
     V2RegisterReq.model_rebuild()
     V2LoginReq.model_rebuild()
@@ -11108,6 +14133,447 @@ def extract_and_save_memory_facts(user_key: str, user_msg: str, ai_reply: str) -
             _LEGACY_extract_and_save_memory_facts(user_key, user_msg, ai_reply)  # type: ignore
         except Exception:
             return
+
+# ══════════════════════════════════════════════════════════════════════
+# ✅ 四级压缩记忆系统（L0/L1/L2/L3 + MemGPT换入换出）
+# 依赖：memory_module.py 中 CompressionEngine（monkey-patch 到 MemoryEngine）
+# 原有 memory_add / memory_build_context / extract_and_save_memory_facts 完全不动
+# ══════════════════════════════════════════════════════════════════════
+
+def _comp_append_turn(user_key: str, conv_id: str, role: str, content: str) -> None:
+    """写入L0原始轮次（每轮对话后调用）。"""
+    try:
+        if MEMORY_ENGINE is not None and hasattr(MEMORY_ENGINE, "append_turn"):
+            MEMORY_ENGINE.append_turn(user_key, conv_id, role, content)
+    except Exception:
+        pass
+
+def _comp_maybe_compress(user_key: str, conv_id: str = "") -> None:
+    """非阻塞触发压缩流水线 L0→L1→L2（每轮对话后调用）。"""
+    try:
+        if MEMORY_ENGINE is not None and hasattr(MEMORY_ENGINE, "maybe_compress"):
+            MEMORY_ENGINE.maybe_compress(user_key, conv_id)
+    except Exception:
+        pass
+
+def _comp_build_context(user_key: str, conv_id: str = "", query: str = "") -> str:
+    """构建四级压缩上下文（MemGPT换入换出），注入 system prompt。"""
+    try:
+        if MEMORY_ENGINE is not None and hasattr(MEMORY_ENGINE, "build_compression_context"):
+            return MEMORY_ENGINE.build_compression_context(user_key, conv_id=conv_id, query=query)
+    except Exception:
+        pass
+    return ""
+
+def _comp_l3_extract(user_key: str, user_msg: str, ai_reply: str) -> None:
+    """异步提取结构化信息存入L3（与 facts 并行运行）。"""
+    try:
+        if MEMORY_ENGINE is not None and hasattr(MEMORY_ENGINE, "l3_extract_async"):
+            MEMORY_ENGINE.l3_extract_async(user_key, user_msg, ai_reply)
+    except Exception:
+        pass
+
+# ══════════════════════════════════════════════════════════════════════
+# 🚗  AI 视觉导航  /vision/analyze  +  /vision/stream
+# iOS AIVisionNavView 调用。
+# 架构：GPT-4o vision (gpt-4o，detail=low) → 流式文字 → 前端并行 TTS
+#
+# /vision/analyze  — 非流式，返回完整 JSON（兼容旧版 & 测试）
+# /vision/stream   — SSE 流式，iOS 边收 token 边合成语音（延迟 ~1s）
+# ══════════════════════════════════════════════════════════════════════
+
+_VISION_SYSTEM_DRIVING = """你是车载AI视觉助手，分析行车摄像头画面，用简洁中文口语播报，规则：
+- 发现行人/障碍/危险：以「注意，」开头，10字内说明
+- 发现限速牌：说「限速X公里」
+- 发现路口/红绿灯/转弯提示：简短说明
+- 正常路况：5字内或不输出
+- 最后一行固定输出 JSON（不换行）：{"danger":"危险描述或空字符串","speed_limit":数字或null,"lane":true或false}
+只用中文，先播报再输出JSON。"""
+
+_VISION_SYSTEM_MANUAL = """分析这张行车画面，用中文详细描述道路情况、前方障碍、特殊情况。
+最后一行输出 JSON：{"danger":"危险或空字符串","speed_limit":数字或null,"lane":false}"""
+
+
+def _build_vision_messages(base64_image: str, mode: str) -> list:
+    """构建 GPT-4o vision messages，detail=low 节省 token"""
+    system = _VISION_SYSTEM_DRIVING if mode == "driving" else _VISION_SYSTEM_MANUAL
+    return [
+        {"role": "system", "content": system},
+        {"role": "user", "content": [
+            {"type": "image_url", "image_url": {
+                "url": f"data:image/jpeg;base64,{base64_image}",
+                "detail": "low"      # low = 固定 85 tokens，最经济
+            }},
+            {"type": "text", "text": "分析当前画面，先播报，再输出JSON。" if mode == "driving"
+             else "详细描述路况和安全情况，再输出JSON。"}
+        ]}
+    ]
+
+
+@app.post("/vision/analyze")
+async def vision_analyze(req: Request):
+    """
+    非流式视觉分析（兼容旧版 & fallback）。
+    Body: { "base64": "...", "mode": "driving"|"manual" }
+    或 Anthropic 格式（直接透传 messages）。
+    """
+    if not OPENAI_API_KEY:
+        raise HTTPException(status_code=503, detail="OPENAI_API_KEY not configured")
+
+    try:
+        body = await req.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON")
+
+    # ── 两种格式兼容 ──
+    # 格式A（iOS 新版）: { base64, mode }
+    # 格式B（旧版 Anthropic 透传）: { messages, model, max_tokens }
+    if "base64" in body:
+        b64 = body["base64"]
+        mode = body.get("mode", "driving")
+        messages = _build_vision_messages(b64, mode)
+    elif "messages" in body:
+        # 旧版直接透传，转换 Anthropic → OpenAI 格式
+        messages = body.get("messages", [])
+    else:
+        raise HTTPException(status_code=400, detail="Need 'base64' or 'messages'")
+
+    import httpx
+    payload = {
+        "model": "gpt-4o",
+        "max_tokens": 200,
+        "stream": False,
+        "messages": messages,
+    }
+
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            r = await client.post(
+                "https://api.openai.com/v1/chat/completions",
+                json=payload,
+                headers={
+                    "Authorization": f"Bearer {OPENAI_API_KEY}",
+                    "Content-Type": "application/json",
+                },
+            )
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"OpenAI request failed: {e}")
+
+    if r.status_code != 200:
+        raise HTTPException(status_code=502, detail=f"OpenAI error {r.status_code}: {r.text[:300]}")
+
+    data = r.json()
+    text = data.get("choices", [{}])[0].get("message", {}).get("content", "")
+    usage = data.get("usage", {})
+
+    return JSONResponse({
+        "ok": True,
+        "text": text,
+        "usage": usage,
+        # 兼容旧版 Anthropic 格式（iOS fallback 解析）
+        "content": [{"type": "text", "text": text}],
+    })
+
+
+@app.post("/vision/stream")
+async def vision_stream(req: Request):
+    """
+    流式视觉分析 — GPT-4o vision SSE。
+    iOS 边收 token 边按句子切割送 TTS，首字延迟 ~0.4s。
+
+    Body: { "base64": "...", "mode": "driving"|"manual" }
+    Response: text/event-stream  (OpenAI SSE 格式直通)
+    """
+    if not OPENAI_API_KEY:
+        raise HTTPException(status_code=503, detail="OPENAI_API_KEY not configured")
+
+    try:
+        body = await req.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON")
+
+    b64  = body.get("base64", "")
+    mode = body.get("mode", "driving")
+
+    if not b64:
+        raise HTTPException(status_code=400, detail="Missing 'base64' field")
+
+    messages = _build_vision_messages(b64, mode)
+
+    payload = {
+        "model": "gpt-4o",
+        "max_tokens": 150,
+        "stream": True,
+        "messages": messages,
+    }
+
+    import httpx
+
+    async def generate():
+        try:
+            async with httpx.AsyncClient(timeout=20.0) as client:
+                async with client.stream(
+                    "POST",
+                    "https://api.openai.com/v1/chat/completions",
+                    json=payload,
+                    headers={
+                        "Authorization": f"Bearer {OPENAI_API_KEY}",
+                        "Content-Type": "application/json",
+                    },
+                ) as resp:
+                    if resp.status_code != 200:
+                        err = await resp.aread()
+                        yield f"data: {{\"error\": \"{resp.status_code}\"}}\n\n"
+                        return
+                    async for chunk in resp.aiter_text():
+                        if chunk:
+                            yield chunk
+        except Exception as e:
+            yield f"data: {{\"error\": \"{str(e)[:100]}\"}}\n\n"
+
+    return StreamingResponse(
+        generate(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",   # 关闭 nginx 缓冲，确保实时推送
+        },
+    )
+
+
+# ── /vision/tts  并行 TTS 代理 ───────────────────────────────────────
+# iOS 收到完整句子后调此接口合成 MP3，边下边播。
+# Body: { "text": "注意，前方有行人", "voice": "nova", "speed": 1.1 }
+# ─────────────────────────────────────────────────────────────────────
+@app.post("/vision/tts")
+async def vision_tts(req: Request):
+    """OpenAI TTS-1 代理，供视觉导航并行语音合成使用"""
+    if not OPENAI_API_KEY:
+        raise HTTPException(status_code=503, detail="OPENAI_API_KEY not configured")
+
+    try:
+        body = await req.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON")
+
+    text  = (body.get("text") or "").strip()
+    voice = body.get("voice", "nova")      # nova=女声自然，alloy/echo/fable/onyx/shimmer
+    speed = float(body.get("speed", 1.1))
+    fmt   = body.get("format", "mp3")
+
+    if not text:
+        raise HTTPException(status_code=400, detail="Missing 'text'")
+    if len(text) > 300:
+        text = text[:300]   # TTS 单次上限保护
+
+    import httpx
+
+    payload = {
+        "model": "tts-1",          # tts-1 延迟最低；tts-1-hd 质量更好但慢 ~1s
+        "input": text,
+        "voice": voice,
+        "speed": max(0.25, min(4.0, speed)),
+        "response_format": fmt,
+    }
+
+    async def stream_audio():
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            async with client.stream(
+                "POST",
+                "https://api.openai.com/v1/audio/speech",
+                json=payload,
+                headers={"Authorization": f"Bearer {OPENAI_API_KEY}"},
+            ) as resp:
+                if resp.status_code != 200:
+                    return
+                async for chunk in resp.aiter_bytes(chunk_size=4096):
+                    yield chunk
+
+    media_type = "audio/mpeg" if fmt == "mp3" else "audio/opus"
+    return StreamingResponse(
+        stream_audio(),
+        media_type=media_type,
+        headers={"Cache-Control": "no-cache"},
+    )
+
+
+# ════════════════════════════════════════════════════════════════════════
+# 阿杜屏幕共享 WebSocket 路由 v0.1
+# Mac 端 (adu-bridge) 推帧 → 后端中继 → iOS 订阅
+# Mac 端 接收控制指令 → CGEvent 执行
+# ════════════════════════════════════════════════════════════════════════
+
+import asyncio as _asyncio_screen
+import json as _json_screen
+
+# user_key → {"mac": WebSocket | None, "ios": Set[WebSocket], "control_mac": WebSocket | None}
+SCREEN_POOL: Dict[str, Dict[str, Any]] = {}
+_SCREEN_LOCK = _asyncio_screen.Lock()
+
+
+async def _screen_pool_get(user_key: str) -> Dict[str, Any]:
+    async with _SCREEN_LOCK:
+        if user_key not in SCREEN_POOL:
+            SCREEN_POOL[user_key] = {
+                "mac": None,
+                "ios": set(),
+                "control_mac": None,
+            }
+        return SCREEN_POOL[user_key]
+
+
+# ─────────── /ws/screen/push/{user_key} — Mac 推帧进来 ───────────
+
+@app.websocket("/ws/screen/push/{user_key}")
+async def ws_screen_push(ws: WebSocket, user_key: str):
+    await ws.accept()
+    pool = await _screen_pool_get(user_key)
+    pool["mac"] = ws
+    print(f"[screen-push] Mac connected user={user_key[:8]}")
+
+    # 通知所有 iOS 订阅者:Mac 上线了
+    for sub in list(pool["ios"]):
+        try:
+            await sub.send_text(_json_screen.dumps({"type": "status", "mac_online": True}))
+        except Exception:
+            pass
+
+    try:
+        while True:
+            msg = await ws.receive_text()
+            # 广播帧给所有 iOS 订阅者
+            dead = []
+            for sub in list(pool["ios"]):
+                try:
+                    await sub.send_text(msg)
+                except Exception:
+                    dead.append(sub)
+            for d in dead:
+                pool["ios"].discard(d)
+
+    except WebSocketDisconnect:
+        pass
+    except Exception as e:
+        print(f"[screen-push] err: {e}")
+    finally:
+        if pool.get("mac") is ws:
+            pool["mac"] = None
+        # 通知所有 iOS:Mac 下线
+        for sub in list(pool["ios"]):
+            try:
+                await sub.send_text(_json_screen.dumps({"type": "status", "mac_online": False}))
+            except Exception:
+                pass
+        print(f"[screen-push] Mac left user={user_key[:8]}")
+
+
+# ─────────── /ws/screen/subscribe/{user_key} — iOS 订阅帧 ───────────
+
+@app.websocket("/ws/screen/subscribe/{user_key}")
+async def ws_screen_subscribe(ws: WebSocket, user_key: str):
+    await ws.accept()
+    pool = await _screen_pool_get(user_key)
+    pool["ios"].add(ws)
+    print(f"[screen-sub] iOS subscribed user={user_key[:8]} total={len(pool['ios'])}")
+
+    try:
+        # 初始 status
+        mac_online = pool.get("mac") is not None
+        await ws.send_text(_json_screen.dumps({"type": "status", "mac_online": mac_online}))
+
+        while True:
+            msg = await ws.receive_text()
+            # iOS 端发来的控制指令 → 转给 Mac
+            try:
+                obj = _json_screen.loads(msg)
+                if obj.get("type") == "control":
+                    ctrl = pool.get("control_mac") or pool.get("mac")
+                    if ctrl:
+                        await ctrl.send_text(_json_screen.dumps(obj.get("payload") or {}))
+                    else:
+                        # 回包告知 iOS:Mac 没连
+                        await ws.send_text(_json_screen.dumps({
+                            "type": "control_result",
+                            "payload": {"ok": False, "error": "Mac offline"},
+                        }))
+            except Exception:
+                pass
+
+    except WebSocketDisconnect:
+        pass
+    except Exception as e:
+        print(f"[screen-sub] err: {e}")
+    finally:
+        pool["ios"].discard(ws)
+        print(f"[screen-sub] iOS left user={user_key[:8]} remaining={len(pool['ios'])}")
+
+
+# ─────────── /ws/control/{user_key} — Mac 订阅控制指令(双向通道) ───────────
+
+@app.websocket("/ws/control/{user_key}")
+async def ws_screen_control(ws: WebSocket, user_key: str):
+    await ws.accept()
+    pool = await _screen_pool_get(user_key)
+    pool["control_mac"] = ws
+    print(f"[control] Mac control channel user={user_key[:8]}")
+
+    try:
+        while True:
+            # Mac 执行完指令的回包 → 广播给所有 iOS 订阅者
+            msg = await ws.receive_text()
+            try:
+                payload = _json_screen.loads(msg)
+            except Exception:
+                payload = {"raw": msg}
+
+            for sub in list(pool["ios"]):
+                try:
+                    await sub.send_text(_json_screen.dumps({
+                        "type": "control_result",
+                        "payload": payload,
+                    }))
+                except Exception:
+                    pass
+
+    except WebSocketDisconnect:
+        pass
+    except Exception as e:
+        print(f"[control] err: {e}")
+    finally:
+        if pool.get("control_mac") is ws:
+            pool["control_mac"] = None
+        print(f"[control] Mac control left user={user_key[:8]}")
+
+
+# ─────────── HTTP 辅助:状态查询 + 直接下发指令(给前端调试用) ───────────
+
+@app.get("/screen/status/{user_key}")
+async def screen_status(user_key: str):
+    pool = SCREEN_POOL.get(user_key) or {}
+    return {
+        "mac_online": pool.get("mac") is not None,
+        "control_online": pool.get("control_mac") is not None,
+        "ios_subscribers": len(pool.get("ios", set())),
+    }
+
+
+@app.post("/screen/control/{user_key}")
+async def screen_control_http(user_key: str, req: Request):
+    pool = SCREEN_POOL.get(user_key) or {}
+    ctrl = pool.get("control_mac") or pool.get("mac")
+    if not ctrl:
+        return JSONResponse({"ok": False, "error": "Mac 未连接"}, status_code=503)
+    try:
+        body = await req.json()
+    except Exception:
+        body = {}
+    try:
+        await ctrl.send_text(_json_screen.dumps(body))
+        return {"ok": True}
+    except Exception as e:
+        return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
+
+
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(
@@ -11118,6 +14584,51 @@ if __name__ == "__main__":
         log_level="info",
         access_log=False,
     )
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 
