@@ -13693,6 +13693,72 @@ async def agent_write(request: Request):
     return {"ok": ok, "path": path}
 
 
+@app.post("/agent/tools")
+async def agent_tools(req: Request):
+    """
+    ✅ 统一工具调用接口（iOS 直接调，不走 AI 回复解析）
+    POST /agent/tools
+    Body: {
+      "tool": "exec" | "read_file" | "write_file" | "search_code",
+      "params": { ... 工具参数 ... },
+      "confirm": false   // 高危操作确认标志
+    }
+    """
+    try:
+        body = await req.json()
+    except Exception:
+        return JSONResponse({"ok": False, "output": "invalid JSON"}, status_code=400)
+
+    try:
+        from agent_intent_router import handle_agent_tools_request
+        result = await handle_agent_tools_request(body)
+        return JSONResponse(result)
+    except Exception as e:
+        log.exception("[agent/tools] error")
+        return JSONResponse({"ok": False, "output": str(e)}, status_code=500)
+
+
+@app.get("/agent/tools/info")
+async def agent_tools_info():
+    """列出所有可用工具及其参数说明"""
+    return {
+        "tools": [
+            {
+                "name": "exec",
+                "description": "执行终端命令",
+                "params": {"command": "str", "timeout": "int (default: 60)"},
+                "safety": "危险命令自动拦截，高危操作需 confirm=true",
+            },
+            {
+                "name": "read_file",
+                "description": "读取文件内容",
+                "params": {"path": "str", "start_line": "int?", "end_line": "int?"},
+                "safety": "只允许工作区路径（GPTsora/backend/chatterbox/frontend）",
+            },
+            {
+                "name": "write_file",
+                "description": "写入文件（始终需要 confirm=true）",
+                "params": {"path": "str", "content": "str"},
+                "safety": "只允许工作区路径，自动 git 备份，始终需要确认",
+            },
+            {
+                "name": "search_code",
+                "description": "搜索代码关键词",
+                "params": {"keyword": "str", "path": "str?", "ext": "str?"},
+                "safety": "只搜索工作区，最多返回50条结果",
+            },
+        ],
+        "safe_roots": [
+            "~/Desktop/GPTsora",
+            "~/Desktop/backend",
+            "~/Desktop/chatterbox",
+            "~/Desktop/frontend",
+            "~/.openclaw/workspace",
+            "/tmp",
+        ]
+    }
+
+
 @app.post("/agent/mac_send")
 async def agent_mac_send(req: Request):
     """发微信消息接口"""
@@ -13948,7 +14014,7 @@ async def agent_install(request: Request):
 
 @app.post("/agent/search")
 async def agent_search(request: Request):
-    """搜索项目代码"""
+    """搜索项目代码（兼容旧接口）"""
     quota_err = _agent_check_quota(request)
     if quota_err:
         return quota_err
@@ -13957,18 +14023,119 @@ async def agent_search(request: Request):
     except Exception:
         body = {}
     pattern = body.get("pattern", "")
-    path = body.get("path", "~/GPTsora")
+    path = body.get("path", "~/Desktop/GPTsora")
     file_type = body.get("file_type", "*.swift")
 
     if not pattern:
         return JSONResponse({"ok": False, "error": "missing pattern"}, status_code=400)
 
-    bridge = await ensure_connected()
-    if not bridge.connected:
-        return JSONResponse({"ok": False, "error": "OpenClaw not connected"}, status_code=503)
+    from adu_computer_tools import tool_search_code
+    result = await tool_search_code(
+        keyword=pattern,
+        path=path,
+        file_pattern=file_type,
+    )
+    return {"ok": result["ok"], "results": result.get("output", ""), **result}
 
-    output = await bridge.search_code(pattern, path, file_type)
-    return {"ok": True, "results": output}
+
+# ══════════════════════════════════════════════════════════════════════
+# ✅ 统一电脑控制工具 API — v1
+#    POST /agent/tool  → dispatch_tool(name, params)
+#    GET  /agent/tools → 返回工具列表和安全配置
+# ══════════════════════════════════════════════════════════════════════
+
+try:
+    from adu_computer_tools import dispatch_tool, get_security_config, TOOL_DEFINITIONS
+    _computer_tools_loaded = True
+    log.info("[ComputerTools] ✅ adu_computer_tools loaded (5 tools)")
+except Exception as _ct_err:
+    _computer_tools_loaded = False
+    log.warning("[ComputerTools] ❌ failed to load: %s", _ct_err)
+
+
+@app.get("/agent/tools")
+async def agent_tools_list():
+    """返回可用工具列表和安全配置"""
+    if not _computer_tools_loaded:
+        return JSONResponse({"ok": False, "error": "computer tools not loaded"}, status_code=503)
+    cfg = get_security_config()
+    return {
+        "ok": True,
+        "tools": TOOL_DEFINITIONS,
+        "security": cfg,
+    }
+
+
+@app.post("/agent/tool")
+async def agent_tool_dispatch(request: Request):
+    """
+    统一工具调用入口。
+
+    Body:
+    {
+        "tool": "exec" | "read_file" | "write_file" | "search_code" | "list_dir",
+        "params": { ... }  // 工具参数
+    }
+
+    Response:
+    {
+        "ok": bool,
+        "output": str,       // exec / search_code
+        "content": str,      // read_file
+        "files": [...],      // list_dir
+        "blocked": bool,     // 安全拦截
+        "reason": str,       // 拦截原因
+        "requires_confirm": bool  // 需要用户确认
+    }
+    """
+    if not _computer_tools_loaded:
+        return JSONResponse({"ok": False, "error": "computer tools not loaded"}, status_code=503)
+
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"ok": False, "error": "invalid JSON"}, status_code=400)
+
+    tool_name = (body.get("tool") or body.get("name") or "").strip()
+    params = body.get("params") or {}
+
+    if not tool_name:
+        return JSONResponse({"ok": False, "error": "missing tool name"}, status_code=400)
+
+    log.info("[ComputerTools] tool=%s params=%s", tool_name, str(params)[:200])
+
+    result = await dispatch_tool(tool_name, params)
+
+    # 记录安全拦截
+    if result.get("blocked"):
+        log.warning("[ComputerTools] BLOCKED tool=%s reason=%s", tool_name, result.get("reason"))
+
+    return result
+
+
+@app.get("/agent/security")
+async def agent_security_config():
+    """查询当前安全策略"""
+    if not _computer_tools_loaded:
+        return JSONResponse({"ok": False, "error": "computer tools not loaded"}, status_code=503)
+    return {"ok": True, **get_security_config()}
+
+
+@app.post("/agent/security/allow_root")
+async def agent_add_allowed_root(request: Request):
+    """添加允许的根目录（扩大工作区范围）"""
+    if not _computer_tools_loaded:
+        return JSONResponse({"ok": False, "error": "computer tools not loaded"}, status_code=503)
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"ok": False, "error": "invalid JSON"}, status_code=400)
+    path = (body.get("path") or "").strip()
+    if not path:
+        return JSONResponse({"ok": False, "error": "missing path"}, status_code=400)
+    from adu_computer_tools import add_allowed_root
+    add_allowed_root(path)
+    return {"ok": True, "message": f"已添加允许根目录：{path}"}
 
 
 @app.post("/agent/git")
