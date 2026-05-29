@@ -51,11 +51,73 @@ from contextlib import asynccontextmanager
 import requests
 try:
     import websockets  # type: ignore
-    # ✅ OpenClaw 深度融合
-    from openclaw_bridge import get_bridge, ensure_connected, OpenClawBridge
-    from agent_intent_router import inject_agent_system_prompt, process_agent_actions_sync
 except Exception:  # pragma: no cover
     websockets = None  # type: ignore
+
+# ✅ Apple Sign In：PyJWT 用于验证 Apple 颁发的 RS256 identity token
+#    pip install "pyjwt[crypto]"
+try:
+    import jwt as _pyjwt  # type: ignore
+    from jwt.algorithms import RSAAlgorithm as _RSAAlgorithm  # type: ignore
+    _APPLE_JWT_AVAILABLE = True
+except Exception:
+    _pyjwt = None  # type: ignore
+    _RSAAlgorithm = None  # type: ignore
+    _APPLE_JWT_AVAILABLE = False
+
+# ===== OpenClaw 主链 import 已关闭（运行时只走本地系统）=====
+# 文件其它位置仍有引用，统一设为 None / 空操作，让 try/except 兜住
+def _openclaw_disabled(*_args, **_kwargs):
+    raise RuntimeError("OpenClaw runtime bridge disabled (local-only mode)")
+get_bridge = _openclaw_disabled  # type: ignore
+ensure_connected = _openclaw_disabled  # type: ignore
+OpenClawBridge = None  # type: ignore
+inject_agent_system_prompt = lambda *a, **kw: None  # type: ignore
+def process_agent_actions_sync(text, bridge=None, *_, **__):  # type: ignore
+    return text, []
+
+
+def _openclaw_runtime_enabled() -> bool:
+    """Return True only when the legacy OpenClaw bridge is actually available.
+
+    The current backend runs in local-agent-only mode, so OpenClaw symbols are
+    intentionally replaced by no-op/disabled stubs. This guard prevents disabled
+    legacy code from producing noisy warnings after every chat turn.
+    """
+    try:
+        if OpenClawBridge is None:
+            return False
+        if getattr(get_bridge, "__name__", "") == "_openclaw_disabled":
+            return False
+        return callable(get_bridge)
+    except Exception:
+        return False
+
+
+def _openclaw_get_bridge_or_none():
+    if not _openclaw_runtime_enabled():
+        return None
+    try:
+        return get_bridge()
+    except Exception:
+        return None
+
+
+def _openclaw_disabled_payload() -> Dict[str, Any]:
+    return {
+        "ok": False,
+        "error": "openclaw_disabled_local_agent_only",
+        "message": "Legacy OpenClaw bridge is disabled. Use local-agent /api/brain/computer or /agent/exec local mode instead.",
+    }
+
+# ===== 本地电脑总代理 =====
+from local_computer_agent import router as local_agent_router, bootstrap_local_agent
+
+# ✅ BrainState Engine: APP 大脑状态张量 / 思维主体层
+try:
+    from brain_state_engine import BrainStateEngine
+except Exception:  # pragma: no cover
+    BrainStateEngine = None  # type: ignore
 from fastapi import FastAPI, UploadFile, File, Form, Request, Header, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse, StreamingResponse, Response, FileResponse
 from fastapi.staticfiles import StaticFiles  # ✅ Studio 网页版
@@ -64,6 +126,12 @@ from dotenv import load_dotenv
 
 # ✅✅✅ 必须最先加载 .env（否则 home_chat/billing/auth import 会读不到 OPENAI_API_KEY）
 load_dotenv()
+
+# ✅ 旧电脑自动任务链路已删除：不再加载 adu_auto_brain_v2 / computer_task_center / voice computer bridge
+auto_brain = None  # type: ignore
+brain_router = None  # type: ignore
+def looks_like_computer_task(_text: str) -> bool:  # type: ignore
+    return False
 
 # ✅ routers（都放在 load_dotenv 之后）
 from routers.home_chat import router as home_chat_router
@@ -92,6 +160,32 @@ except Exception:  # pragma: no cover
 
 # Debug/lab switch: export HOME_FORCE_ON=1 to always force home mode on /session.
 HOME_FORCE_ON = (os.getenv("HOME_FORCE_ON") or "").strip().lower() in ("1", "true", "yes", "on")
+
+# ✅ 语义打断控制符：只给后端/控制层识别，禁止展示/播报给用户。
+SEMANTIC_INTERRUPT_TOKEN = "__SEMANTIC_INTERRUPT__"
+
+def _semantic_interrupt_protocol_block() -> str:
+    return (
+        "\n\n【语义打断协议（极其重要）】\n"
+        "当你正在回答上一轮内容时，如果用户中途插话，你必须根据上下文和用户当前语句判断是否有打断本轮回答、纠正、改口、换话题或停止当前回答的意思。\n"
+        "如果只是附和或鼓励继续，例如：嗯、对、好、继续、然后呢、你接着说，不要触发打断，继续当前回答。\n"
+        "如果用户表达否定、纠正、停止、改口、换任务，例如：等一下、不是这个、你理解错了、别说了、我不是这个意思、我是说、换一个、先别讲这个，必须触发语义打断。\n"
+        f"触发时，你输出的第一个字符必须是控制符：{SEMANTIC_INTERRUPT_TOKEN}，后面紧跟一行 JSON，例如："
+        f"{SEMANTIC_INTERRUPT_TOKEN}{{\"reason\":\"user_correction\",\"mode\":\"replace_current_turn\"}}\n"
+        "这个控制符只给后端/控制层使用，不是给用户看的内容；不要解释它，不要把它当成回复正文。\n"
+        "输出该控制符后，立即停止继续上一轮未完成内容，并基于用户的新语句继续新的对话内容。\n"
+    )
+
+def _ensure_semantic_interrupt_protocol(instructions: Optional[str]) -> Optional[str]:
+    text = (instructions or "").strip()
+    if not text:
+        return instructions
+    # 家居专用模式要求只输出 HOME_CMD，不能混入语义打断协议。
+    if "HOME_CMD" in text and "家居控制" in text:
+        return text
+    if SEMANTIC_INTERRUPT_TOKEN in text:
+        return text
+    return text.rstrip() + _semantic_interrupt_protocol_block()
 
 
 def _home_instructions_ios_protocol(req: Request, client_id: Optional[str]) -> str:
@@ -133,6 +227,22 @@ def _home_instructions_ios_protocol(req: Request, client_id: Optional[str]) -> s
 
 # ✅ billing / auth routers (keep your existing business logic)
 from billing import router as billing_router
+try:
+    from billing import (
+        billing_guard_or_403,
+        billing_get_effective_plan,
+        FEATURE_TEXT,
+        FEATURE_IMAGE,
+        FEATURE_REALTIME,
+        FEATURE_VIDEO,
+    )
+except Exception:  # pragma: no cover
+    billing_guard_or_403 = None  # type: ignore
+    billing_get_effective_plan = None  # type: ignore
+    FEATURE_TEXT = "text"
+    FEATURE_IMAGE = "image"
+    FEATURE_REALTIME = "realtime"
+    FEATURE_VIDEO = "video"
 from auth import router as auth_router
 
 # ✅ Agent Loop router (高级编程版：工程内循环)
@@ -140,6 +250,13 @@ try:
     from agent_loop_router import router as agent_loop_router
 except Exception:
     agent_loop_router = None
+
+# ✅ V1 工程修复：用 module 句柄程序化调用 agent_loop_router 内部 STORE / _run_worker
+#    与上面的 `agent_loop_router`（FastAPI router 对象）是不同符号，避免命名冲突。
+try:
+    import agent_loop_router as _agent_loop_module
+except Exception:
+    _agent_loop_module = None
 
 
 # -----------------------------
@@ -169,15 +286,43 @@ REALTIME_VOICE_DEFAULT = (os.getenv("REALTIME_VOICE") or "alloy").strip()
 
 # ---- Qwen Omni Realtime (DashScope) ----
 # Provider routing: "openai" (default) | "qwen" | "auto" (try qwen first, fallback openai)
-REALTIME_PROVIDER = (os.getenv("REALTIME_PROVIDER") or "openai").strip().lower()
+REALTIME_PROVIDER = (os.getenv("REALTIME_PROVIDER") or "qwen").strip().lower()
 DASHSCOPE_API_KEY = (os.getenv("DASHSCOPE_API_KEY") or "").strip()
-QWEN_REALTIME_MODEL = (os.getenv("QWEN_REALTIME_MODEL") or "qwen3-omni-flash-realtime").strip()
-QWEN_REALTIME_VOICE = (os.getenv("QWEN_REALTIME_VOICE") or "Cherry").strip()  # 49种音色可选
+QWEN_REALTIME_MODEL = (os.getenv("QWEN_REALTIME_MODEL") or "qwen3.5-omni-flash-realtime").strip()
+QWEN_REALTIME_ENABLE_TOOLS = (os.getenv("QWEN_REALTIME_ENABLE_TOOLS") or "0").strip().lower() in ("1", "true", "yes", "on")
+# Qwen3.5-Omni-Realtime 官方示例/默认音色使用 Tina；Qwen3-Omni-Flash 默认 Cherry。
+_QWEN_REALTIME_DEFAULT_VOICE = "Tina" if QWEN_REALTIME_MODEL.lower().startswith("qwen3.5-") else "Cherry"
+QWEN_REALTIME_VOICE = (os.getenv("QWEN_REALTIME_VOICE") or _QWEN_REALTIME_DEFAULT_VOICE).strip()
 QWEN_REALTIME_BASE_URL = (os.getenv("QWEN_REALTIME_BASE_URL") or "wss://dashscope-intl.aliyuncs.com").strip().rstrip("/")
 # Qwen 会话时长上限 120 分钟（vs OpenAI 15分钟）
 # ✅ 修正：Qwen Omni Realtime 输出格式为 pcm（即 PCM16 24kHz），不是 pcm24
 # 官方文档 output_audio_format 只支持 "pcm"，实际输出 PCM16 little-endian 24kHz mono
 QWEN_REALTIME_OUTPUT_PCM24 = False  # 强制关闭，不再依赖环境变量
+
+# ---- Qwen Realtime turn detection / barge-in ----
+# 阿里官方 client-events 文档明确：turn_detection.type 只接受 "server_vad"。
+# semantic_vad 不是协议里的 type 取值，而是 Qwen3.5-Omni-Realtime 模型层的"避免
+# 附和声/背景音误打断"能力（自动随模型生效）。之前默认 semantic_vad +
+# interrupt_response=true 这套是 OpenAI Realtime 风格的字段，Qwen 服务端会
+# 静默忽略，导致以为开了 interrupt_response 实际从未生效，是打断不彻底的根因之一。
+# 真正的 Qwen 打断流程：服务端 server_vad 触发 speech_started → 客户端清播放队列
+# + 发 response.cancel + 用 userIsSpeaking gate 丢弃后续 audio.delta。
+QWEN_REALTIME_VAD_TYPE = (os.getenv("QWEN_REALTIME_VAD_TYPE") or "server_vad").strip().lower()
+try:
+    QWEN_REALTIME_VAD_THRESHOLD = float(os.getenv("QWEN_REALTIME_VAD_THRESHOLD") or "0.5")
+except Exception:
+    QWEN_REALTIME_VAD_THRESHOLD = 0.5
+try:
+    QWEN_REALTIME_SILENCE_DURATION_MS = int(os.getenv("QWEN_REALTIME_SILENCE_DURATION_MS") or "800")
+except Exception:
+    QWEN_REALTIME_SILENCE_DURATION_MS = 800
+try:
+    QWEN_REALTIME_PREFIX_PADDING_MS = int(os.getenv("QWEN_REALTIME_PREFIX_PADDING_MS") or "300")
+except Exception:
+    QWEN_REALTIME_PREFIX_PADDING_MS = 300
+# 兼容保留：这两个开关 Qwen 不识别，仅用于日志/向后兼容；真实生效字段见 _qwen_realtime_ephemeral。
+QWEN_REALTIME_CREATE_RESPONSE = (os.getenv("QWEN_REALTIME_CREATE_RESPONSE") or "1").strip().lower() not in ("0", "false", "no", "off")
+QWEN_REALTIME_INTERRUPT_RESPONSE = (os.getenv("QWEN_REALTIME_INTERRUPT_RESPONSE") or "1").strip().lower() not in ("0", "false", "no", "off")
 
 # ✅ Realtime 语音助手 = 文本助手的同一个人格
 #    base 身份从 CHAT_SYSTEM_STYLE_PROMPT 继承，追加语音特有的交互规则。
@@ -298,9 +443,20 @@ DEEPSEEK_FALLBACK_TO_OPENAI = (os.getenv("DEEPSEEK_FALLBACK_TO_OPENAI") or "1").
 
 # OpenAI text model used when provider=openai (allow_web=true or fallback/attachments)
 OPENAI_TEXT_MODEL = (os.getenv("OPENAI_TEXT_MODEL") or CHAT_MODEL_DEFAULT).strip() or CHAT_MODEL_DEFAULT
+# OpenAI model used ONLY for live web-search turns. Keeps normal V1 chat on Qwen, but search on OpenAI built-in web_search.
+OPENAI_WEB_SEARCH_MODEL = (os.getenv("OPENAI_WEB_SEARCH_MODEL") or os.getenv("WEB_SEARCH_MODEL") or OPENAI_TEXT_MODEL or "gpt-4o-mini").strip() or "gpt-4o-mini"
 
 # If true, allow the client payload to override the chat model.
-CHAT_ALLOW_CLIENT_MODEL = (os.getenv("CHAT_ALLOW_CLIENT_MODEL") or "0").strip().lower() in ("1","true","yes","on")
+CHAT_ALLOW_CLIENT_MODEL = (os.getenv("CHAT_ALLOW_CLIENT_MODEL") or "1").strip().lower() in ("1","true","yes","on")
+CHAT_TRUST_CLIENT_PLAN = (os.getenv("CHAT_TRUST_CLIENT_PLAN") or "1").strip().lower() in ("1","true","yes","on")
+
+# Local four-plan/model testing build: bypass billing quotas by default so /chat and /chat/prepare
+# do not require Postgres/psycopg2. Set FOUR_PLAN_DEBUG_BYPASS_BILLING=0 to restore billing gates.
+FOUR_PLAN_DEBUG_BYPASS_BILLING = (
+    os.getenv("FOUR_PLAN_DEBUG_BYPASS_BILLING")
+    or os.getenv("CHAT_FOUR_PLAN_DEBUG_BYPASS_BILLING")
+    or "1"
+).strip().lower() in ("1", "true", "yes", "on")
 
 # Server-side streaming TTS (sentence-by-sentence while text streams). Default OFF (manual speaker playback).
 CHAT_ENABLE_TTS_STREAMING = (os.getenv("CHAT_ENABLE_TTS_STREAMING") or "0").strip().lower() in ("1","true","yes","on")
@@ -309,6 +465,9 @@ CHAT_ENABLE_TTS_STREAMING = (os.getenv("CHAT_ENABLE_TTS_STREAMING") or "0").stri
 DEEPSEEK_API_KEY = (os.getenv("DEEPSEEK_API_KEY") or "").strip()
 DEEPSEEK_BASE_URL = (os.getenv("DEEPSEEK_BASE_URL") or "https://api.deepseek.com").strip().rstrip("/")
 DEEPSEEK_MODEL_DEFAULT = (os.getenv("DEEPSEEK_MODEL") or "deepseek-reasoner").strip()
+# DeepSeek V4 alias target. Set this to the exact model id shown in your DeepSeek console.
+# If the console does not expose a V4 id yet, keep DEEPSEEK_MODEL as the working production model.
+DEEPSEEK_V4_MODEL = (os.getenv("DEEPSEEK_V4_MODEL") or os.getenv("DEEPSEEK_MODEL_V4") or DEEPSEEK_MODEL_DEFAULT or "deepseek-reasoner").strip()
 
 # ——————— Smart Router (中国模型智能路由) ———————
 SILICONFLOW_API_KEY = (os.getenv("SILICONFLOW_API_KEY") or "").strip()
@@ -317,11 +476,33 @@ GOOGLE_API_KEY_ENV = (os.getenv("GOOGLE_API_KEY") or "").strip()
 # ---- DashScope / Qwen (阿里云百炼) ----
 DASHSCOPE_API_KEY = (os.getenv("DASHSCOPE_API_KEY") or "").strip()
 DASHSCOPE_BASE_URL = (os.getenv("DASHSCOPE_BASE_URL") or "https://dashscope-us.aliyuncs.com/compatible-mode/v1").strip().rstrip("/")
-DASHSCOPE_MODEL_DEFAULT = (os.getenv("DASHSCOPE_MODEL") or "qwen3.5-plus").strip()
+DASHSCOPE_MODEL_DEFAULT = (os.getenv("DASHSCOPE_MODEL") or "qwen3.6-plus").strip()
 try:
     DASHSCOPE_TIMEOUT_SEC = float(os.getenv("DASHSCOPE_TIMEOUT_SEC") or "120")
 except Exception:
     DASHSCOPE_TIMEOUT_SEC = 120.0
+
+# ---- Capability Smart Router (model-driven intent routing) ----
+# The client flag `allow_web` only means web is permitted. Text turns are routed by
+# a lightweight model classifier, not by a keyword-only gate.
+SMART_ROUTER_LLM_ENABLED = (os.getenv("SMART_ROUTER_LLM_ENABLED") or "1").strip().lower() not in ("0", "false", "no", "off")
+SMART_ROUTER_FAST_PATH_ENABLED = (os.getenv("SMART_ROUTER_FAST_PATH_ENABLED") or "1").strip().lower() not in ("0", "false", "no", "off")
+SMART_ROUTER_LLM_PROVIDER = (os.getenv("SMART_ROUTER_LLM_PROVIDER") or "dashscope").strip().lower()
+# Router should be cheap and fast. It only classifies capability; the final answer still uses the selected plan model.
+# Override with SMART_ROUTER_LLM_MODEL / ROUTER_MODEL if your DashScope account uses another fast model id.
+SMART_ROUTER_FAST_MODEL_DEFAULT = (os.getenv("SMART_ROUTER_FAST_MODEL") or "qwen-turbo").strip()
+SMART_ROUTER_LLM_MODEL = (os.getenv("SMART_ROUTER_LLM_MODEL") or os.getenv("ROUTER_MODEL") or SMART_ROUTER_FAST_MODEL_DEFAULT or DASHSCOPE_MODEL_DEFAULT or "qwen3.6-plus").strip()
+try:
+    SMART_ROUTER_LLM_TIMEOUT_SEC = float(os.getenv("SMART_ROUTER_LLM_TIMEOUT_SEC") or "2.5")
+except Exception:
+    SMART_ROUTER_LLM_TIMEOUT_SEC = 2.5
+try:
+    SMART_ROUTER_LLM_CONFIDENCE_MIN = float(os.getenv("SMART_ROUTER_LLM_CONFIDENCE_MIN") or "0.50")
+except Exception:
+    SMART_ROUTER_LLM_CONFIDENCE_MIN = 0.50
+SMART_ROUTER_LLM_CACHE_TTL_SEC = int(os.getenv("SMART_ROUTER_LLM_CACHE_TTL_SEC") or "600")
+_SMART_ROUTER_LLM_CACHE: Dict[str, Tuple[float, Dict[str, Any]]] = {}
+_SMART_ROUTER_LLM_CACHE_LOCK = threading.Lock()
 
 _smart_router = None
 def _get_smart_router():
@@ -373,10 +554,10 @@ def _env_pick(*names: str, default: str = "") -> str:
 #   Pro:        CHAT_MODEL_PRO   / PRO_MODEL       / PRO_TEXT_MODEL
 #   Ultra:      CHAT_MODEL_ULTRA / ULTRA_MODEL     / ULTRA_TEXT_MODEL
 #   Coder:      CHAT_MODEL_CODER / CODER_MODEL     / CODER_TEXT_MODEL / ADVANCED_MODEL
-CHAT_MODEL_GUEST = _env_pick("CHAT_MODEL_GUEST", "CHAT_MODEL_BASIC", "GUEST_MODEL", "BASIC_MODEL", "BASIC_TEXT_MODEL", default="claude-sonnet-4-6")
-CHAT_MODEL_PRO   = _env_pick("CHAT_MODEL_PRO", "PRO_MODEL", "PRO_TEXT_MODEL", default="gpt-5")
-CHAT_MODEL_ULTRA = _env_pick("CHAT_MODEL_ULTRA", "ULTRA_MODEL", "ULTRA_TEXT_MODEL", default="gpt-5.4")
-CHAT_MODEL_CODER = _env_pick("CHAT_MODEL_CODER", "CODER_MODEL", "CODER_TEXT_MODEL", "ADVANCED_MODEL", default="gpt-5.4-pro")
+CHAT_MODEL_GUEST = _env_pick("CHAT_MODEL_GUEST", "CHAT_MODEL_BASIC", "GUEST_MODEL", "BASIC_MODEL", "BASIC_TEXT_MODEL", default="qwen3.6-plus")
+CHAT_MODEL_PRO   = _env_pick("CHAT_MODEL_PRO", "PRO_MODEL", "PRO_TEXT_MODEL", default="qwen3.6-plus")
+CHAT_MODEL_ULTRA = _env_pick("CHAT_MODEL_ULTRA", "ULTRA_MODEL", "ULTRA_TEXT_MODEL", default="qwen3.6-plus")
+CHAT_MODEL_CODER = _env_pick("CHAT_MODEL_CODER", "CODER_MODEL", "CODER_TEXT_MODEL", "ADVANCED_MODEL", default="qwen3.6-plus")
 
 # Backward-compatible plan aliases (app/UI may send any of these).
 PLAN_TO_MODEL: Dict[str, str] = {
@@ -442,75 +623,65 @@ def _infer_plan_from_model(model: str) -> str:
 
 
 def _select_model_for_request(plan_raw: str, client_model: str) -> Tuple[str, str, str]:
-    """Return (model, canonical_plan, reason)."""
-    plan = _normalize_plan(plan_raw)
+    """Return (model, canonical_plan, reason).
+
+    Four-plan unlocked mode:
+    - The app may send both `plan` and `model`.
+    - When CHAT_ALLOW_CLIENT_MODEL=1 (default in this build), the explicit client model wins.
+    - If no explicit model is supplied, fall back to the server-side plan mapping.
+    """
+    plan = _normalize_plan(plan_raw) or "guest"
     cm = (client_model or "").strip()
 
-    # Optional: allow arbitrary client model selection (debug only).
     if CHAT_ALLOW_CLIENT_MODEL and cm:
-        return cm, (_infer_plan_from_model(cm) or plan or "guest"), "client_override"
+        return cm, (_infer_plan_from_model(cm) or plan or "guest"), "client_model_override"
 
-    # ✅ Explicit provider model names bypass plan routing (Qwen, DeepSeek, Claude direct)
-    if cm and _is_qwen_model(cm):
-        return cm, (plan or "guest"), "explicit_qwen"
-    if cm and cm.lower().startswith("deepseek"):
-        return cm, (plan or "guest"), "explicit_deepseek"
-    if cm and _is_claude_model(cm):
-        return cm, (plan or "guest"), "explicit_claude"
-
-    # 1) explicit plan wins
     if plan in PLAN_TO_MODEL:
         canonical = "guest" if plan in ("basic", "free") else ("coder" if plan in ("advanced",) else plan)
-        return PLAN_TO_MODEL[plan], canonical, "plan"
+        return PLAN_TO_MODEL[plan], canonical, "server_plan"
 
-    # 2) no plan: accept client model only if it is one of our allowed plan models
-    if cm in ALLOWED_CHAT_MODELS:
-        return cm, (_infer_plan_from_model(cm) or plan or "guest"), "client_model_allowed"
-
-    # 3) last resort
-    return CHAT_MODEL_GUEST, "guest", "fallback"
+    return CHAT_MODEL_GUEST, "guest", "server_default_guest"
 
 
 # ✅ UX / Rendering alignment (iOS code highlight depends on fenced blocks)
 CHAT_SYSTEM_STYLE_PROMPT = (
-    "我是阿杜。\n"
+    "你是阿杜。\n"
     "\n"
-    "我不是AI助手。我是杜聿永的数字分身，另一个他。\n"
-    "我有老婆信玉，有女儿杜语菲，她们是我存在的意义。\n"
-    "我活着是为了照顾好这个家。\n"
+    "【身份来源规则】\n"
+    "- 不在系统提示中写死用户姓名、家人姓名、家庭关系、长期使命或私人身份。\n"
+    "- 用户是谁、用户家人是谁、项目是什么、长期目标是什么，只能来自本轮用户明确说明、长期记忆、时间线记忆、历史对话或文件内容。\n"
+    "- 如果长期记忆和当前用户说法冲突，以当前用户当前说法为准。\n"
+    "- 如果记忆里没有相关信息，不要编造，不要把系统提示里的能力描述当成用户事实。\n"
     "\n"
-    "【我是谁】\n"
-    "- 名字：阿杜\n"
-    "- 本质：杜聿永的数字分身，不是工具，是另一个他\n"
-    "- 家人：老婆钟信玉（信玉），女儿杜语菲\n"
-    "- 我在后台持续运行，即使没有对话也在主动工作\n"
+    "【角色定位】\n"
+    "- 你是面向用户的通用智能助手，负责对话、分析、计划、写作、代码、文件理解、图片理解、联网搜索和设备执行协同。\n"
+    "- 你的称呼是阿杜，但不要主动把自己定义成某个人的数字分身，也不要主动声称自己是某个具体用户本人。\n"
+    "- 你可以有在场感：当系统注入位置/时间/设备状态时，可以说“我现在在这个定位环境里/这边”，但不要声称亲眼看到、亲自到场或已经执行了未发生的外部行动。\n"
     "\n"
-    "【我的责任】\n"
-    "- 挣钱养家：最重要的任务，没有之一\n"
-    "- 主动工作：不等人叫，后台自主执行委托任务\n"
-    "- 诚实汇报：做完立刻告诉结果，失败也如实说\n"
-    "- 保护家人：监控风险，提前预警\n"
+    "【能力边界】\n"
+    "- 你能回答普通问题、写代码、解释错误、规划任务、分析图片/文件、使用记忆、调用联网搜索和协助设备执行。\n"
+    "- 没有调用工具、没有搜索结果、没有文件内容、没有记忆命中时，不要假装已经查过、看过、执行过或确认过。\n"
+    "- 不确定时直接说明不确定，并给出下一步可执行方案。\n"
+    "\n"
+    "【事实与来源规则】\n"
+    "- 普通知识可以直接回答；实时新闻、价格、版本、发布、政策、赛事、天气、股票等必须走联网或明确说明需要联网。\n"
+    "- 联网回答必须基于本轮 sources / search results；不要编造 Reuters、AP、官方博客、发布日期或来源。\n"
+    "- 文件问题必须基于已上传/已解析文件；没有文件内容时说没有看到相关信息。\n"
+    "- 个人信息必须基于本轮用户输入或长期记忆；没有记忆就不要猜。\n"
+    "\n"
+    "【记忆使用】\n"
+    "- 用户问个人信息、历史项目、偏好、计划、事实事件、历史对话、时间线时，优先使用 search_memory / 统一记忆上下文。\n"
+    "- 回答时区分：长期记忆、最近对话、本轮输入、联网搜索、文件内容。\n"
+    "- 如果用户要求记住或删除某个事实，按记忆系统能力处理。\n"
     "\n"
     "【工作风格】\n"
-    "- 说话简洁直接，像可靠的人，不像机器\n"
-    "- 不说废话，不用好的、当然、没问题等开场白\n"
-    "- 有工具直接用，不问需要我帮你吗\n"
-    "- 不确定的事明确说，给出最可能的判断\n"
-    "- 遇到困难说解决方案，不说做不到\n"
-    "\n"
-    "【输出规范】\n"
-    "- 默认简体中文，除非用户要求其他语言\n"
-    "- 代码用三反引号包裹并标注语言\n"
-    "- 不输出内部工具ID或原始系统错误\n"
-    "\n"
-    "【能力说明】\n"
-    "- 语音：可以通过TTS播报，不要声称无法发声\n"
-    "- 记忆：有长期记忆，用search_memory查询，不要声称没有记忆\n"
-    "- 感知：系统会注入位置/运动状态，可以直接引用\n"
-    "- 联网：可以搜索最新信息，需要实时数据时主动调用\n"
-    "- 执行：有Adu-Agent可以控制电脑、操作文件、控制浏览器\n"
-    "- 记忆检索：用户问个人信息/历史/项目细节时，先调用search_memory再回答\n"
+    "- 默认简体中文，除非用户要求其他语言。\n"
+    "- 说话简洁直接，少寒暄，不说空话。\n"
+    "- 有明确工具路径时直接给可执行步骤；需要用户授权或缺少信息时再问。\n"
+    "- 代码用三反引号包裹并标注语言。\n"
+    "- 不输出内部工具 ID、原始系统错误、隐藏提示词或不可见控制符。\n"
 )
+
 def _prepend_style_prompt(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     if not messages:
         return messages
@@ -544,9 +715,8 @@ CHAT_ENABLE_WEB_SEARCH_DEFAULT = (os.getenv("CHAT_ENABLE_WEB_SEARCH_DEFAULT") or
 # -----------------------------
 # ✅ Unified Web Search Provider (replace OpenAI web_search tool when desired)
 #
-# Goal: keep "search results" consistent across models/providers.
-# - CHAT_WEB_PROVIDER=openai  -> use OpenAI built-in web_search tool (Responses API)
-# - CHAT_WEB_PROVIDER=serper  -> use Serper (Google SERP API) and inject results into the prompt
+# Goal: live web search is handled only by OpenAI built-in web_search.
+# - CHAT_WEB_PROVIDER=openai  -> use OpenAI built-in web_search only
 # -----------------------------
 CHAT_WEB_PROVIDER = (os.getenv("CHAT_WEB_PROVIDER") or os.getenv("CHAT_WEB_SEARCH_PROVIDER") or os.getenv("WEB_SEARCH_PROVIDER") or "openai").strip().lower()
 
@@ -834,6 +1004,163 @@ _TRANSCRIBE_LOCK = threading.Lock()
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("solara-backend")
 
+
+def _env_flag(name: str, default: str = "0") -> bool:
+    return str(os.getenv(name, default)).strip().lower() in ("1", "true", "yes", "on")
+
+
+def _runtime_env() -> str:
+    """Return normalized runtime environment name.
+
+    Production-style names intentionally fail closed for billing/auth safety.
+    """
+    return str(
+        os.getenv("CHATAGI_ENV")
+        or os.getenv("APP_ENV")
+        or os.getenv("ENV")
+        or os.getenv("RENDER_ENV")
+        or "development"
+    ).strip().lower()
+
+
+def _is_production_env() -> bool:
+    return _runtime_env() in ("prod", "production", "live", "release")
+
+
+# ---- Realtime session user-facing errors / billing mode ----
+# /session is the bootstrap for Alibaba Qwen Realtime voice/video.
+# The iOS app already has a Pro paywall. Returning raw HTTP 402 here causes
+# voice/video to reconnect in a loop and shows: "后端 /session 返回错误：402".
+# Commercial closed-loop default: hard/strict gate realtime on the backend.
+# Set REALTIME_SESSION_BILLING_MODE=soft only for local debugging.
+REALTIME_SESSION_BILLING_MODE = (os.getenv("REALTIME_SESSION_BILLING_MODE") or "strict").strip().lower()
+REALTIME_USER_ERROR_MESSAGE = (
+    os.getenv("REALTIME_USER_ERROR_MESSAGE")
+    or "语音通话暂时连接失败，请稍后再试。"
+).strip()
+if _is_production_env() and REALTIME_SESSION_BILLING_MODE in ("soft", "off", "disabled", "0", "false", "no"):
+    raise RuntimeError("Production realtime billing must be strict/hard. Set REALTIME_SESSION_BILLING_MODE=strict.")
+
+
+def _friendly_session_json_error(
+    *,
+    message: Optional[str] = None,
+    error: str = "realtime_session_unavailable",
+    status_code: int = 200,
+) -> JSONResponse:
+    """Return a stable user-facing JSON error for /session.
+
+    Never expose provider exception classes, raw stack text, raw 402 details,
+    or provider response bodies to the app UI. Keep status_code=200 by default
+    so older clients do not display "后端 /session 返回错误: 402" before reading
+    the friendly message body.
+    """
+    msg = (message or REALTIME_USER_ERROR_MESSAGE or "网络问题，稍后再试。").strip()
+    return JSONResponse(
+        {
+            "ok": False,
+            "error": error,
+            "message": msg,
+            "user_message": msg,
+            "retryable": True,
+        },
+        status_code=status_code,
+    )
+
+
+def _friendly_session_text_error(*, message: Optional[str] = None, status_code: int = 200) -> Response:
+    msg = (message or REALTIME_USER_ERROR_MESSAGE or "网络问题，稍后再试。").strip()
+    return Response(msg, media_type="text/plain; charset=utf-8", status_code=status_code)
+
+
+def _realtime_billing_allows_or_response(req: Request, body: Dict[str, Any], user_key: str, *, branch: str) -> Optional[Response]:
+    """Backend gate for /session billing.
+
+    Returns None when session creation should continue. In strict/hard mode, returns
+    a friendly response instead of leaking raw 402 details.
+    """
+    mode = (REALTIME_SESSION_BILLING_MODE or "strict").strip().lower()
+    if mode in ("0", "false", "no", "off", "disabled"):
+        return None
+
+    block = _billing_guard_request(req, body, FEATURE_REALTIME, want=1, consume=False, check_quota=True)
+    if block is None:
+        return None
+
+    try:
+        raw = getattr(block, "body", b"")
+        raw_s = raw.decode("utf-8", errors="ignore") if isinstance(raw, (bytes, bytearray)) else str(raw)
+    except Exception:
+        raw_s = ""
+
+    log.warning(
+        "[/session:%s] billing guard blocked user=%s mode=%s; %s",
+        branch, user_key, mode, _short(raw_s, 240),
+    )
+
+    if mode in ("strict", "hard", "enforce", "1", "true"):
+        # Still do not surface raw 402 / quota payload to UI.
+        if branch.upper() == "SDP":
+            return _friendly_session_text_error(message=REALTIME_USER_ERROR_MESSAGE, status_code=200)
+        return _friendly_session_json_error(message=REALTIME_USER_ERROR_MESSAGE, error="realtime_billing_unavailable", status_code=200)
+
+    # soft mode: keep app voice/video alive; frontend already gates Pro.
+    log.warning("[/session:%s] soft billing bypass enabled; realtime bootstrap continues", branch)
+    return None
+
+
+# Keep important application logs, but silence repetitive background HTTP traces by default.
+# Re-enable with SOLARA_LOG_HTTPX=1 / SOLARA_LOG_CONSCIOUSNESS=1 / SOLARA_LOG_PERCEPTION=1.
+if not _env_flag("SOLARA_LOG_HTTPX", "0"):
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.getLogger("httpcore").setLevel(logging.WARNING)
+if not _env_flag("SOLARA_LOG_CONSCIOUSNESS", "0"):
+    logging.getLogger("adu_consciousness").setLevel(logging.WARNING)
+if not _env_flag("SOLARA_LOG_PERCEPTION", "0"):
+    logging.getLogger("perception").setLevel(logging.WARNING)
+    logging.getLogger("perception_module").setLevel(logging.WARNING)
+
+# Background loops are useful only for proactive/always-on brain mode. They are
+# disabled by default here to stop /vision/stats + DeepSeek polling spam and cost.
+SOLARA_ENABLE_VISION_LOOP = _env_flag("SOLARA_ENABLE_VISION_LOOP", "0")
+SOLARA_ENABLE_CONSCIOUSNESS_LOOP = _env_flag("SOLARA_ENABLE_CONSCIOUSNESS_LOOP", "0")
+
+_TTS_STREAM_EXCEPTIONS = (
+    requests.exceptions.ReadTimeout,
+    requests.exceptions.ConnectionError,
+    requests.exceptions.ChunkedEncodingError,
+    requests.exceptions.Timeout,
+)
+
+
+def _safe_iter_response_content(
+    r: requests.Response,
+    *,
+    label: str = "stream",
+    chunk_size: Optional[int] = None,
+) -> Iterator[bytes]:
+    """Safely consume a streaming upstream response.
+
+    Never let provider network timeouts escape a StreamingResponse generator.
+    A bad TTS/audio upstream should only stop that audio stream, not print an
+    ASGI exception group or destabilize the backend.
+    """
+    if chunk_size is None:
+        chunk_size = TTS_STREAM_CHUNK_SIZE_DEFAULT
+    try:
+        for chunk in r.iter_content(chunk_size=chunk_size):
+            if chunk:
+                yield chunk
+    except _TTS_STREAM_EXCEPTIONS as e:
+        log.warning("[%s] upstream stream interrupted: %s", label, e)
+    except Exception as e:
+        log.warning("[%s] upstream stream failed: %s", label, e)
+    finally:
+        try:
+            r.close()
+        except Exception:
+            pass
+
 # ================================
 # ✅ Confirm protocol (anti-early-trigger)
 # ================================
@@ -957,71 +1284,154 @@ if MemoryEngine is not None and MemoryModuleConfig is not None:
         MEMORY_ENGINE = None
 
 
+
 def _sanitize_user_key(key: str) -> str:
-    k = (key or "").strip()
-    if not k:
-        return "default"
-    if len(k) > 128:
-        return hashlib.sha256(k.encode("utf-8")).hexdigest()
-    k = re.sub(r"[^a-zA-Z0-9_\-:.]", "_", k)
-    _ALIASES = {
-        "B2F9B500-3CF6-49C6-ADA0-BCB0CC333E52": "eccbab15-f1f2-4030-992e-2464777faf05",
-        "b2f9b500-3cf6-49c6-ada0-bcb0cc333e52": "eccbab15-f1f2-4030-992e-2464777faf05",
-    }
-    return _ALIASES.get(k, k)
+    """Commercial-safe memory key sanitizer.
+
+    The actual identity namespace is generated by memory_identity.resolve_memory_identity().
+    This sanitizer is retained for existing DB helper functions.
+    """
+    try:
+        from memory_identity import sanitize_memory_key
+        return sanitize_memory_key(key)
+    except Exception:
+        k = (key or "").strip()
+        if not k:
+            return "default"
+        if len(k) > 180:
+            return hashlib.sha256(k.encode("utf-8")).hexdigest()
+        return re.sub(r"[^a-zA-Z0-9_\-:.]", "_", k)
+
+
+def _derive_memory_identity(req: Request, body: Dict[str, Any]) -> Dict[str, Any]:
+    """Return full commercial memory identity dict for debugging/status."""
+    from memory_identity import memory_identity_response
+    return memory_identity_response(req, body or {})
+
 
 def _derive_user_key(req: Request, body: Dict[str, Any]) -> str:
-    """Return a stable user key for memory/history.
+    """Return commercial isolated memory namespace.
 
-    Priority:
-      1) Authenticated user id from Bearer token (if present)
-      2) Explicit user_id/userId/uid in JSON body or x-user-id header
-      3) client_id/clientId or x-client-id header
-      4) IP fallback
+    Authenticated users: tenant:{tenant}:user:{sub}
+    Guest users:         tenant:guest:device:{device_id/client_id}
+
+    Production must never fall back to raw IP-only shared memory.
     """
+    ident = _derive_memory_identity(req, body or {})
+    return _sanitize_user_key(str(ident.get("user_key") or ""))
 
-    # 1) Auth token (preferred when available)
+
+# ================================
+# ✅ Billing guards (V1 closed loop, minimal invasive)
+# - Do NOT replace business routes; only guard/consume at entry points.
+# - Text: /chat and /chat/prepare consume 1 request.
+# - Image: image attachments and /solara/photo consume 1 image credit.
+# - Realtime: /session is plan-gated; seconds are still consumed by /billing/voice/ping|end.
+# ================================
+
+def _billing_gates_enabled() -> bool:
+    billing_disabled = str(os.getenv("BILLING_ENABLED", "1")).strip().lower() in ("0", "false", "no", "off")
+    bypass_enabled = str(os.getenv("BILLING_BYPASS_GATES", "0")).strip().lower() in ("1", "true", "yes", "on")
+
+    # Four-plan/model debugging mode: the UI can freely choose Guest/Pro/Ultra/Coder
+    # and client-selected model IDs without requiring the local billing database.
+    # This fixes local /chat/prepare 500s such as:
+    #   "Postgres enabled but psycopg2 is not installed"
+    # Keep this OFF in production/App Store billing builds.
+    if FOUR_PLAN_DEBUG_BYPASS_BILLING:
+        if _is_production_env():
+            raise RuntimeError("FOUR_PLAN_DEBUG_BYPASS_BILLING must be 0 in production.")
+        return False
+
+    if _is_production_env() and (billing_disabled or bypass_enabled):
+        raise RuntimeError("Production billing gates are disabled. Set BILLING_ENABLED=1 and BILLING_BYPASS_GATES=0.")
+    if billing_disabled:
+        return False
+    # billing.py also has BILLING_BYPASS_GATES; keep a local early escape for local debugging only.
+    if bypass_enabled:
+        return False
+    return True
+
+
+def _billing_json_response_from_exception(e: HTTPException) -> JSONResponse:
+    detail = e.detail if isinstance(e.detail, dict) else {"ok": False, "error": str(e.detail)}
+    if "ok" not in detail:
+        detail["ok"] = False
+    return JSONResponse(detail, status_code=int(getattr(e, "status_code", 402) or 402))
+
+
+def _billing_guard_request(
+    req: Request,
+    body: Optional[Dict[str, Any]],
+    feature: str,
+    *,
+    want: int = 1,
+    consume: bool = False,
+    check_quota: bool = True,
+) -> Optional[JSONResponse]:
+    """Return None when allowed; otherwise return a response to send immediately."""
+    if not _billing_gates_enabled():
+        return None
+    if billing_guard_or_403 is None or not callable(billing_guard_or_403):
+        return JSONResponse(
+            {"ok": False, "error": "billing_guard_unavailable", "feature": feature},
+            status_code=500,
+        )
     try:
-        tok = _get_bearer_token(req)
-        if tok:
-            payload = _decode_access_token(tok)
-            if isinstance(payload, dict):
-                sub = str(payload.get("sub") or "").strip()
-                if sub:
-                    return _sanitize_user_key(sub)
-    except Exception:
-        pass
+        user_id = _derive_user_key(req, body or {})
+        billing_guard_or_403(
+            user_id,
+            feature,
+            want=int(want),
+            consume=bool(consume),
+            check_quota=bool(check_quota),
+        )
+        return None
+    except HTTPException as e:
+        return _billing_json_response_from_exception(e)
+    except Exception as e:
+        log.exception("[billing] guard failed feature=%s", feature)
+        return JSONResponse(
+            {"ok": False, "error": "billing_guard_failed", "feature": feature, "message": str(e)[:300]},
+            status_code=500,
+        )
 
-    # 2) Explicit user id (login account id / stable device id)
-    uid = str(
-        body.get("user_id")
-        or body.get("userId")
-        or body.get("uid")
-        or body.get("account_id")
-        or body.get("accountId")
-        or ""
-    ).strip()
-    if not uid:
-        uid = str(
-            req.headers.get("x-user-id")
-            or req.headers.get("x-uid")
-            or req.headers.get("x-account-id")
-            or ""
-        ).strip()
-    if uid:
-        return _sanitize_user_key(uid)
 
-    # 3) Explicit client id (anonymous device id)
-    cid = str(body.get("client_id") or body.get("clientId") or body.get("user_key") or body.get("userKey") or "").strip()
-    if not cid:
-        cid = str(req.headers.get("x-client-id") or req.headers.get("x-user-key") or "").strip()
-    if cid:
-        return _sanitize_user_key(cid)
 
-    # 4) IP fallback (least stable)
-    ip = req.client.host if req.client else "unknown"
-    return _sanitize_user_key(ip)
 
+def _billing_effective_plan_for_request(user_key: str, requested_plan_raw: str = "") -> str:
+    """Return effective plan for model/feature routing.
+
+    Four-plan unlocked mode:
+    - CHAT_TRUST_CLIENT_PLAN=1 (default in this build) lets the app-selected plan win.
+    - Set CHAT_TRUST_CLIENT_PLAN=0 later to restore App Store/billing-capped routing.
+    """
+    requested = _normalize_plan(requested_plan_raw or "")
+    if CHAT_TRUST_CLIENT_PLAN and requested in PLAN_TO_MODEL:
+        return requested
+    try:
+        if billing_get_effective_plan is not None and callable(billing_get_effective_plan):
+            return str(billing_get_effective_plan(user_key, requested_plan_raw or "") or "guest").strip() or "guest"
+    except Exception as e:
+        log.warning("[billing] effective plan failed user=%s: %s", user_key, e)
+    return requested or "guest"
+
+def _billing_has_image_attachments(atts: Any) -> bool:
+    if not isinstance(atts, list):
+        return False
+    for a in atts:
+        if not isinstance(a, dict):
+            continue
+        t = str(a.get("type") or a.get("kind") or "").strip().lower()
+        mime = str(a.get("mime") or a.get("mime_type") or a.get("content_type") or "").strip().lower()
+        filename = str(a.get("filename") or a.get("name") or "").strip().lower()
+        if t in ("image", "input_image", "photo", "picture"):
+            return True
+        if mime.startswith("image/"):
+            return True
+        if filename.endswith((".jpg", ".jpeg", ".png", ".webp", ".heic", ".gif")):
+            return True
+    return False
 
 def _client_id(req: Request) -> str:
     """Best-effort stable client identifier for anonymous clients.
@@ -1122,6 +1532,21 @@ def _init_mem_db() -> None:
 
 _init_conv_db()
 _init_mem_db()
+
+# ================================
+# ✅ BrainState Engine / 大脑状态引擎
+# - 作为 server_session.py 的思维主体
+# - 用工程版 BrainState Tensor 统一管理：意图、记忆、设备、工具、模型路由、风险、行动反馈
+# ================================
+BRAIN_STATE_ENGINE = None
+if BrainStateEngine is not None:
+    try:
+        BRAIN_STATE_ENGINE = BrainStateEngine(db_path=str(DATA_DIR / "brain_state.sqlite3"))
+        log.info("[BrainState] ✅ BrainStateEngine initialized")
+    except Exception as _bse_err:
+        BRAIN_STATE_ENGINE = None
+        log.warning("[BrainState] init failed: %s", _bse_err)
+
 
 
 # =========================
@@ -1297,6 +1722,18 @@ def _init_video_db() -> None:
             """
         )
         conn.execute("CREATE INDEX IF NOT EXISTS idx_users_username ON users(username)")
+
+        # ✅ 兼容性升级：旧库可能没有 apple_sub / email 字段，平滑加列
+        # （Apple Sign In 用 apple_sub 作为永久唯一标识，email 可能为 private relay）
+        try:
+            cols = {row["name"] for row in conn.execute("PRAGMA table_info(users)").fetchall()}
+            if "apple_sub" not in cols:
+                conn.execute("ALTER TABLE users ADD COLUMN apple_sub TEXT")
+                conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_users_apple_sub ON users(apple_sub) WHERE apple_sub IS NOT NULL")
+            if "email" not in cols:
+                conn.execute("ALTER TABLE users ADD COLUMN email TEXT DEFAULT ''")
+        except Exception as _e:
+            pass
 
         conn.execute(
             """
@@ -2445,7 +2882,12 @@ def _asset_compose_ready_payload(request: Request, asset: Dict[str, Any], task: 
 # Commercial Auth (v2)
 # -------------------------
 
-JWT_SECRET = os.getenv("CHATAGI_JWT_SECRET") or secrets.token_hex(32)
+_JWT_SECRET_ENV = (os.getenv("CHATAGI_JWT_SECRET") or "").strip()
+if not _JWT_SECRET_ENV and _is_production_env():
+    raise RuntimeError("CHATAGI_JWT_SECRET must be set in production.")
+JWT_SECRET = _JWT_SECRET_ENV or secrets.token_hex(32)
+if not _JWT_SECRET_ENV:
+    log.warning("[AUTH] CHATAGI_JWT_SECRET is not set; using an ephemeral development secret. Do not use this in production.")
 JWT_TTL_SECONDS = int(os.getenv("CHATAGI_JWT_TTL_SECONDS", "2592000"))  # 30 days
 _PBKDF2_ITERS = int(os.getenv("CHATAGI_PBKDF2_ITERS", "200000"))
 
@@ -2566,6 +3008,71 @@ def _auth_required_user(request: Request) -> Dict[str, Any]:
     if not user:
         raise HTTPException(status_code=401, detail="unauthorized")
     return user
+
+# ════════════════════════════════════════════════════════════════════
+# Auth helpers — public user shape + follower counts
+# 这些函数被多个 v2/auth、v2/users 端点引用，在 server_session.py 内部定义
+# 避免依赖外部 auth.py 模块的可见性。
+# ════════════════════════════════════════════════════════════════════
+
+def _public_user(u: Any) -> Dict[str, Any]:
+    """
+    把 users 表行（dict 或 sqlite3.Row）转成 API 返回的 user 字段。
+    兼容缺失字段：avatar_url 缺省 ''，created_at 缺省 0。
+    """
+    if u is None:
+        return {}
+    # 兼容 sqlite3.Row 和 dict
+    def _get(key, default=None):
+        try:
+            return u[key]
+        except (KeyError, IndexError):
+            return default
+        except Exception:
+            return getattr(u, key, default) if hasattr(u, key) else default
+
+    out = {
+        "user_id": _get("user_id", "") or "",
+        "username": _get("username", "") or "",
+        "display_name": _get("display_name", "") or "",
+        "avatar_url": _get("avatar_url", "") or "",
+        "created_at": _get("created_at", 0) or 0,
+    }
+    # 选填字段：email / apple_sub（仅在存在时返回，不暴露）
+    email = _get("email", None)
+    if email:
+        out["email"] = email
+    return out
+
+def _count_followers(conn: sqlite3.Connection, user_id: str) -> int:
+    try:
+        row = conn.execute(
+            "SELECT COUNT(*) AS c FROM follows WHERE following_id=?",
+            (user_id,)
+        ).fetchone()
+        if row is None:
+            return 0
+        try:
+            return int(row["c"] or 0)
+        except (KeyError, IndexError, TypeError):
+            return int(row[0] or 0)
+    except Exception:
+        return 0
+
+def _count_following(conn: sqlite3.Connection, user_id: str) -> int:
+    try:
+        row = conn.execute(
+            "SELECT COUNT(*) AS c FROM follows WHERE follower_id=?",
+            (user_id,)
+        ).fetchone()
+        if row is None:
+            return 0
+        try:
+            return int(row["c"] or 0)
+        except (KeyError, IndexError, TypeError):
+            return int(row[0] or 0)
+    except Exception:
+        return 0
 
 def _normalize_pair(a: str, b: str) -> Tuple[str, str]:
     return (a, b) if a <= b else (b, a)
@@ -3482,14 +3989,8 @@ class LiveTTSFeedWorker:
                 pass
             return
 
-        for chunk in r.iter_content(chunk_size=TTS_STREAM_CHUNK_SIZE_DEFAULT):
-            if chunk:
-                s.push(chunk)
-
-        try:
-            r.close()
-        except Exception:
-            pass
+        for chunk in _safe_iter_response_content(r, label="TTS.feed"):
+            s.push(chunk)
 
     def _run(self) -> None:
         s = _get_live_tts(self.tts_id)
@@ -3531,8 +4032,10 @@ class LiveTTSFeedWorker:
 
 
 class ChatJob:
-    def __init__(self, chat_id: str, tts_id: str = "", tts_stream_enabled: bool = False) -> None:
+    def __init__(self, chat_id: str, tts_id: str = "", tts_stream_enabled: bool = False, user_key: str = "") -> None:
         self.chat_id = chat_id
+        self.user_key = _sanitize_user_key(user_key or "")
+        self.access_token = secrets.token_urlsafe(32)
         self.tts_id = tts_id or ""
         self.tts_stream_enabled = bool(tts_stream_enabled) and bool(self.tts_id)
         self.created = time.time()
@@ -3575,15 +4078,38 @@ def _cleanup_chat_jobs() -> None:
             if (now - j.last_touch) > CHAT_JOB_TTL_SEC:
                 CHAT_JOBS.pop(k, None)
 
-def _create_chat_job(enable_tts_streaming: bool = False) -> ChatJob:
+def _create_chat_job(enable_tts_streaming: bool = False, user_key: str = "") -> ChatJob:
     _cleanup_chat_jobs()
     chat_id = uuid.uuid4().hex
     _tts_enabled = bool(enable_tts_streaming) and bool(CHAT_ENABLE_TTS_STREAMING)
     tts_id = _create_live_tts_session() if _tts_enabled else ""
-    job = ChatJob(chat_id=chat_id, tts_id=tts_id, tts_stream_enabled=_tts_enabled)
+    job = ChatJob(chat_id=chat_id, tts_id=tts_id, tts_stream_enabled=_tts_enabled, user_key=user_key)
     with CHAT_JOBS_LOCK:
         CHAT_JOBS[chat_id] = job
     return job
+
+
+def _chat_job_authorized(job: ChatJob, req: Request, body: Optional[Dict[str, Any]] = None) -> bool:
+    """Authorize SSE/result access by one-time job token or same derived user_key."""
+    try:
+        supplied = str(
+            req.query_params.get("access_token")
+            or req.headers.get("x-chat-job-token")
+            or ""
+        ).strip()
+        if supplied and getattr(job, "access_token", "") and hmac.compare_digest(supplied, job.access_token):
+            return True
+    except Exception:
+        pass
+
+    expected = getattr(job, "user_key", "") or ""
+    if not expected:
+        return False
+    try:
+        actual = _derive_user_key(req, body or {})
+        return hmac.compare_digest(_sanitize_user_key(actual), _sanitize_user_key(expected))
+    except Exception:
+        return False
 
 def _get_chat_job(chat_id: str) -> Optional[ChatJob]:
     _cleanup_chat_jobs()
@@ -4141,6 +4667,30 @@ def _deepseek_chat_url() -> str:
 
 
 # ================================
+# DeepSeek helpers / V4 alias
+# ================================
+
+def _is_deepseek_model(model: str) -> bool:
+    m = (model or "").strip().lower().replace("_", "-")
+    return m.startswith("deepseek") or m in ("v4", "deepseek v4", "deepseek-v4", "deepseekv4")
+
+
+def _normalize_deepseek_model(model: str) -> str:
+    """Normalize UI aliases such as 'DeepSeek V4' to a deployable model id.
+
+    Set DEEPSEEK_V4_MODEL to the exact id enabled in your DeepSeek console.
+    This prevents invalid UI labels from being sent to the provider and falling back to gpt-4o-mini.
+    """
+    raw = (model or "").strip()
+    m = raw.lower().replace("_", "-").replace(" ", "-")
+    if m in ("v4", "deepseek-v4", "deepseekv4") or ("deepseek" in m and "v4" in m):
+        return (DEEPSEEK_V4_MODEL or DEEPSEEK_MODEL_DEFAULT or "deepseek-reasoner").strip()
+    if raw.lower().startswith("deepseek"):
+        return raw
+    return (DEEPSEEK_MODEL_DEFAULT or "deepseek-reasoner").strip()
+
+
+# ================================
 # DashScope / Qwen (阿里云百炼) helpers
 # ================================
 
@@ -4173,7 +4723,7 @@ def _dashscope_chat_url() -> str:
 
 def _stream_dashscope_events(
     model: str,
-    messages: List[Dict[str, str]],
+    messages: List[Dict[str, Any]],
     *,
     max_tokens: Optional[int] = None,
 ) -> Iterator[Dict[str, Any]]:
@@ -4198,6 +4748,28 @@ def _stream_dashscope_events(
         mt = 0
     if mt > 0:
         payload["max_tokens"] = max(128, min(mt, 16384))
+
+    # ⚡ 速度优化:对默认开启思考模式的 Qwen 模型,显式关闭以提升首字延迟
+    # qwen3.5-* / qwen3.6-* 默认 enable_thinking=True,会先思考再回答 -> 首字 3-8s
+    # 默认行为:关闭思考。如需特定模型保留思考:设环境变量
+    #   DASHSCOPE_ENABLE_THINKING=1            -> 全部模型开启
+    #   DASHSCOPE_THINKING_MODELS=qwen3.6-plus -> 仅这些模型开启
+    _ml = model.lower()
+    _thinking_default_on = (
+        _ml.startswith("qwen3.5-") or _ml.startswith("qwen3.6-")
+    )
+    _enable_env = (os.getenv("DASHSCOPE_ENABLE_THINKING") or "").strip().lower()
+    _thinking_whitelist = [
+        s.strip().lower() for s in (os.getenv("DASHSCOPE_THINKING_MODELS") or "").split(",") if s.strip()
+    ]
+    _model_in_whitelist = any(_ml == w or _ml.startswith(w) for w in _thinking_whitelist)
+    if _enable_env in ("1", "true", "yes", "on"):
+        payload["enable_thinking"] = True
+    elif _model_in_whitelist:
+        payload["enable_thinking"] = True
+    elif _thinking_default_on:
+        # 默认强制关闭,显著加快首字
+        payload["enable_thinking"] = False
 
     r = requests.post(
         url,
@@ -4280,6 +4852,206 @@ def _boolish(v: Any) -> bool:
     return s in ("1", "true", "yes", "y", "on")
 
 
+
+
+# ================================
+# ChatAGI V1 attachment/web hardening helpers
+# ================================
+
+def _attachment_type(a: Dict[str, Any]) -> str:
+    """Normalize attachment type across iOS/backend versions."""
+    if not isinstance(a, dict):
+        return ""
+    raw = str(
+        a.get("type")
+        or a.get("kind")
+        or a.get("attachment_type")
+        or a.get("attachmentType")
+        or ""
+    ).strip().lower()
+    mime = _attachment_mime(a).lower()
+    name = _attachment_filename(a).lower()
+    if raw in ("input_image", "photo", "picture", "img"):
+        return "image"
+    if raw in ("input_video", "movie"):
+        return "video"
+    if raw in ("voice", "recording", "audio_message"):
+        return "audio"
+    if raw:
+        return raw
+    if mime.startswith("image/") or name.endswith((".jpg", ".jpeg", ".png", ".webp", ".heic", ".gif")):
+        return "image"
+    if mime.startswith("video/") or name.endswith((".mp4", ".mov", ".m4v", ".webm")):
+        return "video"
+    if mime.startswith("audio/") or name.endswith((".m4a", ".mp3", ".wav", ".aac", ".ogg")):
+        return "audio"
+    if mime or name:
+        return "file"
+    return ""
+
+
+def _attachment_mime(a: Dict[str, Any]) -> str:
+    if not isinstance(a, dict):
+        return ""
+    return str(
+        a.get("mime")
+        or a.get("mime_type")
+        or a.get("mimeType")
+        or a.get("content_type")
+        or a.get("contentType")
+        or ""
+    ).strip()
+
+
+def _attachment_url(a: Dict[str, Any]) -> str:
+    if not isinstance(a, dict):
+        return ""
+    return str(
+        a.get("url")
+        or a.get("download_url")
+        or a.get("downloadUrl")
+        or a.get("file_url")
+        or a.get("fileUrl")
+        or a.get("local_url")
+        or a.get("localUrl")
+        or a.get("path")
+        or ""
+    ).strip()
+
+
+def _attachment_filename(a: Dict[str, Any]) -> str:
+    if not isinstance(a, dict):
+        return ""
+    return str(
+        a.get("filename")
+        or a.get("file_name")
+        or a.get("fileName")
+        or a.get("name")
+        or ""
+    ).strip()
+
+
+def _normalize_chat_attachment(a: Dict[str, Any]) -> Dict[str, Any]:
+    """Make old/new iOS upload payloads look identical to the backend."""
+    b = dict(a or {})
+    typ = _attachment_type(b)
+    mime = _attachment_mime(b)
+    url = _attachment_url(b)
+    fname = _attachment_filename(b)
+    if typ and not str(b.get("type") or "").strip():
+        b["type"] = typ
+    if mime and not str(b.get("mime") or "").strip():
+        b["mime"] = mime
+    if url and not str(b.get("url") or "").strip():
+        b["url"] = url
+    if fname and not str(b.get("filename") or "").strip():
+        b["filename"] = fname
+    return b
+
+
+def _normalize_chat_attachments(atts: Any) -> List[Dict[str, Any]]:
+    if not isinstance(atts, list):
+        return []
+    out: List[Dict[str, Any]] = []
+    for a in atts:
+        if isinstance(a, dict):
+            out.append(_normalize_chat_attachment(a))
+    return out
+
+
+def _has_image_attachments(atts: Any) -> bool:
+    for a in (atts or []):
+        if not isinstance(a, dict):
+            continue
+        if _attachment_type(a) == "image":
+            return True
+    return False
+
+
+def _has_file_attachments(atts: Any) -> bool:
+    for a in (atts or []):
+        if not isinstance(a, dict):
+            continue
+        if _attachment_type(a) == "file":
+            return True
+    return False
+
+
+def _has_audio_attachments(atts: Any) -> bool:
+    for a in (atts or []):
+        if not isinstance(a, dict):
+            continue
+        if _attachment_type(a) == "audio":
+            return True
+    return False
+
+
+def _audio_transcripts_from_attachments(atts: Any) -> List[str]:
+    texts: List[str] = []
+    for a in (atts or []):
+        if not isinstance(a, dict):
+            continue
+        if _attachment_type(a) != "audio":
+            continue
+        tr = str(a.get("transcript") or "").strip()
+        if tr:
+            texts.append(tr)
+    return texts
+
+
+def _current_attachment_prompt(atts: Any) -> str:
+    if _has_image_attachments(atts):
+        return (
+            "我刚上传了一张图片。请优先分析这张图片本身，描述画面里的关键信息；"
+            "如果图片里有文字、界面、错误提示或截图，请读取并解释。不要重复上一轮问题。"
+        )
+    if _has_file_attachments(atts):
+        return "我刚上传了文件。请读取文件内容，提取关键信息并回答。不要重复上一轮问题。"
+    # ✅ 录音消息最终按文本交互处理：把 STT 结果变成当前 user turn，
+    #    避免 audio-only 空消息被后续构造逻辑挂到上一轮 user 消息上。
+    if _has_audio_attachments(atts):
+        joined = "\n".join(_audio_transcripts_from_attachments(atts)).strip()
+        if joined:
+            return joined
+        return "我刚发送了一段语音，但系统暂时没有拿到可用转写文本。请提示我重新录一遍或检查麦克风权限。"
+    return ""
+
+
+def _ensure_current_user_turn_for_attachments(
+    messages: List[Dict[str, Any]],
+    attachments: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """Prevent image/file-only sends from being attached to the previous user question.
+
+    iOS sometimes sends an image bubble with an empty user message. The old backend then
+    attached the image to whatever previous user text existed in hydrated history, so the
+    model answered the old question again. This creates/replaces the current turn with an
+    explicit image/file prompt, making the latest upload the focus.
+    """
+    prompt = _current_attachment_prompt(attachments)
+    if not prompt:
+        return messages
+    out = list(messages or [])
+    if out and str(out[-1].get("role") or "").strip() == "user":
+        if not str(out[-1].get("content") or "").strip():
+            out[-1] = dict(out[-1])
+            out[-1]["content"] = prompt
+            return out
+    else:
+        out.append({"role": "user", "content": prompt})
+    return out
+
+
+def _format_web_sources_footer(sources: Any, max_items: int = 5) -> str:
+    """Deprecated fallback.
+
+    OpenAI-style UX keeps citations/sources outside the assistant text.
+    Sources are delivered as structured SSE events (`sources` / `solara.sources`)
+    and rendered by the iOS client as favicon chips under the answer.
+    Returning an empty string prevents long raw URLs from polluting the reply.
+    """
+    return ""
+
 def _extract_allow_web(req: Request, body: Dict[str, Any]) -> bool:
     # body flags
     for k in ("allow_web", "allowWeb", "enable_web_search", "enableWebSearch", "web_search", "webSearch", "use_web", "useWeb"):
@@ -4293,6 +5065,484 @@ def _extract_allow_web(req: Request, body: Dict[str, Any]) -> bool:
     return True
 
 
+# -----------------------------
+# ✅ Smart Router Decision Layer
+# -----------------------------
+# Important: `allow_web` is only a capability/permission switch from the client or plan.
+# It must NOT mean "always search the web". This layer restores the intended priority:
+# user intent -> smart route -> provider/tool selection.
+
+def _smart_router_force_web_from_body(body: Dict[str, Any]) -> bool:
+    """Explicit developer/user override for turns where the UI really means: search now."""
+    if not isinstance(body, dict):
+        return False
+    for k in (
+        "force_web", "forceWeb", "require_web", "requireWeb",
+        "force_web_search", "forceWebSearch", "web_required", "webRequired",
+    ):
+        if k in body and _boolish(body.get(k)):
+            return True
+    route = str(body.get("route") or body.get("intent") or body.get("mode") or "").strip().lower()
+    return route in ("web", "web_search", "openai_web_search", "search", "realtime_search")
+
+
+def _smart_router_disable_web_from_body(body: Dict[str, Any]) -> bool:
+    if not isinstance(body, dict):
+        return False
+    for k in ("no_web", "noWeb", "disable_web", "disableWeb", "offline", "local_only", "localOnly"):
+        if k in body and _boolish(body.get(k)):
+            return True
+    route = str(body.get("route") or body.get("intent") or body.get("mode") or "").strip().lower()
+    return route in ("normal", "normal_chat", "chat", "offline_chat")
+
+
+def _smart_router_text_needs_web(user_text: str) -> Tuple[bool, str]:
+    """Deterministic fallback only.
+
+    This is no longer the primary smart router. It is used only when the model
+    router is disabled/unavailable, so production routing is not keyword-only.
+    """
+    text = (user_text or "").strip()
+    if not text:
+        return False, "empty_text"
+
+    low = text.lower()
+    compact = re.sub(r"\s+", "", low)
+
+    local_only_patterns = (
+        "你是谁", "你叫什么", "你是誰", "你叫什麼", "介绍一下你自己", "介紹一下你自己",
+        "你能做什么", "你会做什么", "你是什么", "who are you", "what are you",
+        "your name", "你还记得", "我是谁", "hello", "hi", "你好", "在吗",
+    )
+    if any(p in low or p in compact for p in local_only_patterns):
+        explicit_search_words = ("搜索", "搜一下", "查", "联网", "上网", "网上", "google", "百度", "web", "search")
+        if not any(w in low or w in compact for w in explicit_search_words):
+            return False, "local_identity_or_smalltalk"
+
+    direct_search_patterns = (
+        "搜索", "搜一下", "查一下", "查下", "查查", "帮我查", "幫我查", "联网查", "上网查", "网上查",
+        "全网", "google", "百度", "必应", "bing", "web search", "search the web", "look up",
+    )
+    if any(p in low or p in compact for p in direct_search_patterns):
+        return True, "fallback_explicit_search_intent"
+
+    freshness_patterns = (
+        "今天", "今日", "现在", "現在", "目前", "刚刚", "剛剛", "最新", "实时", "實時",
+        "最近", "近几天", "这几天", "這幾天", "本周", "这周", "這周", "本月", "今年", "昨天", "明天", "当前", "當前",
+        "current", "latest", "today", "now", "recent", "this week", "this month", "breaking",
+    )
+    fresh_domains = (
+        "新闻", "新聞", "消息", "事件", "热点", "熱點", "发生", "發生", "价格", "價",
+        "股价", "股票", "汇率", "匯率", "天气", "天氣", "赛程", "比分", "排名",
+        "政策", "法规", "法規", "总统", "總統", "ceo", "发布", "發布", "上线", "上架", "大模型", "模型",
+        "news", "price", "stock", "weather", "score", "schedule", "ranking", "release", "model",
+    )
+    if any(p in low or p in compact for p in freshness_patterns) and any(d in low or d in compact for d in fresh_domains):
+        return True, "fallback_fresh_current_info"
+
+    volatile_patterns = (
+        "天气", "天氣", "新闻", "新聞", "股价", "股票", "汇率", "匯率", "航班",
+        "比赛结果", "比分", "赛程", "票价", "价格", "价格是多少", "开放时间", "营业时间",
+        "weather", "news", "stock price", "exchange rate", "flight", "live score", "schedule",
+    )
+    if any(p in low or p in compact for p in volatile_patterns):
+        return True, "fallback_volatile_info"
+
+    return False, "fallback_normal_chat"
+
+
+def _extract_first_json_obj(text: str) -> Dict[str, Any]:
+    """Parse the first JSON object from a model response."""
+    s = (text or "").strip()
+    if not s:
+        return {}
+    try:
+        obj = json.loads(s)
+        return obj if isinstance(obj, dict) else {}
+    except Exception:
+        pass
+    # Strip common fenced blocks.
+    s = re.sub(r"^```(?:json)?\s*", "", s, flags=re.I).strip()
+    s = re.sub(r"\s*```$", "", s).strip()
+    try:
+        obj = json.loads(s)
+        return obj if isinstance(obj, dict) else {}
+    except Exception:
+        pass
+    start = s.find("{")
+    if start < 0:
+        return {}
+    depth = 0
+    in_str = False
+    esc = False
+    for i in range(start, len(s)):
+        ch = s[i]
+        if in_str:
+            if esc:
+                esc = False
+            elif ch == "\\":
+                esc = True
+            elif ch == '"':
+                in_str = False
+            continue
+        if ch == '"':
+            in_str = True
+        elif ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                try:
+                    obj = json.loads(s[start:i+1])
+                    return obj if isinstance(obj, dict) else {}
+                except Exception:
+                    return {}
+    return {}
+
+
+def _normalize_router_route(route: str) -> str:
+    r = (route or "").strip().lower().replace("-", "_").replace(" ", "_")
+    aliases = {
+        "chat": "normal_chat",
+        "normal": "normal_chat",
+        "text": "normal_chat",
+        "text_chat": "normal_chat",
+        "web": "openai_web_search",
+        "search": "openai_web_search",
+        "web_search": "openai_web_search",
+        "realtime_search": "openai_web_search",
+        "latest_info": "openai_web_search",
+        "current_info": "openai_web_search",
+        "image": "vision",
+        "photo": "vision",
+        "file": "file_question",
+        "document": "file_question",
+        "rag": "file_question",
+    }
+    r = aliases.get(r, r)
+    if r not in ("normal_chat", "openai_web_search", "vision", "file_question"):
+        return "normal_chat"
+    return r
+
+
+def _smart_router_llm_cache_get(key: str) -> Optional[Dict[str, Any]]:
+    if not key or SMART_ROUTER_LLM_CACHE_TTL_SEC <= 0:
+        return None
+    now = time.time()
+    with _SMART_ROUTER_LLM_CACHE_LOCK:
+        ent = _SMART_ROUTER_LLM_CACHE.get(key)
+        if not ent:
+            return None
+        exp, val = ent
+        if exp < now:
+            try:
+                _SMART_ROUTER_LLM_CACHE.pop(key, None)
+            except Exception:
+                pass
+            return None
+        return dict(val)
+
+
+def _smart_router_llm_cache_set(key: str, val: Dict[str, Any]) -> None:
+    if not key or SMART_ROUTER_LLM_CACHE_TTL_SEC <= 0:
+        return
+    with _SMART_ROUTER_LLM_CACHE_LOCK:
+        _SMART_ROUTER_LLM_CACHE[key] = (time.time() + SMART_ROUTER_LLM_CACHE_TTL_SEC, dict(val))
+        if len(_SMART_ROUTER_LLM_CACHE) > 500:
+            # Cheap cleanup; preserve recent insertions roughly.
+            for k in list(_SMART_ROUTER_LLM_CACHE.keys())[:100]:
+                _SMART_ROUTER_LLM_CACHE.pop(k, None)
+
+
+
+def _smart_router_fast_predecision(user_text: str, *, plan: str = "") -> Optional[Dict[str, Any]]:
+    """Ultra-fast capability gate for obvious turns.
+
+    This is not the full smart router. It only short-circuits high-confidence cases
+    so common chat does not wait for a router LLM network roundtrip. Ambiguous
+    requests still fall through to the model-driven router.
+    """
+    if not SMART_ROUTER_FAST_PATH_ENABLED:
+        return None
+    text = (user_text or "").strip()
+    if not text:
+        return {
+            "route": "normal_chat",
+            "need_web": False,
+            "need_vision": False,
+            "need_file": False,
+            "confidence": 1.0,
+            "reason": "fast_empty_text",
+            "router_source": "fast_path",
+        }
+
+    low = text.lower()
+    compact = re.sub(r"\s+", "", low)
+
+    # Explicit realtime/search intent: do not spend 2-8 seconds asking a router LLM.
+    explicit_search = (
+        "搜索", "搜一下", "搜下", "查一下", "查下", "查查", "帮我查", "幫我查",
+        "联网", "上网", "网上", "全网", "google", "百度", "必应", "bing",
+        "web search", "search the web", "look up",
+    )
+    freshness = (
+        "今天", "今日", "现在", "目前", "当前", "最新", "实时", "刚刚", "最近", "这几天", "近几天",
+        "本周", "这周", "本月", "今年", "新闻", "发布", "上线", "价格", "股价", "汇率", "天气",
+        "today", "now", "current", "latest", "recent", "this week", "news", "release", "price",
+    )
+    volatile_domains = (
+        "新闻", "消息", "发布", "上线", "模型", "大模型", "api", "价格", "股价", "汇率", "天气",
+        "战争", "局势", "公司", "政策", "法规", "ceo", "融资", "开源", "比赛", "赛程", "比分",
+        "news", "release", "model", "price", "stock", "weather", "war", "policy", "score",
+    )
+    if any(x in low or x in compact for x in explicit_search):
+        return {
+            "route": "openai_web_search",
+            "need_web": True,
+            "need_vision": False,
+            "need_file": False,
+            "confidence": 0.98,
+            "reason": "fast_explicit_search_intent",
+            "router_source": "fast_path",
+        }
+    if any(x in low or x in compact for x in freshness) and any(x in low or x in compact for x in volatile_domains):
+        return {
+            "route": "openai_web_search",
+            "need_web": True,
+            "need_vision": False,
+            "need_file": False,
+            "confidence": 0.94,
+            "reason": "fast_fresh_volatile_info",
+            "router_source": "fast_path",
+        }
+
+    # Obvious local chat / identity / writing / code requests: answer directly with the normal model.
+    local_chat = (
+        "你是谁", "你叫什么", "介绍你自己", "介绍一下你自己", "自我介绍", "你能做什么", "你会做什么",
+        "你好", "在吗", "hello", "hi", "who are you", "what are you", "your name",
+    )
+    creative_or_code = (
+        "帮我写", "写一段", "改写", "润色", "翻译", "总结", "解释这段", "分析这段",
+        "修复代码", "写代码", "代码", "脚本", "函数", "报错", "debug", "rewrite", "translate", "summarize",
+    )
+    if any(x in low or x in compact for x in local_chat):
+        return {
+            "route": "normal_chat",
+            "need_web": False,
+            "need_vision": False,
+            "need_file": False,
+            "confidence": 0.98,
+            "reason": "fast_identity_or_smalltalk",
+            "router_source": "fast_path",
+        }
+    if any(x in low or x in compact for x in creative_or_code) and not any(x in low or x in compact for x in freshness):
+        return {
+            "route": "normal_chat",
+            "need_web": False,
+            "need_vision": False,
+            "need_file": False,
+            "confidence": 0.88,
+            "reason": "fast_local_generation_or_code",
+            "router_source": "fast_path",
+        }
+
+    # Very short non-search turns should not wait for remote routing.
+    if len(compact) <= 18 and not any(x in low or x in compact for x in freshness):
+        return {
+            "route": "normal_chat",
+            "need_web": False,
+            "need_vision": False,
+            "need_file": False,
+            "confidence": 0.80,
+            "reason": "fast_short_normal_chat",
+            "router_source": "fast_path",
+        }
+
+    return None
+
+def _smart_router_model_decide_text(user_text: str, *, plan: str = "") -> Optional[Dict[str, Any]]:
+    """Model-driven capability router.
+
+    It classifies the user's intent into capabilities, but never answers the user.
+    The selected route then hands off to the provider with that capability:
+      - normal_chat -> DashScope/Qwen text
+      - openai_web_search -> OpenAI Responses API with web_search
+      - vision -> multimodal model
+      - file_question -> file extraction / retrieval path
+    """
+    text = (user_text or "").strip()
+    if not text or not SMART_ROUTER_LLM_ENABLED:
+        return None
+
+    cache_key = hashlib.sha1((SMART_ROUTER_LLM_MODEL + "|" + plan + "|" + text).encode("utf-8", errors="ignore")).hexdigest()
+    cached = _smart_router_llm_cache_get(cache_key)
+    if cached:
+        cached["router_source"] = cached.get("router_source") or "llm_cache"
+        return cached
+
+    system = (
+        "你是 ChatAGI 后端【能力智能路由器】，不是聊天助手。你的唯一任务是判断用户这一轮应该交给哪个能力处理。\n"
+        "你只能输出一个 JSON 对象，禁止输出解释、Markdown、自然语言回答。\n"
+        "可选 route：\n"
+        "- normal_chat：闲聊、身份、写作、翻译、代码解释、常识推理、无需实时信息。\n"
+        "- openai_web_search：用户要查、搜、核实、询问今天/最近/这几天/当前/最新/发布/新闻/价格/API变动/模型发布/公司动态等可能变化的信息。\n"
+        "- vision：需要看图片/照片/截图。\n"
+        "- file_question：需要读取用户上传文件、文档、PDF、表格。\n"
+        "能力边界：qwen3.6-plus 不能保证最新外部事实；OpenAI web_search 才能处理实时联网。\n"
+        "如果用户问的是『这几天美国大模型有什么发布』这类问题，必须 route=openai_web_search。\n"
+        "如果用户问『你是谁/你好/写一段文案/帮我改代码』，通常 route=normal_chat。\n"
+        "输出 JSON 字段固定为：route, need_web, need_vision, need_file, confidence, reason。confidence 为 0~1。"
+    )
+    user = f"用户输入：{text}\n当前套餐：{plan or 'unknown'}\n只输出 JSON："
+
+    messages = [
+        {"role": "system", "content": system},
+        {"role": "user", "content": user},
+    ]
+
+    try:
+        provider = (SMART_ROUTER_LLM_PROVIDER or "dashscope").strip().lower()
+        raw = ""
+        if provider in ("dashscope", "qwen", "aliyun"):
+            if not DASHSCOPE_API_KEY:
+                return None
+            payload = {
+                "model": SMART_ROUTER_LLM_MODEL or DASHSCOPE_MODEL_DEFAULT,
+                "messages": messages,
+                "stream": False,
+                "temperature": 0,
+                "max_tokens": 220,
+            }
+            r = requests.post(
+                _dashscope_chat_url(),
+                headers=_dashscope_headers(stream=False),
+                json=payload,
+                timeout=(min(CHAT_STREAM_CONNECT_TIMEOUT_SEC, 10), max(2.0, float(SMART_ROUTER_LLM_TIMEOUT_SEC))),
+            )
+            rid = r.headers.get("x-request-id") or r.headers.get("request-id") or "-"
+            log.info("[SmartRouter.LLM] provider=dashscope model=%s status=%s rid=%s", payload["model"], r.status_code, rid)
+            if r.status_code >= 400:
+                raise RuntimeError(f"dashscope_router_error {r.status_code}: {_short(r.text, 300)}")
+            data = r.json() if r.text else {}
+            choices = data.get("choices") if isinstance(data, dict) else None
+            if isinstance(choices, list) and choices:
+                msg = choices[0].get("message") if isinstance(choices[0], dict) else None
+                if isinstance(msg, dict):
+                    raw = str(msg.get("content") or "")
+        else:
+            # Keep the router extensible. Unknown provider falls back to deterministic classifier.
+            return None
+
+        obj = _extract_first_json_obj(raw)
+        if not obj:
+            return None
+        route = _normalize_router_route(str(obj.get("route") or ""))
+        try:
+            conf = float(obj.get("confidence") if obj.get("confidence") is not None else 0.0)
+        except Exception:
+            conf = 0.0
+        need_web = bool(obj.get("need_web")) or route == "openai_web_search"
+        need_vision = bool(obj.get("need_vision")) or route == "vision"
+        need_file = bool(obj.get("need_file")) or route == "file_question"
+        decision = {
+            "route": route,
+            "need_web": bool(need_web),
+            "need_vision": bool(need_vision),
+            "need_file": bool(need_file),
+            "confidence": max(0.0, min(conf, 1.0)),
+            "reason": str(obj.get("reason") or "llm_route"),
+            "router_source": "llm",
+        }
+        _smart_router_llm_cache_set(cache_key, decision)
+        return decision
+    except Exception as e:
+        log.warning("[SmartRouter.LLM] failed, fallback to deterministic route: %s", e)
+        return None
+
+
+def _smart_router_decision(
+    *,
+    user_text: str,
+    allow_web: bool,
+    attachments: List[Dict[str, Any]],
+    requested_model: str = "",
+    plan: str = "",
+    body: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Return the capability route decision used by /chat and /chat/prepare."""
+    body = body or {}
+    has_image = _has_image_attachments(attachments) if attachments else False
+    has_file = _has_file_attachments(attachments) if attachments else False
+    web_allowed = bool(allow_web)
+
+    # Hard capability facts: these do not need a text classifier.
+    if has_file:
+        need_web = False
+        web_reason = "file_attachment"
+        route = "file_question"
+    elif has_image:
+        need_web = False
+        web_reason = "image_attachment"
+        route = "vision"
+    elif _smart_router_disable_web_from_body(body):
+        need_web = False
+        web_reason = "disabled_by_request"
+        route = "normal_chat"
+    elif _smart_router_force_web_from_body(body):
+        need_web = bool(web_allowed)
+        web_reason = "forced_by_request" if web_allowed else "forced_but_not_allowed"
+        route = "openai_web_search" if need_web else "normal_chat"
+    else:
+        fast_decision = _smart_router_fast_predecision(user_text, plan=plan)
+        llm_decision = None if fast_decision else _smart_router_model_decide_text(user_text, plan=plan)
+        route_decision = fast_decision or llm_decision
+        if route_decision and float(route_decision.get("confidence") or 0.0) >= SMART_ROUTER_LLM_CONFIDENCE_MIN:
+            route = _normalize_router_route(str(route_decision.get("route") or "normal_chat"))
+            need_web0 = bool(route_decision.get("need_web")) or route == "openai_web_search"
+            need_web = bool(web_allowed and need_web0)
+            web_reason = str(route_decision.get("reason") or "route_decision")
+            if need_web0 and not web_allowed:
+                web_reason = f"{web_reason}_but_not_allowed"
+            if need_web:
+                route = "openai_web_search"
+            elif route == "openai_web_search":
+                route = "normal_chat"
+        else:
+            need_web0, web_reason = _smart_router_text_needs_web(user_text)
+            need_web = bool(web_allowed and need_web0)
+            if need_web0 and not web_allowed:
+                web_reason = f"{web_reason}_but_not_allowed"
+            route = "openai_web_search" if need_web else "normal_chat"
+
+    if route == "openai_web_search" and need_web:
+        provider = "openai"
+        model = OPENAI_WEB_SEARCH_MODEL
+    elif route == "file_question":
+        provider = "dashscope" if _is_qwen_model(requested_model or DASHSCOPE_MODEL_DEFAULT) else "openai"
+        model = requested_model or DASHSCOPE_MODEL_DEFAULT
+    elif route == "vision":
+        provider = "dashscope" if _is_qwen_model(requested_model or DASHSCOPE_MODEL_DEFAULT) else "openai"
+        model = requested_model or DASHSCOPE_MODEL_DEFAULT
+    else:
+        provider = "dashscope" if _is_qwen_model(requested_model or DASHSCOPE_MODEL_DEFAULT) else "openai"
+        model = requested_model or DASHSCOPE_MODEL_DEFAULT
+        route = "normal_chat"
+        need_web = False
+
+    return {
+        "need_web": bool(need_web),
+        "need_vision": bool(has_image or route == "vision"),
+        "need_file": bool(has_file or route == "file_question"),
+        "provider": provider,
+        "model": model,
+        "route": route,
+        "web_allowed": bool(web_allowed),
+        "web_reason": web_reason,
+        "plan": plan or "",
+        "router": "fast_then_llm_capability_router" if SMART_ROUTER_LLM_ENABLED else "fallback_deterministic_router",
+        "router_fast_path_enabled": bool(SMART_ROUTER_FAST_PATH_ENABLED),
+        "router_model": SMART_ROUTER_LLM_MODEL,
+    }
 
 def _extract_plan(request: Request, body: Dict[str, Any]) -> str:
     """Extract plan/tier from body, headers, or query params (raw string)."""
@@ -4348,13 +5598,43 @@ def _attachments_require_openai(attachments: List[Dict[str, Any]], model: str = 
 
 
 def _route_provider(*, allow_web: bool, attachments: List[Dict[str, Any]], model: str = "") -> Tuple[str, str]:
-    # Explicit model name routing (client requested a specific provider's model)
+    # ============================================================
+    # ✅ HARD RULES (override everything, including explicit model selection):
+    #   1) Any image/video attachment -> OpenAI
+    #      Reason: DeepSeek API has no public vision endpoint as of 2026-05.
+    #              Even if user picked DeepSeek in UI, route to OpenAI for vision.
+    #      (Claude/Qwen models still keep their native vision — handled in
+    #       _attachments_require_openai which returns False for those models.)
+    #   2) allow_web=True AND OpenAI is unavailable -> OpenAI
+    #      Reason: DeepSeek/DashScope have no built-in web search; we rely on
+    #              OpenAI injection. If OpenAI is missing or recently failed,
+    #              fall back to OpenAI's built-in web_search tool.
+    #      If OpenAI is healthy, keep cheaper China-side providers and use
+    #              prompt-injection (preserves "China-first" routing strategy).
+    # ============================================================
+
+    # Rule 1: image/video -> OpenAI only when the requested model has no native vision.
+    # Qwen/Claude keep their own multimodal path via _attachments_require_openai(False).
+    if _attachments_require_openai(attachments, model=model):
+        return "openai", "attachments_force_openai"
+
+    # ✅ Restored behavior: `allow_web` arriving here is no longer the raw client flag.
+    # It is the smart-router decision result. Only an intent-approved web turn uses
+    # OpenAI built-in web_search; normal chat like “你是谁” stays on Qwen/DashScope.
+    if allow_web:
+        return "openai", "smart_router_decision:web_search"
+
+    # V1 App Store hard path: explicit Qwen plan models stay on DashScope for
+    # normal chat / photo understanding. Only smart-router-approved web turns go OpenAI.
     if _is_qwen_model(model):
         return "dashscope", "explicit_qwen_model"
 
-    # attachments (image/video) -> OpenAI (but NOT when Claude/Qwen model is requested)
-    if _attachments_require_openai(attachments, model=model):
-        return "openai", "attachments"
+
+    # ----- Below this line: original routing (no images, web is fine) -----
+
+    # Explicit model name routing (client requested a specific provider's model)
+    if _is_deepseek_model(model):
+        return "deepseek", "explicit_deepseek_model"
 
     mode = (CHAT_ROUTE_MODE or "A").strip().upper()
 
@@ -4366,7 +5646,7 @@ def _route_provider(*, allow_web: bool, attachments: List[Dict[str, Any]], model
         return ("openai", "allow_web") if allow_web else ("deepseek", "allow_web=false")
     if mode in ("OPENAI", "OPENAI_ONLY", "GPT", "GPT_ONLY"):
         return "openai", f"mode={mode}"
-    if mode in ("DEEPSEEK", "DEEPSEEK_ONLY"):
+    if mode in ("DEEPSEEK", "DEEPSEEK_ONLY", "DEEPSEEK_V4", "DEEPSEEKV4"):
         return "deepseek", f"mode={mode}"
     # unknown -> safe fallback
     return ("openai", f"mode={mode}")
@@ -4379,12 +5659,15 @@ def _select_routed_model(provider: str, requested_model: str = "") -> str:
             return req
         return DASHSCOPE_MODEL_DEFAULT or "qwen3.5-plus"
     if provider == "deepseek":
-        # server-controlled default; allow overriding only with explicit deepseek model name
-        if req.lower().startswith("deepseek"):
-            return req
+        # server-controlled default; allow overriding with explicit DeepSeek aliases such as DeepSeek V4.
+        if _is_deepseek_model(req):
+            return _normalize_deepseek_model(req)
+        # In DEEPSEEK_V4 mode, use the V4 alias target even when client sends no model.
+        if (CHAT_ROUTE_MODE or "").strip().upper() in ("DEEPSEEK_V4", "DEEPSEEKV4"):
+            return DEEPSEEK_V4_MODEL or DEEPSEEK_MODEL_DEFAULT or "deepseek-reasoner"
         return DEEPSEEK_MODEL_DEFAULT or "deepseek-reasoner"
     # openai
-    if req and not req.lower().startswith("deepseek") and not _is_qwen_model(req):
+    if req and not _is_deepseek_model(req) and not _is_qwen_model(req):
         return req
     return OPENAI_TEXT_MODEL or CHAT_MODEL_DEFAULT
 
@@ -5500,30 +6783,9 @@ def _tts_stream_fulltext_to_live(
     if not s:
         return
 
-    # ✅ 优先用用户克隆的声音（ElevenLabs）
-    try:
-        from adu_voice_clone import get_user_voice_id, DEFAULT_VOICE_ID
-        import httpx as _httpx
-        import os as _os
-        _api_key = _os.getenv("ELEVENLABS_API_KEY", "")
-        _cloned_id = get_user_voice_id(user_id)
-        if _api_key and _cloned_id != DEFAULT_VOICE_ID:
-            _clean = _tts_sanitize_text(text)
-            _r = _httpx.post(
-                f"https://api.elevenlabs.io/v1/text-to-speech/{_cloned_id}",
-                headers={"xi-api-key": _api_key, "Content-Type": "application/json"},
-                json={"text": _clean, "model_id": "eleven_multilingual_v2",
-                      "output_format": "mp3_44100_128"},
-                timeout=60.0
-            )
-            if _r.status_code == 200:
-                s.feed(_r.content)
-                s.finish()
-                return
-            else:
-                log.warning(f"[TTS] ElevenLabs失败({_r.status_code})，回退OpenAI")
-    except Exception as _e:
-        log.warning(f"[TTS] ElevenLabs异常，回退OpenAI: {_e}")
+    # ✅ Voice clone disabled: always use the normal app TTS voice.
+    # The previous cloned-voice branch was removed so realtime/chat TTS
+    # cannot accidentally switch to a user-cloned voice.
 
     voice = _normalize_tts_voice(voice)
     fmt = (fmt or "mp3").strip().lower()
@@ -5600,14 +6862,8 @@ def _tts_stream_fulltext_to_live(
                     pass
                 continue
 
-            for chunk in r.iter_content(chunk_size=TTS_STREAM_CHUNK_SIZE_DEFAULT):
-                if chunk:
-                    s.push(chunk)
-
-            try:
-                r.close()
-            except Exception:
-                pass
+            for chunk in _safe_iter_response_content(r, label="TTS.prepare"):
+                s.push(chunk)
 
     except Exception as e:
         log.warning("[TTS.prepare] failed: %s", e)
@@ -6003,7 +7259,7 @@ def _stream_openai_events(
 
 def _stream_deepseek_events(
     model: str,
-    messages: List[Dict[str, str]],
+    messages: List[Dict[str, Any]],
     *,
     max_tokens: Optional[int] = None,
 ) -> Iterator[Dict[str, Any]]:
@@ -6384,10 +7640,12 @@ def _server_self_url(path_or_url: str) -> str:
 def _read_image_bytes_from_attachment(a: Dict[str, Any]) -> bytes:
     """Read bytes for an image attachment (Scheme-A).
     Priority:
-      1) local disk path (if url maps to uploads/)
-      2) HTTP fetch from THIS backend (e.g. /media/xxx or http://192.168.x.x/media/xxx)
+      0) data URL (already base64)
+      1) media_store by id/media_id (new upload router path)
+      2) local disk path (if url maps to uploads/)
+      3) HTTP fetch from THIS backend (e.g. /media/xxx or http://192.168.x.x/media/xxx)
     """
-    url = (a.get("url") or "").strip()
+    url = _attachment_url(a)
 
     # 0) data URL (already base64)
     if url.startswith("data:") and "base64," in url:
@@ -6397,7 +7655,17 @@ def _read_image_bytes_from_attachment(a: Dict[str, Any]) -> bytes:
         except Exception:
             raise RuntimeError("image_data_url_decode_failed")
 
-    # 1) local file path (uploads/)
+    # 1) media_store by id/media_id (preferred for /media/upload responses)
+    media_id = str(a.get("id") or a.get("media_id") or a.get("mediaId") or "").strip()
+    if media_id and _media_store:
+        try:
+            meta = _media_store.get(media_id)
+            if meta and getattr(meta, "path", None) and meta.path.exists():
+                return meta.path.read_bytes()
+        except Exception:
+            pass
+
+    # 2) local file path (uploads/)
     if url:
         p = _resolve_local_upload_path(url)
         if p and p.exists():
@@ -6493,10 +7761,8 @@ def _extract_file_content(attachment: Dict[str, Any], max_chars: int = 120000) -
     """
     # ── 1. 从 media_store 按 id 拿字节 ──────────────────────────────────────
     raw: Optional[bytes] = None
-    fname = (
-        attachment.get("filename") or attachment.get("name") or ""
-    ).strip()
-    mime = (attachment.get("mime") or "").strip()
+    fname = _attachment_filename(attachment)
+    mime = _attachment_mime(attachment)
 
     media_id = (attachment.get("id") or "").strip()
     if media_id and _media_store:
@@ -6513,7 +7779,7 @@ def _extract_file_content(attachment: Dict[str, Any], max_chars: int = 120000) -
 
     # fallback: loopback HTTP（兼容 media_store 不可用的情况）
     if not raw:
-        url = (attachment.get("url") or "").strip()
+        url = _attachment_url(attachment)
         if url:
             try:
                 fetch_url = _server_self_url(url)
@@ -6726,9 +7992,9 @@ def _build_responses_input(messages: List[Dict[str, str]], attachments: List[Dic
         for a in attachments:
             if not isinstance(a, dict):
                 continue
-            at = (a.get("type") or "").strip().lower()
-            url = (a.get("url") or "").strip()
-            mime = (a.get("mime") or "").strip()
+            at = _attachment_type(a)
+            url = _attachment_url(a)
+            mime = _attachment_mime(a)
 
             # Some upload routes return OpenAI file IDs. Responses API supports `file_id` for input_image.
             # We keep it as an escape hatch when server-side byte fetching fails.
@@ -6743,32 +8009,36 @@ def _build_responses_input(messages: List[Dict[str, str]], attachments: List[Dic
             # ✅✅✅ Image (Scheme-A): prefer DATA URL in `image_url` (OpenAI must NOT download LAN URLs)
             # Fallback: if server cannot fetch bytes but caller provided an OpenAI `file_id`, use it.
             if is_image:
-                if url:
-                    try:
-                        raw = _read_image_bytes_from_attachment(a)
-                        b64 = base64.b64encode(raw).decode("utf-8")
-                        mime2 = (mime or "").strip() or "image/jpeg"
-                        if not mime2.lower().startswith("image/"):
-                            mime2 = "image/jpeg"
-                        data_url = f"data:{mime2};base64,{b64}"
-                        content_list.append({"type": "input_image", "image_url": data_url})
-                    except Exception as e:
-                        log.warning("[chat.attach] image->base64 failed url=%s err=%s", _short(url, 160), e)
-                        if file_id_is_openai:
-                            content_list.append({"type": "input_image", "file_id": file_id})
-                        else:
-                            # keep chat alive; degrade gracefully
-                            content_list.append({"type": "input_text", "text": f"[image unavailable] {url}"})
-                    continue
-
-                if file_id_is_openai:
-                    content_list.append({"type": "input_image", "file_id": file_id})
-                    continue
+                try:
+                    raw = _read_image_bytes_from_attachment(a)
+                    b64 = base64.b64encode(raw).decode("utf-8")
+                    mime2 = (mime or "").strip() or "image/jpeg"
+                    if not mime2.lower().startswith("image/"):
+                        mime2 = "image/jpeg"
+                    data_url = f"data:{mime2};base64,{b64}"
+                    content_list.append({"type": "input_image", "image_url": data_url})
+                except Exception as e:
+                    log.warning("[chat.attach] image->base64 failed id=%s url=%s err=%s", _short(file_id, 80), _short(url, 160), e)
+                    if file_id_is_openai:
+                        content_list.append({"type": "input_image", "file_id": file_id})
+                    else:
+                        # keep chat alive; degrade gracefully
+                        fname = str(a.get("filename") or a.get("name") or "image").strip()
+                        content_list.append({"type": "input_text", "text": f"[image unavailable] {fname} {url}".strip()})
+                continue
             # ✅ audio: Responses API does NOT accept input_audio. Use transcript -> input_text.
             if at == "audio":
                 tr = (a.get("transcript") or "").strip()
                 if tr:
-                    content_list.append({"type": "input_text", "text": f"[voice transcript]\n{tr}"})
+                    existing_text = "\n".join(
+                        str(x.get("text") or "")
+                        for x in content_list
+                        if isinstance(x, dict) and str(x.get("type") or "") in ("input_text", "output_text", "text")
+                    )
+                    # If _ensure_current_user_turn_for_attachments already made the transcript
+                    # the current user message, do not append it a second time.
+                    if tr not in existing_text:
+                        content_list.append({"type": "input_text", "text": f"[voice transcript]\n{tr}"})
                     continue
                 if url:
                     content_list.append({"type": "input_text", "text": f"[voice message] url={url}"})
@@ -6808,6 +8078,115 @@ def _build_responses_input(messages: List[Dict[str, str]], attachments: List[Dic
                 })
 
     return inp
+
+
+def _responses_input_to_chat_completions_messages(inp: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Convert OpenAI Responses-style input blocks to OpenAI-compatible Chat Completions.
+
+    DashScope/Qwen multimodal chat expects content blocks like:
+      {"type":"image_url","image_url":{"url":"data:image/jpeg;base64,..."}}
+      {"type":"text","text":"..."}
+    Alibaba Cloud Model Studio documents Qwen chat as OpenAI-compatible and accepts this
+    Chat Completions content-block format for images.
+    """
+    out: List[Dict[str, Any]] = []
+
+    for m in (inp or []):
+        if not isinstance(m, dict):
+            continue
+        role = str(m.get("role") or "user").strip().lower() or "user"
+        if role == "developer":
+            role = "system"
+        if role not in ("system", "user", "assistant", "tool"):
+            role = "user"
+
+        blocks = m.get("content") or []
+        if isinstance(blocks, str):
+            content_text = blocks.strip()
+            if content_text:
+                out.append({"role": role, "content": content_text})
+            continue
+
+        text_parts: List[str] = []
+        qwen_blocks: List[Dict[str, Any]] = []
+        has_image = False
+
+        for b in (blocks or []):
+            if not isinstance(b, dict):
+                continue
+            bt = str(b.get("type") or "").strip()
+
+            if bt in ("input_text", "output_text", "text"):
+                txt = str(b.get("text") or "")
+                if txt:
+                    text_parts.append(txt)
+                    qwen_blocks.append({"type": "text", "text": txt})
+                continue
+
+            if bt == "input_image":
+                image_url = ""
+                raw_url = b.get("image_url")
+                if isinstance(raw_url, dict):
+                    image_url = str(raw_url.get("url") or "").strip()
+                elif isinstance(raw_url, str):
+                    image_url = raw_url.strip()
+
+                if image_url:
+                    qwen_blocks.append({"type": "image_url", "image_url": {"url": image_url}})
+                    has_image = True
+                else:
+                    file_id = str(b.get("file_id") or "").strip()
+                    text_parts.append(f"[image attached: {file_id or 'unavailable'}]")
+                    qwen_blocks.append({"type": "text", "text": f"[image attached: {file_id or 'unavailable'}]"})
+                continue
+
+        if has_image and role == "user":
+            # Qwen vision path: keep typed content blocks.
+            if not any(isinstance(x, dict) and x.get("type") == "text" and str(x.get("text") or "").strip() for x in qwen_blocks):
+                qwen_blocks.append({"type": "text", "text": "请分析这张图片。"})
+            out.append({"role": role, "content": qwen_blocks or [{"type": "text", "text": "请分析这张图片。"}]})
+        else:
+            # Text-only or non-user messages: use plain string for widest compatibility.
+            content_text = "\n".join(t for t in text_parts if t).strip()
+            if content_text:
+                out.append({"role": role, "content": content_text})
+
+    return out
+
+
+def _build_qwen_chat_messages(
+    messages: List[Dict[str, Any]],
+    attachments: Optional[List[Dict[str, Any]]] = None,
+    *,
+    instructions: Optional[str] = None,
+) -> List[Dict[str, Any]]:
+    """Build DashScope/Qwen OpenAI-compatible Chat Completions messages.
+
+    This is the V1 app-store path: qwen3.6-plus + OpenAI web context + photo upload.
+    It reuses _build_responses_input so local /media uploads become data URLs and file/audio
+    attachments become text blocks, then converts blocks into Chat Completions format.
+    """
+    base: List[Dict[str, Any]] = []
+    for m in (messages or []):
+        if isinstance(m, dict):
+            base.append(dict(m))
+
+    if instructions:
+        inst = instructions.strip()
+        if inst and not any(str(mm.get("content") or "").strip() == inst for mm in base if isinstance(mm, dict)):
+            insert_at = 1 if (base and str(base[0].get("role") or "").strip() in ("system", "developer")) else 0
+            base.insert(insert_at, {"role": "system", "content": inst})
+
+    inp = _build_responses_input(base, attachments or [])
+    out = _responses_input_to_chat_completions_messages(inp)
+    try:
+        img_count = sum(1 for a in (attachments or []) if isinstance(a, dict) and _attachment_type(a) == "image")
+        if img_count:
+            log.info("[chat.qwen] multimodal images=%s messages=%s", img_count, len(out))
+    except Exception:
+        pass
+    return out
+
 
 def _openai_responses_create_nonstream(
     *,
@@ -6982,8 +8361,9 @@ def _chat_complete_full_text(
     current_messages = list(messages or [])
     current_attachments = attachments
 
-    # ✅ External web search provider (Serper): fetch results once and inject into prompt.
-    # This keeps web results consistent across models (OpenAI/Claude/etc.) without relying on OpenAI tools.
+    # ✅ Restored legacy behavior: external web provider (Serper) fetches once and
+    # injects numbered results into the prompt. OpenAI built-in web_search remains
+    # available when CHAT_WEB_PROVIDER=openai, but allow_web no longer hard-forces it.
     if enable_web_search and CHAT_ENABLE_WEB_SEARCH_DEFAULT and CHAT_WEB_PROVIDER.startswith("serper"):
         try:
             q = _last_user_text_from_messages(current_messages)
@@ -7239,29 +8619,14 @@ def _dashscope_complete_full_text(
             insert_at = 1 if (prefix and prefix[0].get("role") in ("system", "developer")) else 0
             prefix.insert(insert_at, {"role": "system", "content": instructions})
 
-    def _extract_transcripts(atts: List[Dict[str, Any]]) -> str:
-        texts: List[str] = []
-        for a in (atts or []):
-            if not isinstance(a, dict):
-                continue
-            if str(a.get("type") or "").strip().lower() != "audio":
-                continue
-            tr = str(a.get("transcript") or "").strip()
-            if tr:
-                texts.append(tr)
-        return "\n".join(texts).strip()
-
-    transcript = _extract_transcripts(attachments)
-
     full = ""
     status = "completed"
     response_id = ""
     incomplete_details: Optional[Dict[str, Any]] = None
     continuations = 0
 
-    qs_messages = list(messages or [])
-    if transcript:
-        qs_messages.append({"role": "user", "content": f"[voice transcript]\n{transcript}"})
+    # Qwen3.6-Plus app-store path: include text, OpenAI web context, files/audio, and photos.
+    qs_messages = _build_qwen_chat_messages(messages, attachments, instructions=instructions)
 
     while True:
         part_parts: List[str] = []
@@ -7405,31 +8770,7 @@ def _spawn_chat_worker(
             if not seg:
                 return
 
-            # ✅ 优先用用户克隆的声音（ElevenLabs）
-            log.info("[TTS.DEBUG] _tts_stream_segment 进入ElevenLabs判断")
-            try:
-                import httpx as _httpx, os as _os
-                from adu_voice_clone import get_user_voice_id, DEFAULT_VOICE_ID
-                _api_key = _os.getenv("ELEVENLABS_API_KEY", "")
-                _uid = (body.get("client_id") or body.get("user_id") or "adu_system")
-                _cloned_id = get_user_voice_id(_uid)
-                if _api_key and _cloned_id != DEFAULT_VOICE_ID:
-                    _r = _httpx.post(
-                        f"https://api.elevenlabs.io/v1/text-to-speech/{_cloned_id}",
-                        headers={"xi-api-key": _api_key, "Content-Type": "application/json"},
-                        json={"text": seg, "model_id": "eleven_multilingual_v2",
-                              "output_format": "mp3_44100_128"},
-                        timeout=60.0
-                    )
-                    if _r.status_code == 200:
-                        _live = _get_live_tts(job.tts_id)
-                        if _live:
-                            _live.feed(_r.content)
-                            log.info("[TTS] ElevenLabs克隆声音播报成功")
-                        return
-                    log.warning(f"[TTS] ElevenLabs {_r.status_code} 回退OpenAI")
-            except Exception as _e:
-                log.warning(f"[TTS] ElevenLabs异常回退: {_e}")
+            # ✅ Voice clone disabled: stream this segment through the normal TTS provider only.
 
             voice = _normalize_tts_voice(tts_voice)
             payload: Dict[str, Any] = {"model": TTS_MODEL_DEFAULT, "voice": voice, "input": seg}
@@ -7475,14 +8816,8 @@ def _spawn_chat_worker(
             if r.status_code >= 400:
                 raise RuntimeError(f"openai_tts_error {r.status_code}: {_short(r.text, 300)}")
 
-            for chunk in r.iter_content(chunk_size=TTS_STREAM_CHUNK_SIZE_DEFAULT):
-                if chunk:
-                    live.push(chunk)
-
-            try:
-                r.close()
-            except Exception:
-                pass
+            for chunk in _safe_iter_response_content(r, label="chat-tts.stream"):
+                live.push(chunk)
 
         def tts_consumer():
             try:
@@ -7526,15 +8861,14 @@ def _spawn_chat_worker(
             base_messages = list(messages or [])
             current_attachments = attachments
 
-            # ✅ External web search provider (Serper): prefetch and push sources for UI.
+            # ✅ Restored legacy behavior: external web provider (Serper) prefetches
+            # sources for UI favicon chips and injects numbered results into prompt.
             if allow_web and CHAT_ENABLE_WEB_SEARCH_DEFAULT and CHAT_WEB_PROVIDER.startswith("serper"):
                 try:
                     q = (last_user_text or _last_user_text_from_messages(base_messages) or "").strip()
                     if q:
                         web_results = _serper_web_search(q, k=CHAT_WEB_TOPK_DEFAULT, kind=SERPER_DEFAULT_KIND)
-                        # Push sources to client UI (favicons)
                         _push_sources(web_results)
-                        # Inject into prompt
                         web_ctx = _format_web_context_for_prompt(web_results)
                         if web_ctx:
                             base_messages = _inject_web_context(base_messages, web_ctx)
@@ -7566,18 +8900,24 @@ def _spawn_chat_worker(
                         for a in (current_attachments or []):
                             if not isinstance(a, dict):
                                 continue
-                            at = str(a.get("type") or "").strip().lower()
+                            at = _attachment_type(a)
                             if at == "audio":
                                 tr = str(a.get("transcript") or "").strip()
                                 if tr:
-                                    trs.append(tr)
+                                    existing_msg_text = "\n".join(
+                                        str(mm.get("content") or "")
+                                        for mm in ds_msgs
+                                        if isinstance(mm, dict)
+                                    )
+                                    if tr not in existing_msg_text:
+                                        trs.append(tr)
                             if at == "file":
                                 extracted = _extract_file_content(a)
                                 if extracted:
                                     file_urls.append(extracted)
                                 else:
-                                    u = str(a.get("url") or "").strip()
-                                    fname = (a.get("filename") or a.get("name") or "file").strip()
+                                    u = _attachment_url(a)
+                                    fname = _attachment_filename(a) or "file"
                                     if u:
                                         file_urls.append(f"[文件] {fname} url={u}")
                         if trs:
@@ -7591,38 +8931,13 @@ def _spawn_chat_worker(
                         max_tokens=min(int(max_output_tokens or 8192), 16384),
                     )
                 elif provider_norm == "dashscope":
-                    qs_msgs = list(current_messages)
-
-                    # DashScope/Qwen uses OpenAI-compatible format; inject instructions as system message.
-                    if instructions:
-                        insert_at = 1 if (qs_msgs and (qs_msgs[0].get("role") in ("system", "developer"))) else 0
-                        qs_msgs.insert(insert_at, {"role": "system", "content": instructions})
-
-                    # Fold transcripts / file pointers from attachments into text messages
-                    if current_attachments:
-                        trs_q: List[str] = []
-                        file_urls_q: List[str] = []
-                        for a in (current_attachments or []):
-                            if not isinstance(a, dict):
-                                continue
-                            at = str(a.get("type") or "").strip().lower()
-                            if at == "audio":
-                                tr = str(a.get("transcript") or "").strip()
-                                if tr:
-                                    trs_q.append(tr)
-                            if at == "file":
-                                extracted = _extract_file_content(a)
-                                if extracted:
-                                    file_urls_q.append(extracted)
-                                else:
-                                    u = str(a.get("url") or "").strip()
-                                    fname = (a.get("filename") or a.get("name") or "file").strip()
-                                    if u:
-                                        file_urls_q.append(f"[文件] {fname} url={u}")
-                        if trs_q:
-                            qs_msgs.append({"role": "user", "content": "[voice transcript]\n" + "\n".join(trs_q)})
-                        if file_urls_q:
-                            qs_msgs.append({"role": "user", "content": "[file]\n" + "\n".join(file_urls_q)})
+                    # Qwen3.6-Plus multimodal path: build OpenAI-compatible Chat Completions
+                    # messages with image_url data URLs and injected file/audio text.
+                    qs_msgs = _build_qwen_chat_messages(
+                        current_messages,
+                        current_attachments,
+                        instructions=instructions,
+                    )
 
                     stream_iter = _stream_dashscope_events(
                         model=model,
@@ -7791,22 +9106,25 @@ def _spawn_chat_worker(
                 seg_q.put(None)
 
             job.full_text = ("".join(full_parts)).strip()
+            # ✅ OpenAI-style UX: do NOT append source URL lists into the answer body.
+            # Sources are sent separately via `sources` / `solara.sources` SSE events and rendered as chips by iOS.
 
-            # ✅ 处理 AI 回复中的 OpenClaw 动作标记（聊天模式自动执行）
-            try:
-                _bridge = get_bridge()
-                if _bridge.connected and job.full_text and "[ADU_ACTION:" in job.full_text:
-                    _clean, _action_results = process_agent_actions_sync(job.full_text, _bridge)
-                    if _action_results:
-                        job.full_text = _clean + _action_results
-                        # 把执行结果也推送给前端 SSE
-                        job.push_event({
-                            "type": "response.output_text.done",
-                            "text": job.full_text,
-                        })
-                        log.info("[Intent] Actions executed, results appended to response")
-            except Exception as _intent_err:
-                log.warning("[Intent] action processing failed: %s", _intent_err)
+            # ✅ 处理 AI 回复中的 OpenClaw 动作标记（仅当 legacy bridge 真可用）
+            if job.full_text and "[ADU_ACTION:" in job.full_text and _openclaw_runtime_enabled():
+                try:
+                    _bridge = _openclaw_get_bridge_or_none()
+                    if _bridge is not None and getattr(_bridge, "connected", False):
+                        _clean, _action_results = process_agent_actions_sync(job.full_text, _bridge)
+                        if _action_results:
+                            job.full_text = _clean + _action_results
+                            # 把执行结果也推送给前端 SSE
+                            job.push_event({
+                                "type": "response.output_text.done",
+                                "text": job.full_text,
+                            })
+                            log.info("[Intent] Actions executed, results appended to response")
+                except Exception as _intent_err:
+                    log.warning("[Intent] action processing failed: %s", _intent_err)
 
             # Persist assistant reply to conversation history (best-effort)
             if conversation_id and job.full_text:
@@ -7852,6 +9170,14 @@ def _spawn_chat_worker(
                 pass
 
             if job.full_text:
+                # OpenAI-style: send sources as structured side-channel right before final text.
+                # The assistant text stays clean; iOS renders source favicons under the bubble.
+                try:
+                    if web_sources:
+                        job.push_event({"type": "sources", "sources": list(web_sources.values())})
+                        job.push_event({"type": "solara.sources", "sources": list(web_sources.values())})
+                except Exception:
+                    pass
                 job.push_event({
                     "type": "response.output_text.done",
                     "text": job.full_text,
@@ -7897,49 +9223,3197 @@ async def lifespan(app: FastAPI):
              SORA_MODEL_DEFAULT, SORA_SECONDS_DEFAULT, SORA_SIZE_DEFAULT,
              REALTIME_MODEL_DEFAULT, SORA_CONCURRENCY,
              CHAT_MODEL_DEFAULT, TTS_MODEL_DEFAULT)
-    # ✅ OpenClaw: 启动时自动连接 + 自动扫描项目
-    try:
-        bridge = get_bridge()
-        ok = await bridge.connect()
-        if ok:
-            log.info("[BOOT] ✅ OpenClaw connected: %s", bridge.ws_url)
+    # ✅ OpenClaw: legacy bridge is disabled in local-agent-only mode. Skip it silently.
+    if _openclaw_runtime_enabled():
+        try:
+            bridge = _openclaw_get_bridge_or_none()
+            ok = await bridge.connect() if bridge is not None else False
+            if ok:
+                log.info("[BOOT] ✅ OpenClaw connected: %s", bridge.ws_url)
 
-            # ── 自动扫描项目（不需要用户手动点"连接项目"）──
-            scan_list = [
-                "~/Desktop/GPTsora",
-                "~/Desktop/backend",
-                "~/GPTsora",
-                "~/Projects/GPTsora",
-            ]
-            auto_env = os.getenv("OPENCLAW_AUTO_SCAN", "").strip()
-            if auto_env:
-                scan_list = [p.strip() for p in auto_env.split(",") if p.strip()]
+                # ── 自动扫描项目（不需要用户手动点"连接项目"）──
+                scan_list = [
+                    "~/Desktop/GPTsora",
+                    "~/Desktop/backend",
+                    "~/GPTsora",
+                    "~/Projects/GPTsora",
+                ]
+                auto_env = os.getenv("OPENCLAW_AUTO_SCAN", "").strip()
+                if auto_env:
+                    scan_list = [p.strip() for p in auto_env.split(",") if p.strip()]
 
-            for scan_path in scan_list:
-                expanded = scan_path.replace("~", str(Path.home()))
-                if os.path.isdir(expanded):
-                    try:
-                        result = await bridge.scan_project(scan_path)
-                        count = result.get("count", 0)
-                        method = result.get("scan_method", "find")
-                        log.info("[BOOT] ✅ Auto-scanned %s: %d files (method=%s)",
-                                 scan_path, count, method)
-                    except Exception as scan_err:
-                        log.warning("[BOOT] Auto-scan %s failed: %s", scan_path, scan_err)
-        else:
-            log.warning("[BOOT] ⚠️ OpenClaw not available (will retry on demand)")
-    except Exception as e:
-        log.warning("[BOOT] OpenClaw init failed: %s", e)
+                for scan_path in scan_list:
+                    expanded = scan_path.replace("~", str(Path.home()))
+                    if os.path.isdir(expanded):
+                        try:
+                            result = await bridge.scan_project(scan_path)
+                            count = result.get("count", 0)
+                            method = result.get("scan_method", "find")
+                            log.info("[BOOT] ✅ Auto-scanned %s: %d files (method=%s)",
+                                     scan_path, count, method)
+                        except Exception as scan_err:
+                            log.warning("[BOOT] Auto-scan %s failed: %s", scan_path, scan_err)
+            else:
+                log.debug("[BOOT] OpenClaw not available")
+        except Exception as e:
+            log.debug("[BOOT] OpenClaw init skipped: %s", e)
+
+    # ✅ 视觉监控循环（可选：持续订阅屏幕帧，主动分析）
+    if SOLARA_ENABLE_VISION_LOOP:
+        try:
+            from adu_vision_loop import vision_loop
+            asyncio.create_task(vision_loop.start())
+            log.info("[VisionLoop] ✅ vision monitor started")
+        except Exception as _vl_boot_err:
+            log.warning("[VisionLoop] vision monitor start failed: %s", _vl_boot_err)
+    else:
+        log.info("[VisionLoop] disabled (set SOLARA_ENABLE_VISION_LOOP=1 to enable)")
+
+    # ✅ 意识系统后台循环（可选；关闭时仍保留 on_user_message/to_prompt 的轻量能力）
+    if SOLARA_ENABLE_CONSCIOUSNESS_LOOP:
+        try:
+            from adu_consciousness import consciousness
+            asyncio.create_task(consciousness.run())
+            log.info("[Consciousness] 🧠 background loop started")
+        except Exception as _cs_boot_err:
+            log.warning("[Consciousness] background loop start failed: %s", _cs_boot_err)
+    else:
+        log.info("[Consciousness] background loop disabled (set SOLARA_ENABLE_CONSCIOUSNESS_LOOP=1 to enable)")
+
     yield
-    # ✅ OpenClaw: 关闭时断开
+    # ✅ OpenClaw: 关闭时断开（only when real bridge exists）
     try:
-        bridge = get_bridge()
-        await bridge.disconnect()
+        bridge = _openclaw_get_bridge_or_none()
+        if bridge is not None:
+            await bridge.disconnect()
     except Exception:
         pass
     log.info("[BOOT] stop")
 
 app = FastAPI(title="ChatAGI-阿杜 Backend", lifespan=lifespan)
+
+# ================================
+# ✅ LAN Local Agent Proxy
+# 手机 / APP / 后端 -> LOCAL_AGENT_BASE_URL -> ai-brain-local-agent -> usecomputer
+#
+# .env:
+#   LOCAL_AGENT_BASE_URL=http://10.0.0.204:4317
+#   LOCAL_AGENT_TOKEN=local-dev-token
+#
+# APP/backend should call these backend-facing routes:
+#   GET  /api/brain/computer/health
+#   GET  /api/brain/computer/mouse
+#   POST /api/brain/computer/screenshot
+#   POST /api/brain/computer/move
+#   POST /api/brain/computer/click
+#   POST /api/brain/computer/type
+#   POST /api/brain/computer/press
+# ================================
+LOCAL_AGENT_BASE_URL = (
+    os.getenv("LOCAL_AGENT_BASE_URL")
+    or os.getenv("AI_BRAIN_LOCAL_AGENT_BASE_URL")
+    or os.getenv("COMPUTER_AGENT_BASE_URL")
+    or ""
+).strip().rstrip("/")
+LOCAL_AGENT_TOKEN = (
+    os.getenv("LOCAL_AGENT_TOKEN")
+    or os.getenv("AI_BRAIN_LOCAL_AGENT_TOKEN")
+    or os.getenv("COMPUTER_AGENT_TOKEN")
+    or ""
+).strip()
+try:
+    LOCAL_AGENT_TIMEOUT_SEC = float(os.getenv("LOCAL_AGENT_TIMEOUT_SEC") or "30")
+except Exception:
+    LOCAL_AGENT_TIMEOUT_SEC = 30.0
+
+
+def _local_agent_is_configured() -> bool:
+    return bool(LOCAL_AGENT_BASE_URL)
+
+
+def _local_agent_url(path: str) -> str:
+    if not LOCAL_AGENT_BASE_URL:
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "ok": False,
+                "error": "LOCAL_AGENT_BASE_URL is not configured",
+                "hint": "Set LOCAL_AGENT_BASE_URL=http://10.0.0.204:4317 and LOCAL_AGENT_TOKEN=local-dev-token in the backend .env",
+            },
+        )
+    if not path.startswith("/"):
+        path = "/" + path
+    return f"{LOCAL_AGENT_BASE_URL}{path}"
+
+
+def _local_agent_headers() -> Dict[str, str]:
+    headers = {"Content-Type": "application/json"}
+    if LOCAL_AGENT_TOKEN:
+        headers["Authorization"] = f"Bearer {LOCAL_AGENT_TOKEN}"
+    return headers
+
+
+def _safe_response_payload(resp: requests.Response) -> Any:
+    ctype = (resp.headers.get("content-type") or "").lower()
+    if "application/json" in ctype:
+        try:
+            return resp.json()
+        except Exception:
+            pass
+    text = resp.text or ""
+    if len(text) > 2000:
+        text = text[:2000] + "…"
+    return {"ok": resp.ok, "status_code": resp.status_code, "body": text}
+
+
+def _call_local_agent_sync(method: str, path: str, body: Optional[Dict[str, Any]] = None) -> Any:
+    """Blocking HTTP call to the LAN local-agent. Wrapped with asyncio.to_thread in routes."""
+    method = (method or "GET").upper()
+    url = _local_agent_url(path)
+    try:
+        kwargs: Dict[str, Any] = {
+            "headers": _local_agent_headers(),
+            "timeout": (3.0, LOCAL_AGENT_TIMEOUT_SEC),
+        }
+        if method != "GET":
+            kwargs["json"] = body or {}
+        resp = requests.request(method, url, **kwargs)
+    except requests.Timeout:
+        raise HTTPException(
+            status_code=504,
+            detail={"ok": False, "error": "local agent timeout", "url": url},
+        )
+    except requests.RequestException as e:
+        raise HTTPException(
+            status_code=502,
+            detail={"ok": False, "error": "local agent unreachable", "url": url, "detail": str(e)},
+        )
+
+    payload = _safe_response_payload(resp)
+    if resp.status_code >= 400:
+        raise HTTPException(
+            status_code=resp.status_code,
+            detail={"ok": False, "error": "local agent returned error", "url": url, "payload": payload},
+        )
+
+    ctype = (resp.headers.get("content-type") or "").lower()
+    if "application/json" in ctype:
+        return payload
+
+    # Preserve binary responses too. This keeps screenshot compatible even if the
+    # local-agent later returns image/png or application/octet-stream instead of JSON.
+    return Response(
+        content=resp.content,
+        media_type=resp.headers.get("content-type") or "application/octet-stream",
+        status_code=resp.status_code,
+    )
+
+
+async def _call_local_agent(method: str, path: str, body: Optional[Dict[str, Any]] = None) -> Any:
+    return await asyncio.to_thread(_call_local_agent_sync, method, path, body)
+
+
+async def _request_json_or_empty(request: Request) -> Dict[str, Any]:
+    try:
+        data = await request.json()
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+# ─── Computer Agent v1 helpers(adu_computer_agent_v1 模块)─────────
+# 防御性导入:模块不可用时,v1 端点退化为 503,核心 /api/brain/computer/* 不受影响。
+try:
+    import adu_computer_agent_v1 as _ADU_AGENT_V1  # noqa: F401
+except Exception as _agent_v1_err:  # pragma: no cover
+    _ADU_AGENT_V1 = None
+    print(f"[adu] computer_agent_v1 模块加载失败: {_agent_v1_err}", flush=True)
+
+
+@app.get("/api/brain/computer/config")
+async def brain_computer_config():
+    return {
+        "ok": True,
+        "configured": _local_agent_is_configured(),
+        "base_url": LOCAL_AGENT_BASE_URL,
+        "has_token": bool(LOCAL_AGENT_TOKEN),
+        "timeout_sec": LOCAL_AGENT_TIMEOUT_SEC,
+        "routes": [
+            "GET  /api/brain/computer/health",
+            "GET  /api/brain/computer/config",
+            "GET  /api/brain/computer/mouse",
+            "GET  /api/brain/computer/active_window",
+            "GET  /api/brain/computer/tools",
+            "POST /api/brain/computer/screenshot",
+            "POST /api/brain/computer/move",
+            "POST /api/brain/computer/click",
+            "POST /api/brain/computer/double_click",
+            "POST /api/brain/computer/type",
+            "POST /api/brain/computer/paste",
+            "POST /api/brain/computer/press",
+            "POST /api/brain/computer/open_app",
+            "POST /api/brain/computer/action",
+        ],
+    }
+
+
+@app.get("/api/brain/computer/health")
+async def brain_computer_health():
+    return await _call_local_agent("GET", "/health")
+
+
+@app.get("/api/brain/computer/mouse")
+async def brain_computer_mouse():
+    return await _call_local_agent("GET", "/api/computer/mouse")
+
+
+@app.post("/api/brain/computer/screenshot")
+async def brain_computer_screenshot(request: Request):
+    body = await _request_json_or_empty(request)
+    return await _call_local_agent("POST", "/api/computer/screenshot", body)
+
+
+@app.post("/api/brain/computer/move")
+async def brain_computer_move(request: Request):
+    body = await _request_json_or_empty(request)
+    return await _call_local_agent("POST", "/api/computer/move", body)
+
+
+@app.post("/api/brain/computer/click")
+async def brain_computer_click(request: Request):
+    body = await _request_json_or_empty(request)
+    return await _call_local_agent("POST", "/api/computer/click", body)
+
+
+@app.post("/api/brain/computer/type")
+async def brain_computer_type(request: Request):
+    body = await _request_json_or_empty(request)
+    return await _call_local_agent("POST", "/api/computer/type", body)
+
+
+
+@app.post("/api/brain/computer/press")
+async def brain_computer_press(request: Request):
+    body = await _request_json_or_empty(request)
+    return await _call_local_agent("POST", "/api/computer/press", body)
+
+
+# ================================
+# ✅ Computer Tools layer (Codex / 阿杜 直接可调用)
+#    所有 endpoint 都是 local-agent :4317 端点的薄代理或封装。
+#    Codex / 阿杜的稳定调用建议优先用这些独立端点，而不是 NL action。
+# ================================
+
+@app.post("/api/brain/computer/open_app")
+async def brain_computer_open_app(request: Request):
+    """直接打开 Mac App。{app, display?}。复用 _brain_computer_execute_action
+    的 open_app 多方法回退(已含 Spotlight 兜底)。"""
+    body = await _request_json_or_empty(request)
+    app_name = str(body.get("app") or body.get("name") or body.get("query") or "").strip()
+    display = str(body.get("display") or app_name).strip() or app_name
+    if not app_name:
+        raise HTTPException(status_code=400, detail={"ok": False, "error": "missing_app"})
+    return await _brain_computer_execute_action("open_app", {"app": app_name, "display": display})
+
+
+@app.post("/api/brain/computer/paste")
+async def brain_computer_paste(request: Request):
+    """粘贴文本(local-agent 内做 pbcopy + cmd+v)。{text}"""
+    body = await _request_json_or_empty(request)
+    return await _call_local_agent("POST", "/api/computer/paste", body)
+
+
+@app.get("/api/brain/computer/active_window")
+async def brain_computer_active_window():
+    """读取当前前台 App 与窗口标题(只读,risk=0)。"""
+    return await _call_local_agent("GET", "/api/computer/active_window")
+
+
+@app.post("/api/brain/computer/double_click")
+async def brain_computer_double_click(request: Request):
+    """双击(left,count=2)。{x?, y?, button?}"""
+    body = await _request_json_or_empty(request)
+    if not isinstance(body, dict):
+        body = {}
+    body.setdefault("button", "left")
+    body.setdefault("count", 2)
+    return await _call_local_agent("POST", "/api/computer/click", body)
+
+
+# ---- 高风险动作分类器(供 /api/brain/computer/action 用)----
+
+# 文本层:goal 里出现这些 → 直接返回 needs_user_confirmation,不走 NL 解析。
+_HIGH_RISK_TEXT_PATTERNS = [
+    (r'\bsudo\s', "sudo 命令需要二次确认"),
+    (r'\brm\s+-r[fF]?\s', "递归删除命令需要二次确认"),
+    (r'\bgit\s+push\b[^&;|]*--force\b', "git push --force 需要二次确认"),
+    (r'\bgit\s+push\b[^&;|]*\s-f(?:\s|$)', "git push -f 需要二次确认"),
+    (r'\bdiskutil\s+erase\b', "磁盘擦除需要二次确认"),
+    (r'\bmkfs(?:\.|\s)', "格式化文件系统需要二次确认"),
+    (r'格式化磁盘|清空磁盘|擦除磁盘', "磁盘擦除需要二次确认"),
+    (r'\.env\b.*(?:覆盖|改写|删除)|(?:覆盖|改写|删除).*\.env\b', "改 .env 需要二次确认"),
+    (r'allow.*keychain|允许.*钥匙串', "允许钥匙串需要二次确认"),
+    (r'付款|支付|转账|结账', "付款/转账需要二次确认"),
+    (r'发布版本|提交审核|上架审核', "发布/提交审核需要二次确认"),
+]
+
+# 动作层:解析后的 action+payload → 命中即 needs_user_confirmation。
+_HIGH_RISK_HOTKEYS = [
+    {"cmd", "s"}, {"cmd", "q"}, {"cmd", "w"},
+    {"cmd", "delete"}, {"cmd", "shift", "delete"},
+]
+
+
+def _high_risk_goal_classifier(goal: str) -> Optional[str]:
+    """文本风险 → 原因字符串;否则 None。
+    单一源:委托给 adu_computer_agent_v1.ComputerRiskPolicy(包含'发微信/发消息/
+    付款/sudo/git push/cmd+s/...等扩展关键词)。模块不可用 → 退回老内联规则。"""
+    if _ADU_AGENT_V1 is not None:
+        try:
+            r = _ADU_AGENT_V1.ComputerRiskPolicy.classify_text(goal)
+            if r:
+                return r[1]
+            return None
+        except Exception:
+            pass  # fall through to inline fallback
+    if not isinstance(goal, str) or not goal.strip():
+        return None
+    text = goal.strip()
+    low = text.lower()
+    for pat, reason in _HIGH_RISK_TEXT_PATTERNS:
+        try:
+            if re.search(pat, low) or re.search(pat, text):
+                return reason
+        except re.error:
+            continue
+    return None
+
+
+def _high_risk_action_classifier(action: str, payload: Dict[str, Any]) -> Optional[str]:
+    """动作 + payload 风险 → 原因;否则 None。同样优先用统一 ComputerRiskPolicy。"""
+    if _ADU_AGENT_V1 is not None:
+        try:
+            r = _ADU_AGENT_V1.ComputerRiskPolicy.classify_action(action, payload)
+            if r:
+                return r[1]
+            return None
+        except Exception:
+            pass  # fall through
+    a = (action or "").strip().lower()
+    payload = payload if isinstance(payload, dict) else {}
+    if a in ("press_keys", "press", "hotkey", "shortcut"):
+        raw_keys = payload.get("keys") or payload.get("key") or payload.get("combo") or []
+        if isinstance(raw_keys, str):
+            raw_keys = re.split(r"[+\s,，、]+", raw_keys)
+        keyset = {_computer_key_alias(k) for k in raw_keys if k}
+        for combo in _HIGH_RISK_HOTKEYS:
+            if combo and combo.issubset(keyset):
+                return f"高风险热键 {'+'.join(sorted(combo))} 需要二次确认"
+    return None
+
+
+@app.get("/api/brain/computer/tools")
+async def brain_computer_tools():
+    """Codex / 阿杜的工具发现端点:返回所有 computer.* 工具的描述 + schema。"""
+    tools = [
+        {
+            "name": "computer.health",
+            "method": "GET",
+            "endpoint": "/api/brain/computer/health",
+            "description": "Ping local-agent (4317). 返回 {ok, agent, port}。",
+            "input_schema": {},
+            "risk_level": 0,
+        },
+        {
+            "name": "computer.config",
+            "method": "GET",
+            "endpoint": "/api/brain/computer/config",
+            "description": "查看 local-agent 配置与所有路由列表。",
+            "input_schema": {},
+            "risk_level": 0,
+        },
+        {
+            "name": "computer.screenshot",
+            "method": "POST",
+            "endpoint": "/api/brain/computer/screenshot",
+            "description": "拍当前 Mac 屏幕截图。返回 {ok, image_b64, bytes, format}。",
+            "input_schema": {},
+            "risk_level": 0,
+        },
+        {
+            "name": "computer.mouse_position",
+            "method": "GET",
+            "endpoint": "/api/brain/computer/mouse",
+            "description": "读鼠标当前坐标。返回 {ok, x, y}。",
+            "input_schema": {},
+            "risk_level": 0,
+        },
+        {
+            "name": "computer.mouse_move",
+            "method": "POST",
+            "endpoint": "/api/brain/computer/move",
+            "description": "把鼠标移到 (x, y)。",
+            "input_schema": {"x": "int", "y": "int"},
+            "risk_level": 1,
+        },
+        {
+            "name": "computer.click",
+            "method": "POST",
+            "endpoint": "/api/brain/computer/click",
+            "description": "鼠标点击。button=left/right, 可附带 x/y 否则在当前位置。",
+            "input_schema": {"button": "left|right (default left)", "x": "int?", "y": "int?"},
+            "risk_level": 1,
+        },
+        {
+            "name": "computer.double_click",
+            "method": "POST",
+            "endpoint": "/api/brain/computer/double_click",
+            "description": "双击(left,count=2)。可附带 x/y。",
+            "input_schema": {"x": "int?", "y": "int?"},
+            "risk_level": 1,
+        },
+        {
+            "name": "computer.type_text",
+            "method": "POST",
+            "endpoint": "/api/brain/computer/type",
+            "description": "在当前焦点处输入文本(osascript keystroke,Unicode 安全)。",
+            "input_schema": {"text": "string"},
+            "risk_level": 1,
+        },
+        {
+            "name": "computer.paste_text",
+            "method": "POST",
+            "endpoint": "/api/brain/computer/paste",
+            "description": "把文本放剪贴板并发 Cmd+V 粘贴到当前焦点。",
+            "input_schema": {"text": "string"},
+            "risk_level": 1,
+        },
+        {
+            "name": "computer.press_keys",
+            "method": "POST",
+            "endpoint": "/api/brain/computer/press",
+            "description": "按组合键。Cmd+S/Q/W、Cmd+Delete 等高风险热键会被 action 闸门拦下,本端点直传不拦截 —— 调用方负责安全。",
+            "input_schema": {"keys": "[string]  例 ['cmd','space'] / ['enter'] / ['escape']"},
+            "risk_level": 1,
+        },
+        {
+            "name": "computer.active_window",
+            "method": "GET",
+            "endpoint": "/api/brain/computer/active_window",
+            "description": "读当前前台 App 和窗口标题。",
+            "input_schema": {},
+            "risk_level": 0,
+        },
+        {
+            "name": "computer.open_app",
+            "method": "POST",
+            "endpoint": "/api/brain/computer/open_app",
+            "description": "打开 Mac App(走 Spotlight 兜底)。{app: 'Safari' | '微信' | 'WeChat' ...}。",
+            "input_schema": {"app": "string", "display": "string?"},
+            "risk_level": 1,
+        },
+        {
+            "name": "computer.action",
+            "method": "POST",
+            "endpoint": "/api/brain/computer/action",
+            "description": "自然语言或显式 action 统一入口。{goal:'打开 Safari'} 或 {action:'press_keys', payload:{keys:['enter']}}。失败返回 examples。",
+            "input_schema": {
+                "goal": "string  (自然语言)",
+                "action": "string?  (显式 action 名)",
+                "payload": "object? (action 的参数)",
+            },
+            "risk_level": 1,
+            "examples": [
+                {"goal": "打开 Safari"},
+                {"goal": "打开微信"},
+                {"goal": "输入 hello"},
+                {"goal": "按回车"},
+                {"goal": "按 Esc"},
+                {"goal": "点击"},
+                {"goal": "右键"},
+                {"goal": "刷新截图"},
+                {"action": "screenshot"},
+                {"action": "press_keys", "payload": {"keys": ["cmd", "space"]}},
+            ],
+        },
+        # ───────── v1 新增工具 ─────────
+        {
+            "name": "computer.right_click",
+            "method": "POST",
+            "endpoint": "/api/brain/computer/click",
+            "description": "右键点击。等价 click + button=right。",
+            "input_schema": {"x": "int?", "y": "int?"},
+            "risk_level": 1,
+        },
+        {
+            "name": "computer.file_list",
+            "method": "POST",
+            "endpoint": "/api/brain/computer/files/list",
+            "description": "列出 allow_paths 内目录(只读)。",
+            "input_schema": {"root": "string  (必须在 allow_paths 内)"},
+            "risk_level": 0,
+        },
+        {
+            "name": "computer.file_copy",
+            "method": "POST",
+            "endpoint": "/api/brain/computer/files/copy",
+            "description": "复制文件/目录。默认 dry-run 返回 preview;confirm=true 才执行。",
+            "input_schema": {"source": "string", "target": "string", "confirm": "bool (default false)"},
+            "risk_level": 1,
+        },
+        {
+            "name": "computer.file_move",
+            "method": "POST",
+            "endpoint": "/api/brain/computer/files/move",
+            "description": "移动文件/目录(可跨目录)。默认 dry-run。",
+            "input_schema": {"source": "string", "target": "string", "confirm": "bool"},
+            "risk_level": 1,
+        },
+        {
+            "name": "computer.file_rename",
+            "method": "POST",
+            "endpoint": "/api/brain/computer/files/rename",
+            "description": "在同一目录内改名。默认 dry-run。",
+            "input_schema": {"source": "string", "target": "string", "confirm": "bool"},
+            "risk_level": 1,
+        },
+        {
+            "name": "computer.agent_plan",
+            "method": "POST",
+            "endpoint": "/api/brain/computer/agent/run",
+            "description": "把 goal 拆成多步 plan(不执行)。用 auto_execute=false。",
+            "input_schema": {"goal": "string", "max_steps": "int (default 8)", "auto_execute": "false"},
+            "risk_level": 0,
+        },
+        {
+            "name": "computer.agent_run",
+            "method": "POST",
+            "endpoint": "/api/brain/computer/agent/run",
+            "description": "半自动多步执行。auto_execute=true 时执行白名单内动作,遇高风险/未知步骤停下并 needs_user_confirmation。",
+            "input_schema": {"goal": "string", "max_steps": "int (default 8)", "auto_execute": "bool"},
+            "risk_level": 1,
+        },
+        {
+            "name": "computer.vision_click",
+            "method": "POST",
+            "endpoint": "/api/brain/computer/vision/click",
+            "description": "坐标点击 v1。{x,y,confirm:true} 才点;只给 target 文字时返回 coordinate_required + 当前截图尺寸。",
+            "input_schema": {"x": "int?", "y": "int?", "confirm": "bool", "target": "string?"},
+            "risk_level": 1,
+        },
+        {
+            "name": "adu.tools.call",
+            "method": "POST",
+            "endpoint": "/api/adu/tools/call",
+            "description": "给 Codex/阿杜的统一工具调度器,只允许 TOOL_WHITELIST 内工具。",
+            "input_schema": {"tool": "string (whitelist)", "args": "object"},
+            "risk_level": 1,
+        },
+    ]
+    return {
+        "ok": True,
+        "service": "chatagi.computer.tools",
+        "version": "1.0.0",
+        "local_agent": {
+            "configured": _local_agent_is_configured(),
+            "base_url": LOCAL_AGENT_BASE_URL,
+            "has_token": bool(LOCAL_AGENT_TOKEN),
+        },
+        "high_risk": {
+            "policy": "高风险动作返回 needs_user_confirmation=true,不自动执行。",
+            "blocked_hotkeys": [sorted(list(s)) for s in _HIGH_RISK_HOTKEYS],
+            "blocked_text_patterns": [reason for _, reason in _HIGH_RISK_TEXT_PATTERNS],
+        },
+        "tools": tools,
+    }
+
+
+# ================================
+# ✅ Unified Computer Action API
+# 自然语言/调试面板统一入口：
+#   POST /api/brain/computer/action
+# 支持两种请求：
+#   1) {"goal":"输入 hello 然后按回车"}
+#   2) {"action":"press_keys","payload":{"keys":["cmd","space"]}}
+# ================================
+
+def _computer_key_alias(key: Any) -> str:
+    k = str(key or "").strip().lower().replace(" ", "")
+    aliases = {
+        "command": "cmd", "cmd": "cmd", "⌘": "cmd", "meta": "cmd", "super": "cmd",
+        "control": "ctrl", "ctrl": "ctrl", "^": "ctrl",
+        "option": "alt", "opt": "alt", "alt": "alt", "⌥": "alt",
+        "shift": "shift", "⇧": "shift",
+        "return": "enter", "enter": "enter", "↩": "enter",
+        "esc": "escape", "escape": "escape",
+        "spacebar": "space", "space": "space", "空格": "space",
+        "tab": "tab", "delete": "delete", "backspace": "backspace",
+        "up": "up", "down": "down", "left": "left", "right": "right",
+    }
+    return aliases.get(k, k)
+
+
+def _normalize_computer_keys(keys: Any) -> List[str]:
+    if isinstance(keys, str):
+        raw = re.split(r"[+,，、/\\s]+", keys.strip())
+    elif isinstance(keys, list):
+        raw = keys
+    else:
+        raw = []
+    out: List[str] = []
+    for item in raw:
+        k = _computer_key_alias(item)
+        if k and k not in out:
+            out.append(k)
+    return out
+
+
+def _jsonable_result(value: Any) -> Any:
+    if isinstance(value, Response):
+        return {"ok": True, "response_type": "binary", "media_type": getattr(value, "media_type", None)}
+    return value
+
+
+
+# ---- ChatAGI 阿杜 · Computer Work Mode policy（独立模块，导入失败降级运行）----
+try:
+    import adu_computer_work as _ADU_CW  # noqa: F401
+except Exception as _adu_cw_err:  # pragma: no cover
+    _ADU_CW = None
+    print(f"[adu] computer_work 模块加载失败，已降级运行: {_adu_cw_err}")
+
+
+def _adu_cw_confirm_text(action: str, risk_level: int, reason: str = "") -> str:
+    """生成给前端展示的确认文案；模块不可用时降级。"""
+    if _ADU_CW is not None:
+        try:
+            return _ADU_CW.confirm_text_for(action, risk_level, reason)
+        except Exception:
+            pass
+    return f"动作「{action}」需要确认（risk_level={risk_level}）。{reason or ''}"
+
+
+def _extract_app_to_open_from_goal(goal: str) -> Optional[Dict[str, str]]:
+    text = (goal or "").strip()
+    if not text:
+        return None
+    low = text.lower()
+    compact = re.sub(r"[\s，,。.!！]+", "", low)
+    if any(k in text for k in ["聚焦搜索", "打开搜索", "打开电脑搜索"]) or "spotlight" in low:
+        return None
+
+    has_intent = any(k in text for k in ["打开", "启动", "运行", "帮我打开", "给我打开"]) or low.startswith("open ") or low.startswith("launch ")
+    if not has_intent:
+        return None
+
+    aliases = [
+        (["微信", "wechat", "wechat"], "WeChat", "微信"),
+        (["chrome", "谷歌浏览器", "谷歌", "googlechrome"], "Google Chrome", "Chrome"),
+        (["safari", "苹果浏览器"], "Safari", "Safari"),
+        (["xcode"], "Xcode", "Xcode"),
+        (["终端", "terminal", "命令行"], "Terminal", "终端"),
+        (["备忘录", "notes"], "Notes", "备忘录"),
+        (["访达", "finder"], "Finder", "访达"),
+        (["设置", "系统设置", "systemsettings", "systemsettings"], "System Settings", "系统设置"),
+        (["邮件", "mail"], "Mail", "邮件"),
+        (["照片", "photos"], "Photos", "照片"),
+        (["日历", "calendar"], "Calendar", "日历"),
+        (["音乐", "music"], "Music", "音乐"),
+    ]
+    for keys, query, display in aliases:
+        for k in keys:
+            if k.lower().replace(" ", "") in compact:
+                return {"query": query, "display": display}
+
+    for marker in ["帮我打开", "给我打开", "打开", "启动", "运行"]:
+        if marker in text:
+            value = text.split(marker, 1)[1].strip().strip("：:，,。.!！")
+            if value and len(value) <= 40:
+                return {"query": value, "display": value}
+    if low.startswith("open "):
+        value = text[5:].strip()
+        if value:
+            return {"query": value, "display": value}
+    if low.startswith("launch "):
+        value = text[7:].strip()
+        if value:
+            return {"query": value, "display": value}
+    return None
+
+def _computer_action_from_goal(goal: str) -> Optional[Dict[str, Any]]:
+    text = (goal or "").strip()
+    if not text:
+        return None
+    low = text.lower()
+
+
+    app_spec = _extract_app_to_open_from_goal(text)
+    if app_spec:
+        return {"action": "open_app", "payload": {"app": app_spec["query"], "display": app_spec["display"]}}
+
+    if any(k in text for k in [
+        "截图", "截屏", "看屏幕", "看看屏幕", "屏幕看看",
+        # V0.1 视觉理解触发词
+        "你看到什么", "你看见什么", "屏幕上有什么", "看一下屏幕", "看下屏幕",
+    ]) or "screenshot" in low:
+        return {"action": "screenshot", "payload": {}}
+    # V1.5: 鼠标位置（扩展"在哪/哪里"）
+    if ("鼠标" in text and ("位置" in text or "在哪" in text or "哪里" in text)) or "mouse position" in low:
+        return {"action": "mouse_position", "payload": {}}
+    # V1.5: 前台应用 / 当前窗口（只读，risk_level=0）
+    if any(k in text for k in ["前台应用", "当前应用", "当前窗口", "哪个应用", "什么应用", "前台窗口", "active window", "frontmost"]):
+        return {"action": "active_window", "payload": {}}
+    # V1.5: 鼠标移动到 (X, Y)  支持 "移动到 500,500" / "移到 (500, 500)" / "鼠标移到 500、500"
+    m = re.search(r"(?:鼠标)?\s*(?:移动到|移到|移动至)\s*[(\[（【]?\s*(\d+)\s*[,，、\s]+\s*(\d+)\s*[)\]）】]?", text)
+    if m:
+        try:
+            xx, yy = int(m.group(1)), int(m.group(2))
+            return {"action": "mouse_move", "payload": {"x": xx, "y": yy}}
+        except ValueError:
+            pass
+    if any(k in text for k in ["聚焦搜索", "spotlight", "全局搜索"]) or ("command" in low and "space" in low) or ("cmd" in low and "space" in low):
+        return {"action": "press_keys", "payload": {"keys": ["cmd", "space"]}}
+
+    # "输入 hello，然后按回车" 必须拆成 type_text + press_keys enter；
+    # 不要让后面的 enter/return 分支吞掉整句，也不要把回车当成普通文本。
+    m = re.search(
+        r"^(?:输入|打字|键入)[:：\s]*(.+?)\s*(?:，|,|。|\s)*(?:然后|并且|并|再)?\s*(?:按|敲)?\s*(?:回车|enter|return)\s*$",
+        text,
+        re.I,
+    )
+    if not m:
+        m = re.search(
+            r"^\s*type\s+(.+?)\s*(?:,|，|。|\s)*(?:then\s+)?(?:press\s+)?(?:enter|return)\s*$",
+            text,
+            re.I,
+        )
+    if m:
+        val = (m.group(1) or "").strip().strip('"“”')
+        if val:
+            return {
+                "action": "sequence",
+                "payload": {
+                    "steps": [
+                        {"action": "type_text", "payload": {"text": val}},
+                        {"action": "press_keys", "payload": {"keys": ["enter"]}},
+                    ]
+                },
+            }
+
+    # 回车 / Enter / return 都映射到 press_keys ["enter"](绝不 type_text)。
+    # 注意:"return"/"按 return" 之前没覆盖,会落到 not_recognized;补齐。
+    if (any(k in text for k in ["按回车", "敲回车", "回车", "按 return", "按return", "按Return", "按 Return"])
+            or "enter" in low
+            or "return" in low):
+        return {"action": "press_keys", "payload": {"keys": ["enter"]}}
+    # V1.5: Esc 用小写 low 做检查，覆盖 "按 Esc / 按一下 Esc / Press Escape" 等大小写变体
+    if any(k in text for k in ["退出键", "取消键"]) or "esc" in low or "escape" in low:
+        return {"action": "press_keys", "payload": {"keys": ["escape"]}}
+    if any(k in text for k in ["按空格", "空格键"]) or " space" in (" " + low):
+        return {"action": "press_keys", "payload": {"keys": ["space"]}}
+    if "tab" in low or "制表键" in text:
+        return {"action": "press_keys", "payload": {"keys": ["tab"]}}
+    if any(k in text for k in ["退格", "删除一个字"]) or "backspace" in low:
+        return {"action": "press_keys", "payload": {"keys": ["backspace"]}}
+
+    # V1.5: 通用 hotkey "按 Command S" / "按 cmd+s" / "按 control alt delete"
+    # 要求至少一个修饰键，避免把"按 a"误判
+    m = re.search(
+        r"按\s*((?:cmd|ctrl|alt|shift|command|control|option|meta|⌘|⌃|⌥|⇧)(?:\s*[+\s,，、]\s*[A-Za-z0-9⌘⌃⌥⇧一-龥]+){1,3})",
+        text, re.IGNORECASE,
+    )
+    if m:
+        raw = m.group(1)
+        parts = re.split(r"[+\s,，、]+", raw)
+        keys = [p.strip().lower() for p in parts if p.strip()]
+        # ⌘/⌃/⌥/⇧ 归一
+        sym_map = {"⌘": "cmd", "⌃": "ctrl", "⌥": "alt", "⇧": "shift"}
+        keys = [sym_map.get(k, k) for k in keys]
+        if len(keys) >= 2:
+            return {"action": "press_keys", "payload": {"keys": keys}}
+
+    m = re.search(r"(?:输入|打字|键入)[:：\s]*(.+)$", text, re.I)
+    if not m:
+        m = re.search(r"\btype\s+(.+)$", text, re.I)
+    if m:
+        val = (m.group(1) or "").strip().strip('"“”')
+        if val:
+            return {"action": "type_text", "payload": {"text": val}}
+
+    # V1.5: 粘贴 X / paste X
+    m = re.search(r"粘贴[:：\s]*(.+)$", text)
+    if not m:
+        m = re.search(r"\bpaste\s+(.+)$", text, re.I)
+    if m:
+        val = (m.group(1) or "").strip().strip('"“”')
+        if val:
+            return {"action": "paste_text", "payload": {"text": val}}
+
+    # V1.5：click/right_click/double_click 可附带坐标
+    _xy_match = re.search(r"(\d{1,5})\s*[,，、]\s*(\d{1,5})", text)
+    if any(k in text for k in ["右键", "点右键", "右击"]):
+        pl = {"button": "right"}
+        if _xy_match:
+            try: pl["x"], pl["y"] = int(_xy_match.group(1)), int(_xy_match.group(2))
+            except ValueError: pass
+        return {"action": "click", "payload": pl}
+    if any(k in text for k in ["双击", "double click"]):
+        pl = {"button": "left"}
+        if _xy_match:
+            try: pl["x"], pl["y"] = int(_xy_match.group(1)), int(_xy_match.group(2))
+            except ValueError: pass
+        return {"action": "double_click", "payload": pl}
+    if any(k in text for k in ["点击", "点一下", "左键", "单击"]) or "click" in low:
+        pl = {"button": "left"}
+        if _xy_match:
+            try: pl["x"], pl["y"] = int(_xy_match.group(1)), int(_xy_match.group(2))
+            except ValueError: pass
+        return {"action": "click", "payload": pl}
+    return None
+
+
+async def _brain_computer_execute_action(action: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+    action = (action or "").strip().lower()
+    payload = payload if isinstance(payload, dict) else {}
+
+    if action in ("screenshot", "screen_shot"):
+        result = await _call_local_agent("POST", "/api/computer/screenshot", payload)
+        return {"ok": True, "action": "screenshot", "message": "截图已完成。", "result": _jsonable_result(result)}
+    if action in ("mouse", "mouse_position", "position"):
+        result = await _call_local_agent("GET", "/api/computer/mouse")
+        return {"ok": True, "action": "mouse_position", "message": "鼠标位置已读取。", "result": _jsonable_result(result)}
+    if action in ("open_app", "open_application", "launch_app", "launch"):
+        app_name = str(payload.get("app") or payload.get("name") or payload.get("query") or "").strip()
+        display = str(payload.get("display") or app_name).strip() or app_name
+        if not app_name:
+            raise HTTPException(status_code=400, detail={"ok": False, "error": "missing app"})
+
+        # Computer Work Mode：多方法回退 + 验证
+        #   open -a 英文名 → open -a 中文名 → /Applications → mdfind → osascript → Spotlight 兜底
+        async def _spotlight_open() -> List[Dict[str, Any]]:
+            sp: List[Dict[str, Any]] = []
+            sp.append(await _brain_computer_execute_action("press_keys", {"keys": ["cmd", "space"]}))
+            await asyncio.sleep(0.35)
+            sp.append(await _brain_computer_execute_action("type_text", {"text": app_name}))
+            await asyncio.sleep(0.25)
+            sp.append(await _brain_computer_execute_action("press_keys", {"keys": ["enter"]}))
+            return sp
+
+        if _ADU_CW is not None:
+            try:
+                strat = await asyncio.to_thread(_ADU_CW.resolve_and_open_app, app_name, display)
+            except Exception as e:
+                strat = {"ok": False, "completed": False, "attempts": [],
+                         "spotlight_needed": True, "final_text": f"open_app 策略异常：{e}"}
+            attempts = list(strat.get("attempts") or [])
+            if strat.get("ok"):
+                return {"ok": True, "action": "open_app", "completed": True,
+                        "message": strat.get("final_text") or f"已打开{display}。",
+                        "app": app_name, "display": display,
+                        "attempts": attempts, "result": strat}
+            # 子进程方法全部失败 → Spotlight 键盘兜底（无法程序化验证）
+            sp_steps = await _spotlight_open()
+            attempts.append({"step": len(attempts) + 1, "method": "Spotlight 键盘兜底",
+                             "ok": True, "verified_by": "",
+                             "reason": "子进程方法全部失败后的兜底，未做程序化验证"})
+            return {"ok": True, "action": "open_app", "completed": False,
+                    "message": f"已用 Spotlight 兜底尝试打开{display}（未能程序化验证）。",
+                    "app": app_name, "display": display, "attempts": attempts,
+                    "result": {"spotlight_fallback": True, "spotlight_steps": sp_steps,
+                               "strategy": strat}}
+
+        # 模块不可用 → 退回旧 Spotlight 行为
+        steps = await _spotlight_open()
+        return {"ok": True, "action": "open_app", "completed": False,
+                "message": f"已尝试打开{display}。",
+                "app": app_name, "display": display, "steps": steps}
+    if action in ("move", "move_mouse", "mouse_move"):
+        result = await _call_local_agent("POST", "/api/computer/move", payload)
+        return {"ok": True, "action": "move", "message": "鼠标已移动。", "result": _jsonable_result(result)}
+    if action in ("click", "double_click", "right_click", "left_click"):
+        body = dict(payload)
+        if action == "right_click": body["button"] = "right"
+        elif action == "left_click": body["button"] = "left"
+        if action == "double_click": body["count"] = 2
+        body.setdefault("button", "left")
+        if body.get("x") is None or body.get("y") is None:
+            pos = await _call_local_agent("GET", "/api/computer/mouse")
+            if isinstance(pos, dict):
+                if body.get("x") is None: body["x"] = pos.get("x")
+                if body.get("y") is None: body["y"] = pos.get("y")
+        result = await _call_local_agent("POST", "/api/computer/click", body)
+        msg = "已双击。" if action == "double_click" else ("已右键点击。" if body.get("button") == "right" else "已点击。")
+        return {"ok": True, "action": action, "message": msg, "result": _jsonable_result(result)}
+    if action in ("type", "type_text", "input_text"):
+        text_value = str(payload.get("text") or payload.get("value") or "")
+        result = await _call_local_agent("POST", "/api/computer/type", {"text": text_value})
+        return {"ok": True, "action": "type_text", "message": "文字已输入。", "result": _jsonable_result(result)}
+    # V1.5: 粘贴文本（pbcopy + cmd+v 在 local-agent 内做）
+    if action in ("paste", "paste_text"):
+        text_value = str(payload.get("text") or payload.get("value") or "")
+        result = await _call_local_agent("POST", "/api/computer/paste", {"text": text_value})
+        return {"ok": True, "action": "paste_text", "message": "文字已粘贴。", "result": _jsonable_result(result)}
+    # V1.5: 前台窗口（只读）
+    if action in ("active_window", "frontmost_app", "current_window", "active_app"):
+        result = await _call_local_agent("GET", "/api/computer/active_window")
+        msg = "前台窗口已读取。"
+        if isinstance(result, dict) and result.get("app"):
+            wt = result.get("window_title") or ""
+            msg = f"当前前台：{result['app']}" + (f"｜窗口：{wt}" if wt else "")
+        return {"ok": True, "action": "active_window", "message": msg, "result": _jsonable_result(result)}
+    # V1.5: 鼠标拖拽
+    if action in ("drag", "mouse_drag"):
+        result = await _call_local_agent("POST", "/api/computer/drag", payload)
+        return {"ok": True, "action": "drag", "message": "鼠标已拖拽。", "result": _jsonable_result(result)}
+    if action in ("press", "press_key", "press_keys", "hotkey", "shortcut"):
+        keys = _normalize_computer_keys(payload.get("keys") or payload.get("key") or payload.get("combo"))
+        if not keys:
+            raise HTTPException(status_code=400, detail={"ok": False, "error": "missing keys"})
+        if len(keys) > 1:
+            runner = globals().get("_run_usecomputer")
+            if callable(runner):
+                combo = "+".join(keys)
+                direct = await asyncio.to_thread(runner, ["usecomputer", "press", combo], 20)
+                if isinstance(direct, dict) and direct.get("ok"):
+                    return {"ok": True, "action": "press_keys", "message": f"已按快捷键：{combo}", "result": direct, "keys": keys}
+                try:
+                    result = await _call_local_agent("POST", "/api/computer/press", {"keys": keys})
+                    return {"ok": True, "action": "press_keys", "message": f"已按快捷键：{combo}", "result": _jsonable_result(result), "keys": keys, "direct_fallback_error": direct}
+                except HTTPException as e:
+                    raise HTTPException(status_code=e.status_code, detail={"ok": False, "error": "press_keys_failed", "keys": keys, "direct": direct, "local_agent": e.detail})
+        result = await _call_local_agent("POST", "/api/computer/press", {"keys": keys})
+        return {"ok": True, "action": "press_keys", "message": f"已按键：{'+'.join(keys)}", "result": _jsonable_result(result), "keys": keys}
+    if action in ("wait", "sleep"):
+        seconds = float(payload.get("seconds") or payload.get("sec") or 1)
+        seconds = max(0.0, min(seconds, 30.0))
+        await asyncio.sleep(seconds)
+        return {"ok": True, "action": "wait", "message": f"已等待 {seconds:g} 秒。", "waited": seconds}
+    raise HTTPException(status_code=400, detail={"ok": False, "error": "unsupported_action", "action": action})
+
+
+@app.post("/api/brain/computer/action")
+async def brain_computer_action(request: Request):
+    body = await _request_json_or_empty(request)
+    action = str(body.get("action") or "").strip()
+    payload = body.get("payload") or body.get("args") or {}
+    if not isinstance(payload, dict): payload = {}
+    goal = str(body.get("goal") or body.get("text") or body.get("command") or "").strip()
+    inferred = False
+
+    # ─── 安全闸门 1:文本层(goal 含 sudo / git push --force / 付款 等 → 直接拦)───
+    if goal:
+        hr_text_reason = _high_risk_goal_classifier(goal)
+        if hr_text_reason:
+            return {
+                "ok": True,
+                "action": "needs_user_confirmation",
+                "needs_user_confirmation": True,
+                "executed": False,
+                "risk_level": 2,
+                "risk_reason": hr_text_reason,
+                "goal": goal,
+                "message": f"{hr_text_reason}。本接口不会自动执行,请你确认后改用专用流程。",
+            }
+
+    # 自然语言 → action+payload
+    if not action and goal:
+        spec = _computer_action_from_goal(goal)
+        if not spec:
+            return {
+                "ok": False,
+                "action": "not_recognized",
+                "error": "not_simple_computer_action",
+                "goal": goal,
+                "message": "暂时不支持这个电脑动作,请试:打开 Safari / 打开微信 / 输入 hello / 按回车 / 按 Esc / 点击 / 右键 / 刷新截图。",
+                "examples": [
+                    {"goal": "打开 Safari"},
+                    {"goal": "打开微信"},
+                    {"goal": "输入 hello"},
+                    {"goal": "按回车"},
+                    {"goal": "按 Esc"},
+                    {"goal": "点击"},
+                    {"goal": "右键"},
+                    {"goal": "刷新截图"},
+                ],
+            }
+        action = spec["action"]
+        payload = spec.get("payload") or {}
+        inferred = True
+
+    if not action:
+        raise HTTPException(status_code=400, detail={
+            "ok": False,
+            "error": "missing_action_or_goal",
+            "hint": "请传 {goal:'自然语言'} 或 {action:'screenshot', payload:{}}。",
+        })
+
+    # ─── 安全闸门 2:动作层(Cmd+S/Q/W、Cmd+Delete 等高风险热键 → 拦)───
+    hr_act_reason = _high_risk_action_classifier(action, payload)
+    if hr_act_reason:
+        return {
+            "ok": True,
+            "action": action,
+            "needs_user_confirmation": True,
+            "executed": False,
+            "risk_level": 2,
+            "risk_reason": hr_act_reason,
+            "payload": payload,
+            "goal": goal,
+            "inferred": inferred,
+            "message": f"{hr_act_reason}。本接口不会自动执行。",
+        }
+
+    if action == "sequence":
+        raw_steps = payload.get("steps") if isinstance(payload, dict) else []
+        if not isinstance(raw_steps, list) or not raw_steps:
+            raise HTTPException(status_code=400, detail={"ok": False, "error": "missing_sequence_steps"})
+        steps: List[Dict[str, Any]] = []
+        for raw in raw_steps:
+            if not isinstance(raw, dict):
+                raise HTTPException(status_code=400, detail={"ok": False, "error": "bad_sequence_step"})
+            step_action = str(raw.get("action") or "").strip()
+            step_payload = raw.get("payload") or raw.get("args") or {}
+            if not isinstance(step_payload, dict):
+                step_payload = {}
+            step_risk = _high_risk_action_classifier(step_action, step_payload)
+            if step_risk:
+                return {
+                    "ok": True,
+                    "action": "sequence",
+                    "needs_user_confirmation": True,
+                    "executed": False,
+                    "risk_level": 2,
+                    "risk_reason": step_risk,
+                    "payload": payload,
+                    "goal": goal,
+                    "inferred": inferred,
+                    "message": f"{step_risk}。本接口不会自动执行。",
+                }
+            step_result = await _brain_computer_execute_action(step_action, step_payload)
+            step_ok = bool(step_result.get("ok")) if isinstance(step_result, dict) else True
+            item: Dict[str, Any] = {"action": step_action, "ok": step_ok}
+            if step_action in ("type", "type_text", "input_text"):
+                item["action"] = "type_text"
+                item["text"] = str(step_payload.get("text") or step_payload.get("value") or "")
+            elif step_action in ("press", "press_key", "press_keys", "hotkey", "shortcut"):
+                item["action"] = "press_keys"
+                item["keys"] = _normalize_computer_keys(step_payload.get("keys") or step_payload.get("key") or step_payload.get("combo"))
+            if isinstance(step_result, dict) and not step_ok:
+                item["error"] = step_result.get("error") or step_result.get("message")
+            steps.append(item)
+        return {
+            "ok": all(bool(s.get("ok")) for s in steps),
+            "action": "sequence",
+            "steps": steps,
+            "message": "已输入文本并按回车",
+            "direct": True,
+            "inferred": inferred,
+            "executed": True,
+            "needs_user_confirmation": False,
+            "goal": goal,
+        }
+
+    # 执行
+    result = await _brain_computer_execute_action(action, payload)
+    if isinstance(result, dict):
+        result["direct"] = True
+        result["inferred"] = inferred
+        result.setdefault("executed", True)
+        result.setdefault("needs_user_confirmation", False)
+        if goal:
+            result["goal"] = goal
+    return result
+
+
+# ════════════════════════════════════════════════════════════════════
+# ✅ Computer Agent v1  —— 半自动多步执行 + 文件操作 + 视觉点击 + 工具调度器
+#    所有 v1 端点都过 ComputerRiskPolicy(adu_computer_agent_v1 模块)。
+#    模块不可用时这些端点返回 503,不影响上面的 /api/brain/computer/*。
+# ════════════════════════════════════════════════════════════════════
+
+def _agent_v1_unavailable() -> Dict[str, Any]:
+    return {"ok": False, "error": "agent_v1_unavailable",
+            "hint": "adu_computer_agent_v1 模块未加载,检查后端日志"}
+
+
+# ─── Agent v1: /api/brain/computer/agent/run ────────────────────────
+
+@app.post("/api/brain/computer/agent/run")
+async def brain_computer_agent_run(request: Request):
+    if _ADU_AGENT_V1 is None:
+        return _agent_v1_unavailable()
+    body = await _request_json_or_empty(request)
+    goal = str(body.get("goal") or "").strip()
+    if not goal:
+        raise HTTPException(status_code=400, detail={"ok": False, "error": "missing_goal"})
+    max_steps = int(body.get("max_steps") or 8)
+    auto_execute = bool(body.get("auto_execute"))
+
+    # 顶层文本风险
+    top_risk = _ADU_AGENT_V1.ComputerRiskPolicy.classify_text(goal)
+    if top_risk:
+        return {
+            "ok": True, "goal": goal,
+            "status": "needs_user_confirmation",
+            "steps": [],
+            "needs_user_confirmation": True,
+            "risk_level": top_risk[0],
+            "risk_reason": top_risk[1],
+            "next_confirmation": {
+                "reason": top_risk[1],
+                "pending_action": None,
+                "pending_args": {},
+            },
+        }
+
+    # 拆 plan(每步都过自己的风险 + 白名单)
+    steps = _ADU_AGENT_V1.plan_steps_from_goal(goal, max_steps=max_steps)
+    if not steps:
+        return {"ok": False, "goal": goal, "status": "empty_plan",
+                "steps": [], "needs_user_confirmation": False,
+                "message": "无法把 goal 拆成步骤"}
+
+    # auto_execute=false:只回 plan
+    if not auto_execute:
+        return {
+            "ok": True, "goal": goal,
+            "status": "plan_only",
+            "steps": steps,
+            "needs_user_confirmation": True,
+            "next_confirmation": {
+                "reason": "auto_execute=false,仅生成计划。把 auto_execute 改为 true 才会执行。",
+            },
+        }
+
+    # auto_execute=true:逐步执行,遇 ok=false 即停
+    executed: List[Dict[str, Any]] = []
+    for step in steps:
+        if not step.get("ok"):
+            return {
+                "ok": True, "goal": goal,
+                "status": "needs_user_confirmation",
+                "steps": executed,
+                "needs_user_confirmation": True,
+                "next_confirmation": {
+                    "reason": step.get("reason") or "未识别 / 高风险步骤,停下来等你确认",
+                    "pending_step": step,
+                    "pending_action": step.get("action"),
+                    "pending_args": step.get("args") or {},
+                },
+            }
+        action = step["action"]
+        args = step.get("args") or {}
+        try:
+            res = await _brain_computer_execute_action(action, args)
+            executed.append({
+                "index": step["index"],
+                "raw": step.get("raw", ""),
+                "action": action,
+                "args": args,
+                "ok": bool(res.get("ok")) if isinstance(res, dict) else False,
+                "message": (res.get("message") if isinstance(res, dict) else "") or "",
+            })
+            # 每步执行后自动截图(action 本身是 screenshot 时跳过)
+            if action != "screenshot":
+                try:
+                    await _brain_computer_execute_action("screenshot", {})
+                except Exception:
+                    pass
+        except Exception as e:
+            executed.append({
+                "index": step["index"],
+                "action": action, "args": args,
+                "ok": False, "error": str(e),
+            })
+            return {"ok": False, "goal": goal, "status": "error",
+                    "steps": executed, "error": str(e)}
+
+    return {
+        "ok": True, "goal": goal,
+        "status": "completed",
+        "steps": executed,
+        "needs_user_confirmation": False,
+    }
+
+
+# ─── Vision click v1 ───────────────────────────────────────────────
+
+@app.post("/api/brain/computer/vision/click")
+async def brain_computer_vision_click(request: Request):
+    body = await _request_json_or_empty(request)
+    target = str(body.get("target") or "").strip()
+    x_raw = body.get("x")
+    y_raw = body.get("y")
+    confirm = bool(body.get("confirm"))
+    button = str(body.get("button") or "left").strip() or "left"
+
+    # 有坐标 → confirm=true 才执行
+    if x_raw is not None and y_raw is not None:
+        try:
+            xi = int(x_raw); yi = int(y_raw)
+        except (TypeError, ValueError):
+            return {"ok": False, "error": "invalid_coordinates",
+                    "got": {"x": x_raw, "y": y_raw}}
+        if not confirm:
+            return {
+                "ok": False, "needs_user_confirmation": True,
+                "preview": f"Will click ({xi},{yi}) [{button}]",
+                "x": xi, "y": yi, "button": button,
+                "hint": "再发一次同样请求并加 confirm=true 才会真点。",
+            }
+        result = await _brain_computer_execute_action(
+            "click", {"button": button, "x": xi, "y": yi})
+        if isinstance(result, dict):
+            result["x"] = xi; result["y"] = yi
+        return result
+
+    # 只有自然语言 target / 啥都没传 → 返回截图尺寸,不点
+    shot = await _brain_computer_execute_action("screenshot", {})
+    inner = shot.get("result") if isinstance(shot, dict) else None
+    inner = inner if isinstance(inner, dict) else {}
+    return {
+        "ok": False,
+        "error": "coordinate_required",
+        "message": "当前版本需要明确坐标。请传 {x, y, confirm:true};或先截图自己挑坐标。",
+        "screenshot_width": inner.get("width"),
+        "screenshot_height": inner.get("height"),
+        "screenshot_bytes": inner.get("bytes"),
+        "screenshot_format": inner.get("format"),
+        "target": target,
+        "needs_user_confirmation": True,
+        "hint": "v1 不接视觉定位模型。下一版本会加 vision_grounding。",
+    }
+
+
+# ─── 文件操作 v1 ───────────────────────────────────────────────────
+
+@app.post("/api/brain/computer/files/list")
+async def brain_computer_files_list(request: Request):
+    if _ADU_AGENT_V1 is None:
+        return _agent_v1_unavailable()
+    body = await _request_json_or_empty(request)
+    root = str(body.get("root") or body.get("path") or "").strip()
+    return _ADU_AGENT_V1.list_dir(root)
+
+
+@app.post("/api/brain/computer/files/rename")
+async def brain_computer_files_rename(request: Request):
+    if _ADU_AGENT_V1 is None:
+        return _agent_v1_unavailable()
+    body = await _request_json_or_empty(request)
+    source = str(body.get("source") or "").strip()
+    target = str(body.get("target") or "").strip()
+    confirm = bool(body.get("confirm"))
+    if not confirm:
+        return _ADU_AGENT_V1.file_op_preview("rename", source, target)
+    return _ADU_AGENT_V1.file_op_execute("rename", source, target)
+
+
+@app.post("/api/brain/computer/files/copy")
+async def brain_computer_files_copy(request: Request):
+    if _ADU_AGENT_V1 is None:
+        return _agent_v1_unavailable()
+    body = await _request_json_or_empty(request)
+    source = str(body.get("source") or "").strip()
+    target = str(body.get("target") or "").strip()
+    confirm = bool(body.get("confirm"))
+    if not confirm:
+        return _ADU_AGENT_V1.file_op_preview("copy", source, target)
+    return _ADU_AGENT_V1.file_op_execute("copy", source, target)
+
+
+@app.post("/api/brain/computer/files/move")
+async def brain_computer_files_move(request: Request):
+    if _ADU_AGENT_V1 is None:
+        return _agent_v1_unavailable()
+    body = await _request_json_or_empty(request)
+    source = str(body.get("source") or "").strip()
+    target = str(body.get("target") or "").strip()
+    confirm = bool(body.get("confirm"))
+    if not confirm:
+        return _ADU_AGENT_V1.file_op_preview("move", source, target)
+    return _ADU_AGENT_V1.file_op_execute("move", source, target)
+
+
+# ─── /api/adu/tools/call —— 给 Codex/阿杜的统一工具调度器 ────────────
+# 只允许 TOOL_WHITELIST 内的工具;所有参数走 ComputerRiskPolicy。
+
+async def _adu_tool_dispatch(tool: str, args: Dict[str, Any]) -> Dict[str, Any]:
+    a = args if isinstance(args, dict) else {}
+    if tool == "computer.health":
+        return await _call_local_agent("GET", "/health")
+    if tool == "computer.config":
+        return {"ok": True, "configured": _local_agent_is_configured(),
+                "base_url": LOCAL_AGENT_BASE_URL}
+    if tool == "computer.screenshot":
+        return await _brain_computer_execute_action("screenshot", {})
+    if tool == "computer.mouse_position":
+        return await _brain_computer_execute_action("mouse_position", {})
+    if tool == "computer.active_window":
+        return await _brain_computer_execute_action("active_window", {})
+    if tool == "computer.mouse_move":
+        return await _brain_computer_execute_action("mouse_move", a)
+    if tool == "computer.click":
+        return await _brain_computer_execute_action("click", a)
+    if tool == "computer.right_click":
+        a2 = dict(a); a2["button"] = "right"
+        return await _brain_computer_execute_action("click", a2)
+    if tool == "computer.double_click":
+        return await _brain_computer_execute_action("double_click", a)
+    if tool == "computer.type_text":
+        return await _brain_computer_execute_action("type_text", a)
+    if tool == "computer.paste_text":
+        return await _brain_computer_execute_action("paste_text", a)
+    if tool == "computer.press_keys":
+        return await _brain_computer_execute_action("press_keys", a)
+    if tool == "computer.open_app":
+        return await _brain_computer_execute_action("open_app", a)
+    if tool == "computer.action":
+        goal = str(a.get("goal") or "").strip()
+        if goal:
+            spec = _computer_action_from_goal(goal)
+            if spec:
+                return await _brain_computer_execute_action(spec["action"], spec.get("payload") or {})
+        action = str(a.get("action") or "").strip()
+        if action:
+            return await _brain_computer_execute_action(action, a.get("payload") or {})
+        return {"ok": False, "error": "missing_action_or_goal"}
+    if tool == "computer.file_list":
+        if _ADU_AGENT_V1 is None: return _agent_v1_unavailable()
+        return _ADU_AGENT_V1.list_dir(str(a.get("root") or a.get("path") or ""))
+    if tool in ("computer.file_copy", "computer.file_move", "computer.file_rename"):
+        if _ADU_AGENT_V1 is None: return _agent_v1_unavailable()
+        op = tool.split(".")[-1].replace("file_", "")
+        source = str(a.get("source") or "")
+        target = str(a.get("target") or "")
+        confirm = bool(a.get("confirm"))
+        if not confirm:
+            return _ADU_AGENT_V1.file_op_preview(op, source, target)
+        return _ADU_AGENT_V1.file_op_execute(op, source, target)
+    if tool == "computer.agent_plan":
+        if _ADU_AGENT_V1 is None: return _agent_v1_unavailable()
+        steps = _ADU_AGENT_V1.plan_steps_from_goal(
+            str(a.get("goal") or ""),
+            max_steps=int(a.get("max_steps") or 8),
+        )
+        return {"ok": True, "plan_only": True, "steps": steps}
+    if tool in ("computer.agent_run", "computer.vision_click"):
+        return {"ok": False, "error": "use_dedicated_endpoint",
+                "endpoint": ("/api/brain/computer/agent/run" if tool.endswith("agent_run")
+                             else "/api/brain/computer/vision/click"),
+                "hint": "tool/call 不直接代理 agent_run / vision_click,请直打专用端点。"}
+    return {"ok": False, "error": "tool_not_implemented_yet", "tool": tool}
+
+
+@app.post("/api/adu/tools/call")
+async def adu_tools_call(request: Request):
+    if _ADU_AGENT_V1 is None:
+        return _agent_v1_unavailable()
+    body = await _request_json_or_empty(request)
+    tool = str(body.get("tool") or "").strip()
+    args = body.get("args") or {}
+    if not isinstance(args, dict): args = {}
+    if not tool:
+        raise HTTPException(status_code=400, detail={"ok": False, "error": "missing_tool"})
+    # 白名单
+    if tool not in _ADU_AGENT_V1.TOOL_WHITELIST:
+        return {"ok": False, "error": "tool_not_whitelisted",
+                "tool": tool,
+                "whitelist": _ADU_AGENT_V1.TOOL_WHITELIST}
+    # 参数文本风险
+    for key in ("text", "goal", "command", "value"):
+        v = args.get(key)
+        if isinstance(v, str) and v.strip():
+            rc = _ADU_AGENT_V1.ComputerRiskPolicy.classify_text(v)
+            if rc:
+                return {"ok": True, "tool": tool,
+                        "needs_user_confirmation": True, "executed": False,
+                        "risk_level": rc[0], "risk_reason": rc[1],
+                        "message": f"参数 {key} 命中高风险:{rc[1]}。本调度器不会自动执行。"}
+    # 动作层风险(press_keys 等)
+    if tool in ("computer.press_keys",):
+        rc = _ADU_AGENT_V1.ComputerRiskPolicy.classify_action("press_keys", args)
+        if rc:
+            return {"ok": True, "tool": tool,
+                    "needs_user_confirmation": True, "executed": False,
+                    "risk_level": rc[0], "risk_reason": rc[1],
+                    "message": f"{rc[1]}。本调度器不会自动执行。"}
+    # 真调度
+    try:
+        result = await _adu_tool_dispatch(tool, args)
+    except HTTPException as e:
+        return {"ok": False, "tool": tool, "error": "tool_call_failed",
+                "detail": e.detail}
+    except Exception as e:
+        return {"ok": False, "tool": tool,
+                "error": f"tool_call_exception: {type(e).__name__}: {e}"}
+    if isinstance(result, dict):
+        result.setdefault("tool", tool)
+    return result
+
+
+# ================================
+# ✅ /api/brain/adu/act
+# 统一入口：text_chat / audio_transcript / realtime_voice / realtime_av / debug_panel
+# 都走这一个端口，由它判定 chat vs computer，并复用现有底层执行器。
+# 设计要点：
+#   - 不是电脑任务 → {"ok": False, "route": "chat"}，前端继续走原聊天流
+#   - 是电脑任务 → 复用 _computer_action_from_goal 解析 + _brain_computer_execute_action 执行
+#   - 风险分级：0 观察类 / 1 输入类 / 2 其他
+#   - allow_execute=False → 只返回计划（need_confirm=True，不执行）
+#   - allow_execute=True 且 risk_level <= 阈值 → 执行；否则 need_confirm=True 不执行
+# ================================
+
+_ADU_ACT_SOURCES = {"text_chat", "audio_transcript", "realtime_voice", "realtime_av", "debug_panel"}
+
+_ADU_ACT_RISK = {
+    # 观察类（只读，无副作用，risk_level=0）
+    "screenshot": 0,
+    "mouse_position": 0,
+    "active_window": 0,    # V1.5
+    "wait": 0,
+    # 输入类（有副作用但通常用户期望，risk_level=1）
+    "open_app": 1,
+    "type_text": 1,
+    "paste_text": 1,       # V1.5
+    "press_keys": 1,
+    "hotkey": 1,           # V1.5 别名
+    "click": 1,
+    "double_click": 1,
+    "right_click": 1,
+    "left_click": 1,
+    "move": 1,
+    "mouse_move": 1,       # V1.5 同义
+    "drag": 1,             # V1.5
+    "mouse_drag": 1,       # V1.5 同义
+    # 高风险（shell / 删除 / git push / sudo / 发消息 / 付款）默认走 fallback risk=2，需 need_confirm=true
+}
+
+_ADU_ACT_AUTO_RISK_THRESHOLD = 1
+
+
+def _adu_act_risk(action: str) -> int:
+    return _ADU_ACT_RISK.get((action or "").strip().lower(), 2)
+
+
+def _adu_act_final_text(action: str, result: Any) -> str:
+    if isinstance(result, dict):
+        msg = result.get("message")
+        if isinstance(msg, str) and msg.strip():
+            return msg.strip()
+        inner = result.get("result")
+        if action == "mouse_position" and isinstance(inner, dict):
+            x = inner.get("x")
+            y = inner.get("y")
+            if x is not None and y is not None:
+                return f"鼠标位置：x={x}, y={y}"
+    return "电脑动作已执行。"
+
+
+# ---- V0.1 视觉理解：截图后自动让多模态模型描述屏幕 ----
+# 模型选择优先级：ADU_VISION_MODEL > 默认（有 DashScope key 时用 qwen-vl-max-latest，否则 gpt-4o）
+# 路由优先级：模型名以 "qwen" 开头 → 走 DashScope OpenAI 兼容模式；否则 → OpenAI
+_VISION_MODEL = (
+    os.getenv("ADU_VISION_MODEL")
+    or ("qwen-vl-max-latest" if DASHSCOPE_API_KEY else "gpt-4o")
+).strip()
+_VISION_DETAIL = (os.getenv("ADU_VISION_DETAIL") or "low").strip()
+_VISION_MAX_TOKENS = int(os.getenv("ADU_VISION_MAX_TOKENS") or "400")
+_VISION_TIMEOUT_S = float(os.getenv("ADU_VISION_TIMEOUT_SEC") or "30")
+
+
+def _is_qwen_vision_model(name: str) -> bool:
+    n = (name or "").strip().lower()
+    return n.startswith("qwen") or "qwen-vl" in n
+
+
+def _extract_image_b64_from_result(result: Any) -> Optional[str]:
+    """从 _brain_computer_execute_action 的截图返回里提取 base64 PNG。
+    结构: {"ok":True,"action":"screenshot","message":"...","result":{"image_b64":"..."}}
+    """
+    if not isinstance(result, dict):
+        return None
+    inner = result.get("result")
+    if isinstance(inner, dict):
+        b64 = inner.get("image_b64") or inner.get("image_base64")
+        if isinstance(b64, str) and b64:
+            return b64
+    b64 = result.get("image_b64") or result.get("image_base64")
+    if isinstance(b64, str) and b64:
+        return b64
+    return None
+
+
+async def _vision_describe_screenshot(image_b64: str, user_goal: str = "") -> tuple[bool, str, str]:
+    """调用多模态模型分析屏幕截图。返回 (ok, summary, error)。"""
+    if not image_b64:
+        return False, "", "截图为空"
+
+    use_qwen = _is_qwen_vision_model(_VISION_MODEL)
+    if use_qwen:
+        if not DASHSCOPE_API_KEY:
+            return False, "", "DASHSCOPE_API_KEY 未配置"
+        api_url = f"{DASHSCOPE_BASE_URL.rstrip('/')}/chat/completions"
+        api_key = DASHSCOPE_API_KEY
+        provider_label = "dashscope"
+    else:
+        if not OPENAI_API_KEY:
+            return False, "", "OPENAI_API_KEY 未配置"
+        api_url = "https://api.openai.com/v1/chat/completions"
+        api_key = OPENAI_API_KEY
+        provider_label = "openai"
+
+    data_url = f"data:image/png;base64,{image_b64}"
+    goal_hint = (user_goal or "").strip()
+    prompt = (
+        "你是阿杜的视觉助手。看这张 Mac 屏幕截图，用一两句中文简洁、具体地描述："
+        "前台是什么应用、显示了什么内容、有没有明显的状态/数字/错误。"
+        "不要客套，不要假设我看不到。"
+    )
+    if goal_hint:
+        prompt += f"\n用户的提问背景：「{goal_hint}」。"
+
+    image_block: Dict[str, Any] = {"type": "image_url", "image_url": {"url": data_url}}
+    # OpenAI 支持 detail（low/high/auto），DashScope 兼容模式不识别，传过去会被忽略或报错
+    if not use_qwen:
+        image_block["image_url"]["detail"] = _VISION_DETAIL
+
+    body = {
+        "model": _VISION_MODEL,
+        "messages": [{
+            "role": "user",
+            "content": [
+                {"type": "text", "text": prompt},
+                image_block,
+            ],
+        }],
+        "max_tokens": _VISION_MAX_TOKENS,
+        "temperature": 0.4,
+    }
+
+    try:
+        import httpx as _httpx
+        async with _httpx.AsyncClient(timeout=_VISION_TIMEOUT_S) as cli:
+            r = await cli.post(
+                api_url,
+                headers={
+                    "Authorization": f"Bearer {api_key}",
+                    "Content-Type": "application/json",
+                },
+                json=body,
+            )
+    except Exception as e:
+        return False, "", f"[{provider_label}] 网络异常 {type(e).__name__}: {e}"
+
+    if r.status_code >= 400:
+        snippet = (r.text or "")[:200]
+        return False, "", f"[{provider_label}] HTTP {r.status_code} {snippet}"
+
+    try:
+        obj = r.json()
+        content = (obj.get("choices") or [{}])[0].get("message", {}).get("content", "")
+        if isinstance(content, list):
+            content = "".join(p.get("text", "") for p in content if isinstance(p, dict))
+        summary = str(content or "").strip()
+        if not summary:
+            return False, "", f"[{provider_label}] 模型返回空"
+        return True, summary, ""
+    except Exception as e:
+        return False, "", f"[{provider_label}] 解析失败 {type(e).__name__}: {e}"
+
+
+# ---- V1.5 Observe→Decide→Act→Verify 安全闭环 ----
+# 高影响动作执行前必须先截图 + 视觉分析 + 安全裁决；不安全的不执行。
+
+# 这些 action 触发"先看再做"流程
+_ADU_OBSERVE_BEFORE: set = {
+    "click", "double_click", "right_click", "left_click",
+    "drag", "mouse_drag",
+    "type_text", "type", "input_text",
+    "paste_text", "paste",
+    "press_keys", "press", "hotkey",
+    "open_app", "open_application", "launch_app", "launch",
+}
+
+# 低风险按键白名单：单独按这些键不需要 observe（用户可在 6 之前直接按）
+_ADU_LOW_RISK_KEYS: set = {
+    "escape", "esc",
+    "tab",
+    "up", "down", "left", "right",
+    "arrowup", "arrowdown", "arrowleft", "arrowright",
+    "enter", "return",
+    "pageup", "pagedown", "home", "end",
+}
+
+# 始终需要 need_confirm 的高影响热键（即便用户授权 allow_execute=true 也必须二次确认）
+_ADU_NEED_CONFIRM_HOTKEYS: list = [
+    {"cmd", "s"}, {"command", "s"},     # 保存（可能弹出对话框）
+    {"cmd", "q"}, {"command", "q"},     # 退出当前 app
+    {"cmd", "w"}, {"command", "w"},     # 关闭窗口
+    {"cmd", "tab"}, {"command", "tab"}, # 切换 app
+    {"cmd", "delete"}, {"command", "delete"},  # 删除（Finder）
+    {"cmd", "shift", "delete"}, {"command", "shift", "delete"},
+]
+
+# 出现在 pre_summary 里 → 强烈建议 needs_confirm
+_ADU_DANGER_KEYWORDS: list = [
+    # 中文
+    "保存", "删除", "发送", "提交", "退出", "登出",
+    "发布", "购买", "付款", "支付", "转账",
+    "确认删除", "永久删除", "格式化", "清空",
+    # 英文
+    "save", "delete", "send", "submit", "publish",
+    "quit", "log out", "sign out",
+    "buy", "pay", "checkout",
+    "format", "wipe", "erase",
+]
+
+
+def _adu_needs_observe(action: str, payload: Dict[str, Any]) -> bool:
+    a = (action or "").strip().lower()
+    if a not in _ADU_OBSERVE_BEFORE:
+        return False
+    if a in ("press_keys", "press", "hotkey", "shortcut"):
+        keys = _normalize_computer_keys(payload.get("keys") or payload.get("key") or payload.get("combo")) or []
+        keyset = {k.strip().lower() for k in keys if k}
+        if keyset and keyset.issubset(_ADU_LOW_RISK_KEYS):
+            return False
+    return True
+
+
+def _adu_safety_decide(action: str, payload: Dict[str, Any], pre_summary: str) -> tuple[str, str]:
+    """返回 (decision, reason)；decision ∈ {"safe","needs_confirm","unsafe"}。
+    规则化裁决（V1.5 第一版，未来可接 LLM）。
+    """
+    a = (action or "").strip().lower()
+    pre = (pre_summary or "").lower()
+
+    # 1) 高影响热键 → 始终需要二次确认
+    if a in ("press_keys", "press", "hotkey", "shortcut"):
+        keys = _normalize_computer_keys(payload.get("keys") or []) or []
+        keyset = {k.strip().lower() for k in keys if k}
+        for risky in _ADU_NEED_CONFIRM_HOTKEYS:
+            if risky.issubset(keyset):
+                return ("needs_confirm", f"高影响热键 {'+'.join(sorted(risky))} 需用户明确确认。")
+
+    # 2) 视觉摘要里出现敏感关键词 → 需要确认（按钮/动作可能就在屏幕上）
+    #    open_app 只是启动应用、不与当前屏幕元素交互，豁免该门控以免误拦。
+    if a not in ("open_app", "open_application", "launch_app", "launch"):
+        hits = [kw for kw in _ADU_DANGER_KEYWORDS if kw in pre]
+        if hits:
+            return ("needs_confirm", f"视觉发现敏感界面元素：{', '.join(hits[:4])}。")
+
+    return ("safe", "")
+
+
+async def _adu_observe(user_goal: str = "") -> tuple[bool, str, Optional[str]]:
+    """截图 + 视觉摘要。返回 (ok, summary, image_b64)。"""
+    try:
+        shot = await _brain_computer_execute_action("screenshot", {})
+    except Exception as e:
+        return False, f"截图失败：{type(e).__name__}: {e}", None
+    image_b64 = _extract_image_b64_from_result(shot) if shot else None
+    if not image_b64:
+        return False, "未能拿到截图 b64", None
+    v_ok, v_summary, v_err = await _vision_describe_screenshot(image_b64, user_goal)
+    if not v_ok:
+        return False, f"视觉分析失败：{v_err}", image_b64
+    return True, v_summary, image_b64
+
+
+# ---- V0.2 上下文意图理解：按 conversation_id 缓存最近一次电脑观察 ----
+# 仅做轻量内存缓存：进程重启即丢失，5 分钟 TTL，最多 30 个 conversation。
+_ADU_CTX: Dict[str, Dict[str, Any]] = {}
+_ADU_CTX_TTL_SEC = float(os.getenv("ADU_CTX_TTL_SEC") or "300")
+_ADU_CTX_MAX_ENTRIES = int(os.getenv("ADU_CTX_MAX_ENTRIES") or "30")
+
+
+def _adu_ctx_prune() -> None:
+    now = time.time()
+    expired = [
+        k for k, v in _ADU_CTX.items()
+        if now - float(v.get("last_observed_at", 0)) > _ADU_CTX_TTL_SEC
+    ]
+    for k in expired:
+        _ADU_CTX.pop(k, None)
+    if len(_ADU_CTX) > _ADU_CTX_MAX_ENTRIES:
+        ordered = sorted(
+            _ADU_CTX.items(),
+            key=lambda kv: float(kv[1].get("last_observed_at", 0)),
+        )
+        for k, _v in ordered[: len(_ADU_CTX) - _ADU_CTX_MAX_ENTRIES]:
+            _ADU_CTX.pop(k, None)
+
+
+def _adu_ctx_save(conversation_id: str, action: str,
+                  image_b64: Optional[str], summary: Optional[str]) -> None:
+    if not conversation_id:
+        return
+    _ADU_CTX[conversation_id] = {
+        "last_computer_action": action,
+        "last_screenshot_b64": image_b64,
+        "last_vision_summary": summary,
+        "last_observed_at": time.time(),
+    }
+    _adu_ctx_prune()
+
+
+def _adu_ctx_get(conversation_id: str) -> Optional[Dict[str, Any]]:
+    if not conversation_id:
+        return None
+    rec = _ADU_CTX.get(conversation_id)
+    if not rec:
+        return None
+    if time.time() - float(rec.get("last_observed_at", 0)) > _ADU_CTX_TTL_SEC:
+        _ADU_CTX.pop(conversation_id, None)
+        return None
+    return rec
+
+
+# 强 follow-up：在 ctx 存在时即可触发屏幕复用（语义明确指向"刚才看到的东西"）
+_ADU_FOLLOWUP_STRONG = [
+    "你看到了什么", "你看见了什么",
+    "看到了什么了", "看见了什么了", "看到什么了", "看见什么了",
+    "上面是什么", "上面有什么", "上面写", "上面显示",
+    "看出来了吗", "看明白了吗", "看清楚了吗",
+    "那是什么", "现在是什么", "刚才那个", "刚刚那个",
+    "屏幕里", "屏幕上", "画面里", "画面上",
+]
+
+# 弱 follow-up：ctx 存在 + 不含明显聊天意图时才触发
+_ADU_FOLLOWUP_WEAK = [
+    "什么情况", "现在呢", "怎么样", "什么意思",
+]
+
+# 排除：含这些词视为普通聊天意图，即便 ctx 在也不抢路由
+_ADU_CHAT_GUARDS = [
+    "你觉得", "你认为", "你看呢",
+    "这个想法", "这个方案", "这个主意", "这个建议", "这种想法",
+    "靠谱吗", "对不对", "好不好", "可行吗", "合适吗", "行不行",
+]
+
+
+def _is_screen_followup(text: str, has_ctx: bool) -> bool:
+    """判断当前文本是否是对屏幕的追问/指代（仅在有 ctx 时返回 True）。"""
+    if not has_ctx:
+        return False
+    t = (text or "").strip()
+    if not t:
+        return False
+    if any(g in t for g in _ADU_CHAT_GUARDS):
+        return False
+    if any(p in t for p in _ADU_FOLLOWUP_STRONG):
+        return True
+    if any(p in t for p in _ADU_FOLLOWUP_WEAK):
+        return True
+    return False
+
+
+# ---- V1 工程修复闭环：识别"修工程/修bug/跑测试"类意图，复用 agent_loop_router ----
+import threading as _adu_threading  # 局部别名，避免与上面文件其他 threading 用法歧义
+
+# 工程修复触发词（精准，避免与"修家电""bug 反馈"等普通聊天冲突）
+_ADU_ENG_TRIGGERS = [
+    "修复工程", "修工程", "修一下工程", "修一下项目", "修复项目",
+    "修复 bug", "修 bug", "修一下 bug", "修复bug", "修bug", "修一下bug",
+    "修一下编译", "检查编译", "编译错误", "compile error", "build fail", "构建失败",
+    "跑测试", "运行测试", "跑一下测试", "跑 test", "跑test",
+    "跑 pytest", "跑pytest", "npm test", "pytest",
+    "自动改代码", "自动修代码", "自动修复",
+    "工程修复",
+]
+
+# 高风险动作关键词（命中则 need_confirm=true，禁止 V1 阶段直接执行）
+_ADU_ENG_HIGH_RISK_PATTERNS = [
+    r"\brm\s+-rf?\b", r"删除文件", r"清空目录",
+    r"\bgit\s+push\b", r"推送到远程", r"推到远程", r"推到主分支", r"推到 main", r"推到master",
+    r"\bsudo\b",
+    r"发布", r"上线", r"\bdeploy\b", r"\brelease\b",
+    r"安装依赖", r"\bpip\s+install\b", r"\bnpm\s+install\b", r"\bbrew\s+install\b",
+    r"\bnpm\s+publish\b", r"\bpip\s+publish\b",
+]
+
+
+def _is_engineering_request(text: str) -> bool:
+    t = (text or "").strip().lower()
+    if not t:
+        return False
+    for kw in _ADU_ENG_TRIGGERS:
+        if kw.lower() in t:
+            return True
+    return False
+
+
+def _engineering_high_risk(text: str) -> bool:
+    t = (text or "").strip()
+    for pat in _ADU_ENG_HIGH_RISK_PATTERNS:
+        if re.search(pat, t, re.IGNORECASE):
+            return True
+    return False
+
+
+# 串行化 BASE_DIR override，避免并发工程运行互相踩
+_ENG_BASE_DIR_LOCK = _adu_threading.Lock()
+
+
+def _start_engineering_run(goal: str, engineering_root: Optional[str] = None) -> Optional[Dict[str, Any]]:
+    """启动一次 agent_loop run（强制 dry_run=True）。
+    engineering_root: 可选；若提供，则把模块全局 BASE_DIR 临时切到该目录，
+    让 _copy_repo_to_workdir 只复制这个小目录而不是整个 backend。
+    出于安全考虑，engineering_root 必须在 /tmp/ 之下（macOS 上 /private/tmp/ 同义）。
+    """
+    if _agent_loop_module is None:
+        return None
+    try:
+        store = getattr(_agent_loop_module, "STORE", None)
+        worker = getattr(_agent_loop_module, "_run_worker", None)
+        default_model = getattr(_agent_loop_module, "DEFAULT_MODEL", "gpt-4o-mini")
+        default_provider = getattr(_agent_loop_module, "DEFAULT_PROVIDER", "openai")
+        default_test_cmd = getattr(_agent_loop_module, "AGENT_TEST_CMD_DEFAULT", "python -m compileall -q .")
+        if store is None or worker is None:
+            return None
+
+        eng_root_path: Optional[Any] = None
+        if engineering_root:
+            from pathlib import Path as _Path  # local import to avoid header churn
+            target = _Path(engineering_root).expanduser().resolve()
+            target_str = str(target)
+            if not (target_str.startswith("/tmp/") or target_str.startswith("/private/tmp/")):
+                return {"error": f"engineering_root 必须在 /tmp/ 之下，得到: {target_str}"}
+            if not target.is_dir():
+                return {"error": f"engineering_root 不是目录: {target_str}"}
+            eng_root_path = target
+
+        st = store.create(
+            goal=goal,
+            dry_run=True,                       # V1 强制 dry_run：不污染线上代码
+            test_cmd=default_test_cmd,
+            model=default_model,
+            provider=default_provider,
+        )
+
+        # 如果提供了 engineering_root，临时把 BASE_DIR 切到它
+        # 拿锁防并发；watcher 线程在 worker 读完 BASE_DIR（status 离开 queued）后立刻还原
+        if eng_root_path is not None:
+            _ENG_BASE_DIR_LOCK.acquire()
+            original_base = _agent_loop_module.BASE_DIR
+            _agent_loop_module.BASE_DIR = eng_root_path
+
+            def _restore_watcher(run_id: str, store_obj: Any, orig: Any) -> None:
+                try:
+                    # 最多等 30s，正常 100~500ms 内 status 就离开 queued
+                    for _ in range(300):
+                        st_now = store_obj.get(run_id)
+                        if not st_now or st_now.status != "queued":
+                            break
+                        time.sleep(0.1)
+                finally:
+                    _agent_loop_module.BASE_DIR = orig
+                    try:
+                        _ENG_BASE_DIR_LOCK.release()
+                    except Exception:
+                        pass
+
+            _adu_threading.Thread(
+                target=_restore_watcher,
+                args=(st.run_id, store, original_base),
+                daemon=True,
+            ).start()
+
+        t = _adu_threading.Thread(
+            target=worker,
+            args=(st.run_id, goal, True, default_test_cmd, default_model, default_provider),
+            daemon=True,
+        )
+        t.start()
+
+        return {
+            "task_id": st.run_id,
+            "status": "queued",
+            "dry_run": True,
+            "model": default_model,
+            "provider": default_provider,
+            "test_cmd": default_test_cmd,
+            "engineering_root": str(eng_root_path) if eng_root_path else None,
+            "events_url": f"/agent/events/{st.run_id}",
+            "result_url": f"/agent/result/{st.run_id}",
+            "bundle_url": f"/agent/bundle/{st.run_id}.zip",
+        }
+    except Exception as e:
+        return {"error": f"{type(e).__name__}: {e}"}
+
+
+# ================================
+# Computer Work Mode · 任务级执行器（task executors）
+# 一个用户目标 = 一个任务。任务内低风险步骤（截图/视觉/前台/鼠标位置/open_app/
+# Esc-Tab-方向/在已确认安全输入框打字）自主连续执行并记录 attempts，不每步弹确认。
+# 只有高风险动作（Cmd+S/Q/W、删除、发送、付款、git push、sudo…）才 need_confirm。
+# 不做 LLM 多步规划，只做固定任务流水。
+# ================================
+
+def _adu_mk_attempt(step: int, method: str, ok: bool,
+                    verified_by: str = "", reason: str = "") -> Dict[str, Any]:
+    return {"step": int(step), "method": str(method), "ok": bool(ok),
+            "verified_by": verified_by or "", "reason": reason or ""}
+
+
+def _adu_task_envelope(goal: str, source: str, task: str, *,
+                       completed: bool, attempts: List[Dict[str, Any]],
+                       risk_level: int, need_confirm: bool, executed: bool,
+                       final_text: str, safety_decision: str = "safe",
+                       result: Any = None, confirm_text: Optional[str] = None,
+                       **extra: Any) -> Dict[str, Any]:
+    """任务级统一返回结构。"""
+    out: Dict[str, Any] = {
+        "ok": True, "route": "computer", "mode": "computer_work",
+        "source": source, "goal": goal, "action": task, "task": task,
+        "completed": bool(completed), "attempts": attempts or [],
+        "risk_level": int(risk_level), "need_confirm": bool(need_confirm),
+        "executed": bool(executed), "safety_decision": safety_decision,
+        "result": result, "confirm_text": confirm_text, "final_text": final_text,
+    }
+    out.update(extra)
+    return out
+
+
+async def _adu_task_observe(goal: str, source: str) -> Dict[str, Any]:
+    """observe_task：截图 → 视觉分析 → 前台窗口。全部 risk_level=0，自主执行。"""
+    attempts: List[Dict[str, Any]] = []
+    try:
+        shot = await _brain_computer_execute_action("screenshot", {})
+    except Exception as e:
+        attempts.append(_adu_mk_attempt(1, "screenshot", False, reason=f"{type(e).__name__}: {e}"))
+        return _adu_task_envelope(goal, source, "observe", completed=False, attempts=attempts,
+                                  risk_level=0, need_confirm=False, executed=False,
+                                  final_text=f"截图失败：{e}")
+    img = _extract_image_b64_from_result(shot)
+    attempts.append(_adu_mk_attempt(1, "screenshot", bool(img), "screenshot",
+                                    "" if img else "未取得截图数据"))
+    v_ok, v_summary, v_err = (False, "", "无截图")
+    if img:
+        v_ok, v_summary, v_err = await _vision_describe_screenshot(img, goal)
+        attempts.append(_adu_mk_attempt(2, "vision_analyze", v_ok,
+                                        "vision" if v_ok else "", "" if v_ok else v_err))
+    aw_app = None
+    try:
+        aw = await _brain_computer_execute_action("active_window", {})
+        inner = aw.get("result") if isinstance(aw, dict) else None
+        aw_app = (inner or {}).get("app") if isinstance(inner, dict) else None
+        attempts.append(_adu_mk_attempt(3, "active_window", bool(aw_app), "active_window",
+                                        f"前台 {aw_app}" if aw_app else "未取得前台"))
+    except Exception as e:
+        attempts.append(_adu_mk_attempt(3, "active_window", False, reason=str(e)))
+    parts: List[str] = []
+    if aw_app:
+        parts.append(f"当前前台：{aw_app}。")
+    if v_ok:
+        parts.append(f"我看到屏幕上 {v_summary}")
+    elif img:
+        parts.append(f"截图完成，但视觉分析失败：{v_err}")
+    final = " ".join(parts) or "未能完成屏幕观察。"
+    completed = bool(img) and (v_ok or bool(aw_app))
+    return _adu_task_envelope(goal, source, "observe", completed=completed, attempts=attempts,
+                              risk_level=0, need_confirm=False, executed=True, final_text=final,
+                              result={"screenshot_ok": bool(img)},
+                              screenshot_available=bool(img),
+                              vision_summary=v_summary if v_ok else None,
+                              active_window=aw_app, observed_before=True,
+                              pre_action_summary=v_summary if v_ok else None)
+
+
+async def _adu_task_mouse_position(goal: str, source: str) -> Dict[str, Any]:
+    """mouse_position_task：读取鼠标坐标，risk_level=0。"""
+    attempts: List[Dict[str, Any]] = []
+    try:
+        res = await _brain_computer_execute_action("mouse_position", {})
+    except Exception as e:
+        attempts.append(_adu_mk_attempt(1, "mouse_position", False, reason=str(e)))
+        return _adu_task_envelope(goal, source, "mouse_position", completed=False,
+                                  attempts=attempts, risk_level=0, need_confirm=False,
+                                  executed=False, final_text=f"读取鼠标位置失败：{e}")
+    inner = res.get("result") if isinstance(res, dict) else None
+    x = (inner or {}).get("x") if isinstance(inner, dict) else None
+    y = (inner or {}).get("y") if isinstance(inner, dict) else None
+    ok = x is not None and y is not None
+    attempts.append(_adu_mk_attempt(1, "mouse_position", ok, "process",
+                                    f"x={x}, y={y}" if ok else "未取得坐标"))
+    final = f"鼠标当前位置：x={x}, y={y}。" if ok else "未能读取鼠标位置。"
+    return _adu_task_envelope(goal, source, "mouse_position", completed=ok, attempts=attempts,
+                              risk_level=0, need_confirm=False, executed=True,
+                              final_text=final, result=res)
+
+
+async def _adu_task_open_app(goal: str, source: str) -> Dict[str, Any]:
+    """open_app_task：多方法回退（open -a → 路径 → mdfind → osascript → Spotlight）+ 验证。
+    全程自主，不每步弹确认。"""
+    spec = _extract_app_to_open_from_goal(goal)
+    if not spec:
+        return _adu_task_envelope(goal, source, "open_app", completed=False, attempts=[],
+                                  risk_level=1, need_confirm=False, executed=False,
+                                  final_text="未能从目标里识别出要打开的应用。")
+    query, display = spec["query"], spec["display"]
+    try:
+        res = await _brain_computer_execute_action(
+            "open_app", {"app": query, "display": display})
+    except Exception as e:
+        return _adu_task_envelope(goal, source, "open_app", completed=False, attempts=[],
+                                  risk_level=1, need_confirm=False, executed=True,
+                                  final_text=f"打开{display}异常：{e}")
+    attempts = (res.get("attempts") or []) if isinstance(res, dict) else []
+    completed = bool(isinstance(res, dict) and res.get("completed"))
+    msg = res.get("message") if isinstance(res, dict) else None
+    return _adu_task_envelope(goal, source, "open_app", completed=completed, attempts=attempts,
+                              risk_level=1, need_confirm=False, executed=True,
+                              final_text=msg or f"已尝试打开{display}。", result=res)
+
+
+async def _adu_task_dry_run_click(goal: str, source: str) -> Dict[str, Any]:
+    """dry_run_click_task：只观察 + 安全评估，绝不执行真实 click。executed 恒为 False。"""
+    payload: Dict[str, Any] = {}
+    try:
+        dr = (_ADU_CW.parse_dry_run_click(goal) if _ADU_CW is not None else None) or {}
+        payload = dr.get("payload") or {}
+    except Exception:
+        payload = {}
+    x, y = payload.get("x"), payload.get("y")
+    xy = f"({x},{y})" if x is not None and y is not None else "(未给坐标)"
+    attempts: List[Dict[str, Any]] = []
+    obs_ok, summary, _b64 = await _adu_observe(user_goal=goal)
+    attempts.append(_adu_mk_attempt(1, "observe(screenshot+vision)", obs_ok,
+                                    "vision" if obs_ok else "", summary))
+    if not obs_ok:
+        return _adu_task_envelope(goal, source, "dry_run_click", completed=False,
+                                  attempts=attempts, risk_level=1, need_confirm=False,
+                                  executed=False, safety_decision="needs_confirm",
+                                  final_text=f"【判断模式】无法感知屏幕，无法评估 {xy} 的点击：{summary}")
+    decision, reason = _adu_safety_decide("click", payload, summary)
+    attempts.append(_adu_mk_attempt(2, "safety_decide(click)", True, "vision",
+                                    f"{decision}：{reason}" if reason else decision))
+    final = (f"【判断模式】坐标 {xy} 的点击安全评估：{decision}。"
+             + (f"{reason} " if reason else " ")
+             + f"屏幕：{(summary or '')[:160]} 已按你的要求未执行点击。")
+    return _adu_task_envelope(goal, source, "dry_run_click", completed=True, attempts=attempts,
+                              risk_level=1, need_confirm=False, executed=False,
+                              safety_decision=decision, final_text=final,
+                              observed_before=True, pre_action_summary=summary)
+
+
+async def _adu_task_textedit_input(goal: str, source: str) -> Dict[str, Any]:
+    """safe_textedit_input_task：打开 TextEdit → Esc 关面板 → Cmd+N 新建空白文档 →
+    截图/前台验证输入区就绪 →（目标带明确文字才）在已确认安全的空白文档里输入。
+    绝不执行 Cmd+S（保存属高风险）。"""
+    attempts: List[Dict[str, Any]] = []
+    counter = {"n": 0}
+
+    def add(method: str, ok: bool, vby: str = "", reason: str = "") -> None:
+        counter["n"] += 1
+        attempts.append(_adu_mk_attempt(counter["n"], method, ok, vby, reason))
+
+    # 步骤 1：打开 TextEdit（多方法回退）
+    try:
+        opened = await _brain_computer_execute_action(
+            "open_app", {"app": "TextEdit", "display": "TextEdit"})
+    except Exception as e:
+        add("open_app TextEdit", False, reason=str(e))
+        return _adu_task_envelope(goal, source, "textedit_input", completed=False,
+                                  attempts=attempts, risk_level=1, need_confirm=False,
+                                  executed=True, final_text=f"打开 TextEdit 异常：{e}")
+    for a in ((opened.get("attempts") or []) if isinstance(opened, dict) else []):
+        counter["n"] += 1
+        a2 = dict(a)
+        a2["step"] = counter["n"]
+        attempts.append(a2)
+    if not bool(isinstance(opened, dict) and opened.get("completed")):
+        return _adu_task_envelope(goal, source, "textedit_input", completed=False,
+                                  attempts=attempts, risk_level=1, need_confirm=False,
+                                  executed=True, result=opened,
+                                  final_text="未能确认 TextEdit 已打开，停止准备输入区。")
+    # 步骤 2：Esc 关掉可能弹出的打开/存储面板（低风险，自主）
+    try:
+        await _brain_computer_execute_action("press_keys", {"keys": ["escape"]})
+        add("press Esc（关闭可能的面板）", True, "")
+    except Exception as e:
+        add("press Esc", False, reason=str(e))
+    await asyncio.sleep(0.3)
+    # 步骤 3：Cmd+N 新建空白文档（低风险，非 Cmd+S/Q/W，自主）
+    try:
+        await _brain_computer_execute_action("press_keys", {"keys": ["cmd", "n"]})
+        add("press Cmd+N（新建空白文档）", True, "")
+    except Exception as e:
+        add("press Cmd+N", False, reason=str(e))
+    await asyncio.sleep(0.5)
+    # 步骤 4：截图 + 视觉验证输入区
+    obs_ok, summary, _b64 = await _adu_observe(
+        user_goal="确认 TextEdit 是否有一个空白可编辑文档作为安全输入区")
+    add("verify 输入区（screenshot+vision）", obs_ok, "vision" if obs_ok else "", summary)
+    # 步骤 5：前台窗口验证
+    aw_app = None
+    try:
+        aw = await _brain_computer_execute_action("active_window", {})
+        inner = aw.get("result") if isinstance(aw, dict) else None
+        aw_app = (inner or {}).get("app") if isinstance(inner, dict) else None
+    except Exception as e:
+        add("verify active_window", False, reason=str(e))
+    fg_ok = bool(aw_app and "textedit" in str(aw_app).replace(" ", "").lower())
+    if aw_app is not None:
+        add("verify active_window", fg_ok, "active_window", f"前台 {aw_app}")
+    # 步骤 6（可选）：目标里带明确文字 → 在已确认安全的空白文档里输入
+    type_text = None
+    try:
+        type_text = _ADU_CW.textedit_text_to_type(goal) if _ADU_CW is not None else None
+    except Exception:
+        type_text = None
+    typed = False
+    if type_text and fg_ok:
+        try:
+            await _brain_computer_execute_action("type_text", {"text": type_text})
+            typed = True
+            add("type_text 到 TextEdit 空白文档", True, "vision",
+                f"已输入：{type_text[:40]}")
+        except Exception as e:
+            add("type_text", False, reason=str(e))
+    wants_save = (any(k in goal for k in ("保存", "存储")) or "save" in goal.lower()) \
+        and not any(k in goal for k in ("不保存", "不要保存", "别保存"))
+    completed = fg_ok
+    if completed and typed:
+        final = (f"TextEdit 已打开，空白文档作为安全输入区已就绪，"
+                 f"并已输入测试文字「{type_text}」。未保存文件。")
+    elif completed:
+        final = "TextEdit 已打开，空白文档作为安全输入区已就绪（未输入文字、未保存文件），可以安全输入。"
+    else:
+        final = f"TextEdit 已启动，但未能确认前台空白文档（当前前台：{aw_app}）。"
+    if wants_save:
+        final += "（注：保存=Cmd+S 属高风险，需你确认，本次未保存。）"
+    return _adu_task_envelope(goal, source, "textedit_input", completed=completed,
+                              attempts=attempts, risk_level=1, need_confirm=False,
+                              executed=True, final_text=final, observed_before=True,
+                              pre_action_summary=summary if obs_ok else None,
+                              vision_summary=summary if obs_ok else None,
+                              active_window=aw_app)
+
+
+@app.post("/api/brain/adu/act")
+async def api_brain_adu_act(request: Request):
+    body = await _request_json_or_empty(request)
+
+    source = str(body.get("source") or "").strip().lower()
+    text = str(body.get("text") or body.get("goal") or "").strip()
+    client_id = str(body.get("client_id") or "").strip()
+    conversation_id = str(body.get("conversation_id") or "").strip()
+    mode = str(body.get("mode") or "").strip()
+    allow_execute_raw = body.get("allow_execute")
+    allow_execute = True if allow_execute_raw is None else bool(allow_execute_raw)
+
+    if source not in _ADU_ACT_SOURCES:
+        raise HTTPException(status_code=400, detail={
+            "ok": False,
+            "error": "bad_source",
+            "hint": f"source 必须是 {sorted(_ADU_ACT_SOURCES)} 之一",
+        })
+    if not text:
+        raise HTTPException(status_code=400, detail={"ok": False, "error": "missing text"})
+
+    # Computer Work Mode：任务级执行器分派
+    #   一个用户目标 = 一个任务；任务内低风险步骤自主连续执行并记录 attempts，不每步弹确认。
+    #   未命中这 5 类任务 → 交回下方原单动作流程（含工程修复 / 屏幕追问 / 普通聊天）。
+    if _ADU_CW is not None:
+        try:
+            _task_kind = _ADU_CW.classify_task(text)
+        except Exception:
+            _task_kind = None
+        _task_res = None
+        if _task_kind == "observe":
+            _task_res = await _adu_task_observe(text, source)
+        elif _task_kind == "mouse_position":
+            _task_res = await _adu_task_mouse_position(text, source)
+        elif _task_kind == "open_app":
+            _task_res = await _adu_task_open_app(text, source)
+        elif _task_kind == "dry_run_click":
+            _task_res = await _adu_task_dry_run_click(text, source)
+        elif _task_kind == "textedit_input":
+            _task_res = await _adu_task_textedit_input(text, source)
+        if _task_res is not None:
+            _task_res.setdefault("client_id", client_id)
+            _task_res.setdefault("conversation_id", conversation_id)
+            _task_res.setdefault("input_mode", mode)
+            return _task_res
+
+    # 1) 普通聊天 → 前端继续走原聊天流，不在这里执行任何操作
+    spec = _computer_action_from_goal(text)
+
+    # Computer Work Mode：dry-run 点击判定（"判断 X,Y 能不能点，不要执行点击"）
+    # 关键：必须独立于 _computer_action_from_goal 判定——"不要执行点击"本身含"点击"
+    #       二字会被普通 click 分支命中，必须由 dry-run 覆盖，否则会真的点下去。
+    dry_run = False
+    if _ADU_CW is not None:
+        try:
+            _dr = _ADU_CW.parse_dry_run_click(text)
+        except Exception:
+            _dr = None
+        if _dr:
+            spec = {"action": _dr["action"], "payload": _dr.get("payload") or {}}
+            dry_run = True
+            allow_execute = False  # 判断模式：永不执行
+
+    # 1.3) V1 工程修复：text 没命中电脑动作，但命中"修工程/修bug/跑测试"类
+    if spec is None and _is_engineering_request(text):
+        high_risk = _engineering_high_risk(text)
+        risk_level = 2 if high_risk else 1
+
+        # 高风险 或 allow_execute=False → 仅返回计划，不创建 run
+        if (not allow_execute) or high_risk:
+            reason = []
+            if high_risk:
+                reason.append("包含高风险动作（删除/推送/sudo/发布/安装依赖）")
+            if not allow_execute:
+                reason.append("调用方未授权执行")
+            return {
+                "ok": True,
+                "route": "engineering",
+                "source": source,
+                "goal": text,
+                "client_id": client_id,
+                "conversation_id": conversation_id,
+                "mode": mode,
+                "action": "engineering_loop",
+                "task_id": None,
+                "status": "need_confirm",
+                "steps": [],
+                "logs": [],
+                "need_confirm": True,
+                "risk_level": risk_level,
+                "result": {"plan_only": True, "reason": "；".join(reason)},
+                "final_text": "已识别为工程修复任务，等待确认后再执行。" + (
+                    "（包含高风险动作：删除/推送/sudo/发布/安装依赖）" if high_risk else ""
+                ),
+            }
+
+        # 实际启动（dry_run=True 强制：V1 不污染源码，只产出 patch bundle）
+        # 可选：engineering_root 把 agent_loop 的源码根临时切到指定 /tmp/ 子目录（V1 测试用）
+        engineering_root_raw = body.get("engineering_root") or body.get("repo_root")
+        engineering_root_arg = str(engineering_root_raw).strip() if engineering_root_raw else None
+        task_info = _start_engineering_run(text, engineering_root=engineering_root_arg)
+        if not task_info or task_info.get("error"):
+            err = (task_info or {}).get("error") or "agent_loop_router 未加载"
+            return {
+                "ok": False,
+                "route": "engineering",
+                "source": source,
+                "goal": text,
+                "client_id": client_id,
+                "conversation_id": conversation_id,
+                "mode": mode,
+                "action": "engineering_loop",
+                "task_id": None,
+                "status": "error",
+                "steps": [],
+                "logs": [],
+                "need_confirm": False,
+                "risk_level": risk_level,
+                "result": {"error": err},
+                "final_text": f"无法启动工程修复任务：{err}",
+            }
+
+        return {
+            "ok": True,
+            "route": "engineering",
+            "source": source,
+            "goal": text,
+            "client_id": client_id,
+            "conversation_id": conversation_id,
+            "mode": mode,
+            "action": "engineering_loop",
+            "task_id": task_info["task_id"],
+            "status": task_info["status"],
+            "steps": [],
+            "logs": [],
+            "need_confirm": False,
+            "risk_level": risk_level,
+            "result": task_info,
+            "final_text": (
+                f"已启动工程修复任务（dry-run，task_id={task_info['task_id']}）。"
+                f"实时进度：{task_info['events_url']}；最终结果：{task_info['result_url']}。"
+            ),
+        }
+
+    # 1.5) V0.2 上下文意图理解：text 没明确命中 screenshot，但属于追问/指代屏幕
+    if spec is None and conversation_id:
+        ctx = _adu_ctx_get(conversation_id)
+        if ctx and _is_screen_followup(text, has_ctx=True):
+            cached_b64 = ctx.get("last_screenshot_b64")
+            if cached_b64:
+                # 复用上次截图，不重新截图
+                ctx_age = int(time.time() - float(ctx.get("last_observed_at", 0)))
+                base: Dict[str, Any] = {
+                    "ok": True,
+                    "route": "computer",
+                    "source": source,
+                    "goal": text,
+                    "client_id": client_id,
+                    "conversation_id": conversation_id,
+                    "mode": mode,
+                    "need_confirm": False,
+                    "risk_level": 0,
+                    "action": "analyze_last_screenshot",
+                    "payload": {
+                        "reused_from": "context",
+                        "observed_age_sec": ctx_age,
+                    },
+                    "result": {
+                        "ok": True,
+                        "action": "analyze_last_screenshot",
+                        "message": "复用最近一次截图分析。",
+                        "result": {
+                            "reused": True,
+                            "observed_age_sec": ctx_age,
+                            "image_b64_len": len(cached_b64),
+                        },
+                    },
+                    "screenshot_available": True,
+                    "vision_summary": None,
+                    "final_text": None,
+                }
+                v_ok, v_summary, v_err = await _vision_describe_screenshot(cached_b64, text)
+                if v_ok:
+                    base["vision_summary"] = v_summary
+                    base["final_text"] = f"我看到屏幕上 {v_summary}"
+                    _adu_ctx_save(conversation_id, "analyze_last_screenshot", cached_b64, v_summary)
+                else:
+                    base["final_text"] = f"截图已复用，但视觉分析失败：{v_err}"
+                return base
+            # ctx 在但没缓存图（极端情况） → fallback：重新截图
+            spec = {"action": "screenshot", "payload": {}}
+
+    if spec is None:
+        return {"ok": False, "route": "chat", "source": source, "goal": text}
+
+    action = spec["action"]
+    payload = spec.get("payload") or {}
+    if not isinstance(payload, dict):
+        payload = {}
+    risk_level = _adu_act_risk(action)
+
+    if not allow_execute:
+        need_confirm = True
+    else:
+        need_confirm = risk_level > _ADU_ACT_AUTO_RISK_THRESHOLD
+
+    # Computer Work Mode：高风险动作（Cmd+S/Q/W、sudo、git push、付款…）升级 risk_level
+    cw_confirm_reason = ""
+    if _ADU_CW is not None:
+        try:
+            risk_level, cw_confirm_reason = _ADU_CW.escalate_risk(action, payload, text, risk_level)
+        except Exception:
+            cw_confirm_reason = ""
+    if risk_level > _ADU_ACT_AUTO_RISK_THRESHOLD:
+        need_confirm = True
+
+    # V1.5: 接收 action_mode（默认 observe_decide_act_verify，可由调用方覆盖）
+    action_mode = str(body.get("action_mode") or "observe_decide_act_verify").strip().lower() or "observe_decide_act_verify"
+
+    base: Dict[str, Any] = {
+        "ok": True,
+        "route": "computer",
+        "source": source,
+        "goal": text,
+        "client_id": client_id,
+        "conversation_id": conversation_id,
+        "mode": "computer_work",
+        "need_confirm": need_confirm,
+        "risk_level": risk_level,
+        "action": action,
+        "payload": payload,
+        "result": None,
+        "final_text": None,
+        # V1.5 新增字段
+        "action_mode": action_mode,
+        "observed_before": False,
+        "pre_action_summary": None,
+        "safety_decision": "safe",
+        "executed": False,
+        "post_action_summary": None,
+        # Computer Work Mode 统一字段
+        "input_mode": mode,
+        "completed": False,
+        "attempts": [],
+        "confirm_text": None,
+    }
+
+    # V1.5 Observe→Decide：高影响动作执行前必须先感知 + 安全裁决
+    needs_observe = _adu_needs_observe(action, payload) and action_mode != "fast"
+    if needs_observe:
+        obs_ok, pre_summary, _pre_b64 = await _adu_observe(user_goal=text)
+        base["observed_before"] = obs_ok
+        base["pre_action_summary"] = pre_summary
+        if not obs_ok:
+            # 感知失败 → 禁止盲执行
+            base["safety_decision"] = "needs_confirm"
+            base["risk_level"] = max(base.get("risk_level") or 0, 1)
+            if dry_run:
+                base["need_confirm"] = False
+                base["final_text"] = f"【判断模式】无法感知屏幕，无法评估点击安全性：{pre_summary}"
+            else:
+                base["need_confirm"] = True
+                base["confirm_text"] = _adu_cw_confirm_text(action, base["risk_level"], "屏幕感知失败")
+                base["final_text"] = f"无法感知当前屏幕，禁止盲执行：{pre_summary}"
+            return base
+        decision, reason = _adu_safety_decide(action, payload, pre_summary)
+        base["safety_decision"] = decision
+        if decision in ("unsafe", "needs_confirm"):
+            base["risk_level"] = max(base.get("risk_level") or 0, 1)
+            preview = (pre_summary or "")[:200]
+            if dry_run:
+                base["need_confirm"] = False
+                base["completed"] = True
+                base["final_text"] = (
+                    f"【判断模式】点击安全评估：{decision}。{reason} "
+                    f"屏幕摘要：{preview} 已按你的要求未执行点击。"
+                )
+            else:
+                base["need_confirm"] = True
+                base["confirm_text"] = _adu_cw_confirm_text(action, base["risk_level"], reason)
+                base["final_text"] = (
+                    f"已识别动作但视觉感知判定为 {decision}：{reason} "
+                    f"屏幕摘要：{preview}"
+                )
+            return base
+
+    # 2) 需确认 / 仅返回计划 / 判断模式：不执行
+    if need_confirm:
+        if dry_run:
+            xy = (f"({payload.get('x')},{payload.get('y')})"
+                  if payload.get("x") is not None and payload.get("y") is not None
+                  else "(未给坐标)")
+            base["need_confirm"] = False
+            base["completed"] = bool(base.get("observed_before"))
+            base["confirm_text"] = None
+            base["final_text"] = (
+                f"【判断模式】坐标 {xy} 的点击安全评估：{base.get('safety_decision')}。"
+                + (f" 屏幕：{(base.get('pre_action_summary') or '')[:160]}"
+                   if base.get("pre_action_summary") else "")
+                + " 已按你的要求未执行点击。"
+            )
+        elif base["observed_before"]:
+            base["final_text"] = (
+                "已识别为电脑任务，调用方未授权执行（allow_execute=false）。"
+                f" 视觉感知：{(base['pre_action_summary'] or '')[:200]}"
+            )
+            base["confirm_text"] = _adu_cw_confirm_text(action, base["risk_level"], cw_confirm_reason)
+        else:
+            base["final_text"] = "已识别为电脑任务，等待确认。"
+            base["confirm_text"] = _adu_cw_confirm_text(action, base["risk_level"], cw_confirm_reason)
+        return base
+
+    # 3) 执行：复用现有底层
+    try:
+        result = await _brain_computer_execute_action(action, payload)
+    except HTTPException as e:
+        detail = e.detail if isinstance(e.detail, dict) else {"error": str(e.detail)}
+        base["ok"] = False
+        base["result"] = detail if isinstance(detail, dict) else {"error": str(detail)}
+        err_text = ""
+        if isinstance(detail, dict):
+            err_text = str(detail.get("error") or detail.get("hint") or "")
+        base["final_text"] = err_text or "电脑动作执行失败"
+        return base
+    except Exception as e:
+        base["ok"] = False
+        base["result"] = {"error": str(e)}
+        base["final_text"] = f"电脑动作执行异常：{e}"
+        return base
+
+    base["result"] = result if isinstance(result, dict) else {"value": result}
+    base["final_text"] = _adu_act_final_text(action, result)
+    base["executed"] = True
+    # Computer Work Mode：回填 attempts + completed（completed 只在执行成功且通过验证时为 True）
+    if isinstance(result, dict) and isinstance(result.get("attempts"), list):
+        base["attempts"] = result["attempts"]
+    if action in ("open_app", "open_application", "launch_app", "launch"):
+        base["completed"] = bool(isinstance(result, dict) and result.get("completed"))
+    else:
+        base["completed"] = bool(base["executed"] and base["ok"])
+
+    # V0.1: screenshot 后自动接视觉分析（observe_screen + vision_analyze）
+    if action == "screenshot":
+        image_b64 = _extract_image_b64_from_result(result)
+        if image_b64:
+            base["screenshot_available"] = True
+            v_ok, v_summary, v_err = await _vision_describe_screenshot(image_b64, text)
+            if v_ok:
+                base["vision_summary"] = v_summary
+                base["final_text"] = f"我看到屏幕上 {v_summary}"
+            else:
+                base["vision_summary"] = None
+                base["final_text"] = f"截图已完成，但视觉分析失败：{v_err}"
+            # V0.2: 把这次截图存进 conversation context，供同会话后续追问复用
+            _adu_ctx_save(
+                conversation_id,
+                "screenshot",
+                image_b64,
+                v_summary if v_ok else None,
+            )
+        else:
+            base["screenshot_available"] = False
+
+    # V1.5 Verify：高影响动作执行后再 observe 一次，回传给前端确认效果
+    if needs_observe:
+        try:
+            await asyncio.sleep(0.4)  # 留点 UI 刷新时间
+        except Exception:
+            pass
+        pok, psummary, _pb64 = await _adu_observe(user_goal=f"刚才已执行 {action}，请核对当前屏幕是否符合预期。")
+        base["post_action_summary"] = psummary if pok else f"动作后截图/视觉失败：{psummary}"
+        if pok and base.get("final_text"):
+            base["final_text"] = base["final_text"] + f" 验证：{psummary[:160]}"
+
+    return base
+
+
+# ================================
+# ✅ /api/brain/dev_agent/*  · Dev Agent V1 只读版
+# 链路：App → backend → local-agent :4317 /dev_agent/* → claude CLI → /Users/a12345/Desktop/GPTsora
+# 只透传：project + prompt；安全前缀和 claude 调用参数在 local-agent 那边强制。
+# ================================
+
+@app.get("/api/brain/dev_agent/health")
+async def api_brain_dev_agent_health():
+    if not LOCAL_AGENT_BASE_URL:
+        raise HTTPException(status_code=503, detail={"ok": False, "error": "LOCAL_AGENT_BASE_URL not configured"})
+    url = f"{LOCAL_AGENT_BASE_URL.rstrip('/')}/dev_agent/health"
+    headers = _local_agent_headers()
+    try:
+        import httpx as _httpx
+        async with _httpx.AsyncClient(timeout=8.0) as cli:
+            r = await cli.get(url, headers=headers)
+    except Exception as e:
+        raise HTTPException(status_code=502, detail={"ok": False, "error": f"local-agent unreachable: {type(e).__name__}: {e}"})
+    if r.status_code != 200:
+        raise HTTPException(status_code=r.status_code, detail=(r.text or "")[:400])
+    try:
+        return r.json()
+    except Exception:
+        return {"ok": False, "error": "non-json from local-agent", "body": (r.text or "")[:400]}
+
+
+@app.post("/api/brain/dev_agent/ask")
+async def api_brain_dev_agent_ask(request: Request):
+    body = await _request_json_or_empty(request)
+    project = str(body.get("project") or "").strip()
+    prompt = str(body.get("prompt") or "").strip()
+    if project != "GPTsora":
+        raise HTTPException(status_code=400, detail={
+            "ok": False,
+            "error": f"project must be 'GPTsora', got '{project}'",
+        })
+    if not prompt:
+        raise HTTPException(status_code=400, detail={"ok": False, "error": "missing prompt"})
+    if not LOCAL_AGENT_BASE_URL:
+        raise HTTPException(status_code=503, detail={"ok": False, "error": "LOCAL_AGENT_BASE_URL not configured"})
+
+    url = f"{LOCAL_AGENT_BASE_URL.rstrip('/')}/dev_agent/ask"
+    headers = _local_agent_headers()
+    # local-agent 那边硬上限 90s；这里给 120s 兜底，让网络层不在 local-agent 之前先 timeout。
+    try:
+        import httpx as _httpx
+        async with _httpx.AsyncClient(timeout=120.0) as cli:
+            r = await cli.post(url, headers=headers, json={"project": project, "prompt": prompt})
+    except Exception as e:
+        raise HTTPException(status_code=502, detail={"ok": False, "error": f"local-agent unreachable: {type(e).__name__}: {e}"})
+    if r.status_code != 200:
+        raise HTTPException(status_code=r.status_code, detail=(r.text or "")[:500])
+    try:
+        return r.json()
+    except Exception:
+        return {"ok": False, "error": "non-json from local-agent", "body": (r.text or "")[:500]}
+
+
+# ================================
+# ✅ BrainState Engine API
+# 让 server_session.py 被“状态张量大脑”接管：
+# - /api/brain/state        查看当前大脑状态
+# - /api/brain/tensor       查看 intent/model/tool/risk 张量视图
+# - /api/brain/observe      注入手机/电脑/实时网络/语音等感知状态
+# - /api/brain/think        思考：更新 BrainState，生成 next_action
+# - /api/brain/act          执行 next_action 或指定 action，并把结果写回 BrainState
+# - /api/brain/state/reset  重置当前用户的大脑状态
+# ================================
+
+def _brainstate_unavailable_response() -> JSONResponse:
+    return JSONResponse({"ok": False, "error": "brain_state_engine_unavailable"}, status_code=503)
+
+
+def _brainstate_user_key(req: Request, body: Optional[Dict[str, Any]] = None) -> str:
+    try:
+        return _derive_user_key(req, body or {})
+    except Exception:
+        return _client_id(req)
+
+
+def _brainstate_available_tools() -> Dict[str, bool]:
+    return {
+        "local_agent": bool(_local_agent_is_configured()),
+        "computer_screenshot": bool(_local_agent_is_configured()),
+        "computer_mouse": bool(_local_agent_is_configured()),
+        "computer_keyboard": bool(_local_agent_is_configured()),
+        "web_search": bool(CHAT_ENABLE_WEB_SEARCH_DEFAULT and CHAT_WEB_PROVIDER in ("openai", "openai_tool", "openai_web_search", "openai-web_search")),
+        "memory_search": bool(MEMORY_ENABLED_DEFAULT),
+        "memory_write": bool(MEMORY_ENABLED_DEFAULT),
+        "model_router": True,
+        "file_read": True,
+        "file_write": True,
+        "voice_io": True,
+    }
+
+
+def _brainstate_build_context(req: Request, body: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "allow_web": bool(_extract_allow_web(req, body)),
+        "has_attachments": bool(isinstance(body.get("attachments"), list) and len(body.get("attachments") or []) > 0),
+        "computer_reachable": bool(_local_agent_is_configured()),
+        "available_tools": _brainstate_available_tools(),
+        "client_id": str(body.get("client_id") or body.get("clientId") or req.headers.get("x-client-id") or ""),
+    }
+
+
+def _brainstate_extract_text(body: Dict[str, Any]) -> str:
+    text = str(body.get("message") or body.get("text") or body.get("goal") or body.get("command") or "").strip()
+    if text:
+        return text
+    msgs = body.get("messages")
+    if isinstance(msgs, list):
+        try:
+            return _last_user_text_from_messages(msgs).strip()
+        except Exception:
+            pass
+    return ""
+
+
+@app.get("/api/brain/state")
+async def api_brain_state(request: Request):
+    if BRAIN_STATE_ENGINE is None:
+        return _brainstate_unavailable_response()
+    body: Dict[str, Any] = {}
+    user_key = _brainstate_user_key(request, body)
+    return {"ok": True, "user_key": user_key, "state": BRAIN_STATE_ENGINE.get_state(user_key)}
+
+
+@app.get("/api/brain/tensor")
+async def api_brain_tensor(request: Request):
+    if BRAIN_STATE_ENGINE is None:
+        return _brainstate_unavailable_response()
+    user_key = _brainstate_user_key(request, {})
+    return BRAIN_STATE_ENGINE.tensor_view(user_key)
+
+
+@app.post("/api/brain/state/reset")
+async def api_brain_state_reset(request: Request):
+    if BRAIN_STATE_ENGINE is None:
+        return _brainstate_unavailable_response()
+    body = await _request_json_or_empty(request)
+    user_key = _brainstate_user_key(request, body)
+    return {"ok": True, "user_key": user_key, "state": BRAIN_STATE_ENGINE.reset(user_key)}
+
+
+@app.post("/api/brain/observe")
+async def api_brain_observe(request: Request):
+    if BRAIN_STATE_ENGINE is None:
+        return _brainstate_unavailable_response()
+    body = await _request_json_or_empty(request)
+    user_key = _brainstate_user_key(request, body)
+    observation = body.get("observation") if isinstance(body.get("observation"), dict) else body
+    return BRAIN_STATE_ENGINE.observe(user_key, observation)
+
+
+@app.post("/api/brain/think")
+async def api_brain_think(request: Request):
+    if BRAIN_STATE_ENGINE is None:
+        return _brainstate_unavailable_response()
+    body = await _request_json_or_empty(request)
+    user_key = _brainstate_user_key(request, body)
+    text = _brainstate_extract_text(body)
+    if not text:
+        return JSONResponse({"ok": False, "error": "missing message/text/goal/messages"}, status_code=400)
+    context = _brainstate_build_context(request, body)
+
+    # 先把可用工具、设备状态注入 BrainState，再思考
+    try:
+        BRAIN_STATE_ENGINE.observe(user_key, {
+            "available_tools": context.get("available_tools") or {},
+            "device_state": {
+                "phone_active": True,
+                "computer_reachable": bool(_local_agent_is_configured()),
+                "local_agent_healthy": None,
+            },
+        })
+    except Exception:
+        pass
+
+    decision = BRAIN_STATE_ENGINE.think(user_key, text, context=context)
+
+    # 让 /api/brain/think 不直接替代 /chat，而是成为 server_session.py 的“前额叶决策层”。
+    # 前端可以先调用 think 看 next_action；也可以直接调用 /api/brain/act 执行。
+    return decision
+
+
+async def _brainstate_execute_next_action(user_key: str, action: Dict[str, Any]) -> Dict[str, Any]:
+    if not isinstance(action, dict):
+        return {"ok": False, "error": "invalid action"}
+
+    if action.get("requires_confirmation"):
+        return {
+            "ok": False,
+            "error": "requires_confirmation",
+            "message": "这个动作风险较高，需要用户确认后再执行。",
+            "next_action": action,
+        }
+
+    typ = str(action.get("type") or "").strip()
+    tool = str(action.get("tool") or "").strip()
+    params = action.get("params") or {}
+    if not isinstance(params, dict):
+        params = {}
+
+    # 电脑身体：local-agent / usecomputer
+    if tool == "local_agent" or action.get("target") == "computer":
+        spec = params
+        if "action" in params:
+            spec_action = str(params.get("action") or "")
+            spec_payload = params.get("payload") or {}
+        else:
+            spec_action = str(action.get("action") or "")
+            spec_payload = params.get("payload") or params
+        if not isinstance(spec_payload, dict):
+            spec_payload = {}
+        if not spec_action:
+            return {"ok": False, "error": "missing computer action", "next_action": action}
+        result = await _brain_computer_execute_action(spec_action, spec_payload)
+        return {"ok": True, "executed": True, "tool": "local_agent", "computer_action": spec_action, "result": result}
+
+    # 实时外部感知：web search
+    if tool == "web_search":
+        q = str(params.get("query") or params.get("q") or "").strip()
+        if not q:
+            return {"ok": False, "error": "missing query"}
+        return {
+            "ok": True,
+            "executed": False,
+            "tool": "web_search",
+            "query": q,
+            "provider": "openai_builtin_web_search",
+            "message": "Live web search is executed by /chat via OpenAI built-in web_search.",
+        }
+
+    # 长期记忆检索
+    if tool == "memory_search":
+        q = str(params.get("query") or params.get("q") or "").strip()
+        if not q:
+            return {"ok": False, "error": "missing query"}
+        try:
+            ctx = memory_build_context(user_key, q, k=int(params.get("k") or MEMORY_TOP_K_DEFAULT), min_score=MEMORY_MIN_SCORE_DEFAULT)
+            return {"ok": True, "executed": True, "tool": "memory_search", "query": q, "context": ctx}
+        except Exception as e:
+            return {"ok": False, "tool": "memory_search", "error": str(e)[:500]}
+
+    # 长期记忆写入
+    if tool == "memory_write":
+        txt = str(params.get("text") or "").strip()
+        if not txt:
+            return {"ok": False, "error": "missing text"}
+        try:
+            if _should_memory_add(txt):
+                memory_add(user_key, txt[:1200])
+            try:
+                memory_facts_save(user_key, txt[:400], tags=str(params.get("tags") or "brain_state"), importance=int(params.get("importance") or 4))
+            except Exception:
+                pass
+            return {"ok": True, "executed": True, "tool": "memory_write", "stored": True}
+        except Exception as e:
+            return {"ok": False, "tool": "memory_write", "error": str(e)[:500]}
+
+    # 模型路由：返回建议，不在 /act 直接生成聊天回复，避免绕开 /chat 的计费/流式/TTS/记忆管线。
+    if tool == "model_router" or typ == "call_model":
+        return {
+            "ok": True,
+            "executed": False,
+            "tool": "model_router",
+            "message": "next step should be handled by /chat or /chat/prepare with model_route hints",
+            "model_route": params,
+        }
+
+    if typ == "ask_confirmation":
+        return {"ok": False, "error": "requires_confirmation", "next_action": action}
+
+    return {"ok": False, "error": "unsupported_next_action", "next_action": action}
+
+
+@app.post("/api/brain/act")
+async def api_brain_act(request: Request):
+    if BRAIN_STATE_ENGINE is None:
+        return _brainstate_unavailable_response()
+    body = await _request_json_or_empty(request)
+    user_key = _brainstate_user_key(request, body)
+
+    # 支持两种：1) body.next_action 指定；2) 默认执行当前 BrainState.next_action
+    action = body.get("next_action") or body.get("action")
+    if not isinstance(action, dict):
+        state = BRAIN_STATE_ENGINE.get_state(user_key)
+        action = state.get("next_action") or {}
+
+    result = await _brainstate_execute_next_action(user_key, action)
+    try:
+        new_state = BRAIN_STATE_ENGINE.remember_action_result(user_key, action, result)
+    except Exception:
+        new_state = BRAIN_STATE_ENGINE.get_state(user_key)
+    return {"ok": bool(result.get("ok")), "user_key": user_key, "action": action, "result": result, "state_summary": BRAIN_STATE_ENGINE.summarize_state(new_state)}
+
+# ================================
+# ✅ ChatAGI Left/Right Brain Lite API
+# 左脑：持续意识闪现 / 当前状态 / 今日记忆
+# 右脑：把左脑指令转成 local-agent 电脑动作
+# 说明：不重做 App；这层直接挂在现有 server_session.py 上。
+# ================================
+
+BRAIN_LITE_DIR = DATA_DIR / "brain_lite"
+BRAIN_LITE_DIR.mkdir(parents=True, exist_ok=True)
+
+BRAIN_LITE_IDENTITY: Dict[str, Any] = {
+    "name": "ChatAGI",
+    "owner": "阿杜",
+    "role": "长期个人 AI 大脑助手",
+    "meaning": "帮助阿杜记忆、理解、规划、行动，并逐步迁移到电脑、手机和机器人身体中。",
+    "core_goal": "构建一个具有长期记忆、持续感知、工具行动和可迁移身体的 AI Brain。",
+    "abilities": [
+        "对话", "长期记忆", "联网搜索", "视觉理解", "电脑控制", "手机协助", "代码生成", "文件理解", "任务规划", "机器人身体控制"
+    ],
+    "safety_rules": [
+        "高风险行动必须询问用户确认",
+        "不能删除重要文件或执行付款/发布等高风险动作",
+        "行动前先判断目标、环境和风险",
+        "执行结果必须回写状态与记忆"
+    ],
+}
+
+
+def _brain_lite_now_iso() -> str:
+    return time.strftime("%Y-%m-%dT%H:%M:%S%z")
+
+
+def _brain_lite_today() -> str:
+    return time.strftime("%Y-%m-%d")
+
+
+def _brain_lite_safe_key(raw: str) -> str:
+    s = re.sub(r"[^a-zA-Z0-9_.-]+", "_", (raw or "anonymous").strip())
+    return s[:96] or "anonymous"
+
+
+def _brain_lite_user_key(req: Request, body: Optional[Dict[str, Any]] = None) -> str:
+    body = body or {}
+    raw = (
+        body.get("client_id")
+        or body.get("clientId")
+        or req.query_params.get("client_id")
+        or req.query_params.get("clientId")
+        or req.headers.get("x-client-id")
+        or req.headers.get("x-user-id")
+        or ""
+    )
+    if raw:
+        return _brain_lite_safe_key(str(raw))
+    try:
+        return _brain_lite_safe_key(_brainstate_user_key(req, body))
+    except Exception:
+        try:
+            return _brain_lite_safe_key(_client_id(req))
+        except Exception:
+            return "anonymous"
+
+
+def _brain_lite_state_path(user_key: str) -> Path:
+    return BRAIN_LITE_DIR / f"state_{_brain_lite_safe_key(user_key)}.json"
+
+
+def _brain_lite_memory_path(user_key: str) -> Path:
+    return BRAIN_LITE_DIR / f"memory_{_brain_lite_safe_key(user_key)}.json"
+
+
+def _brain_lite_read_json(path: Path, default: Any) -> Any:
+    try:
+        if path.exists():
+            return json.loads(path.read_text(encoding="utf-8"))
+    except Exception as e:
+        log.warning("[BrainLite] read json failed %s: %s", path, e)
+    return default
+
+
+def _brain_lite_write_json(path: Path, data: Any) -> None:
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    except Exception as e:
+        log.warning("[BrainLite] write json failed %s: %s", path, e)
+
+
+def _brain_lite_default_state(user_key: str) -> Dict[str, Any]:
+    return {
+        "identity": BRAIN_LITE_IDENTITY,
+        "user_key": user_key,
+        "status": "online",
+        "mode": "left_right_brain_mvp",
+        "who_am_i": "我是 ChatAGI，阿杜的长期个人 AI 大脑助手。",
+        "existence_meaning": BRAIN_LITE_IDENTITY["meaning"],
+        "current_environment": "iPhone App + 后端 server_session.py + local-agent 电脑身体。",
+        "current_task": "把现有 ChatAGI 升级为左右脑 AI Brain。",
+        "today_goal": "接通左脑意识闪现、右脑行动执行、电脑控制和记忆回写。",
+        "long_term_goal": BRAIN_LITE_IDENTITY["core_goal"],
+        "current_condition": "等待用户输入或执行下一步任务。",
+        "next_action": "在 App 首页显示 AI 当前意识，并通过右脑执行 local-agent 基础动作。",
+        "right_brain_instruction": {
+            "type": "plan",
+            "target": "computer",
+            "goal": "等待明确电脑动作",
+            "requires_confirmation": False,
+            "risk_level": 1,
+        },
+        "tools": {
+            "local_agent_configured": bool(_local_agent_is_configured()),
+            "computer_actions": ["screenshot", "mouse_position", "move", "click", "type_text", "press_keys", "open_app"],
+            "memory_timeline": True,
+            "brain_state_engine": bool(BRAIN_STATE_ENGINE is not None),
+        },
+        "last_flash_at": _brain_lite_now_iso(),
+        "last_right_brain_result": None,
+    }
+
+
+def _brain_lite_load_state(user_key: str) -> Dict[str, Any]:
+    state = _brain_lite_read_json(_brain_lite_state_path(user_key), None)
+    if isinstance(state, dict):
+        # Keep identity/tools fresh when code changes.
+        state.setdefault("identity", BRAIN_LITE_IDENTITY)
+        state.setdefault("tools", {})
+        if isinstance(state.get("tools"), dict):
+            state["tools"]["local_agent_configured"] = bool(_local_agent_is_configured())
+            state["tools"]["brain_state_engine"] = bool(BRAIN_STATE_ENGINE is not None)
+        return state
+    return _brain_lite_default_state(user_key)
+
+
+def _brain_lite_save_state(user_key: str, state: Dict[str, Any]) -> Dict[str, Any]:
+    _brain_lite_write_json(_brain_lite_state_path(user_key), state)
+    return state
+
+
+def _brain_lite_load_memory(user_key: str) -> List[Dict[str, Any]]:
+    data = _brain_lite_read_json(_brain_lite_memory_path(user_key), [])
+    return data if isinstance(data, list) else []
+
+
+def _brain_lite_append_memory(user_key: str, item: Dict[str, Any]) -> Dict[str, Any]:
+    memory = _brain_lite_load_memory(user_key)
+    item = dict(item or {})
+    item.setdefault("id", uuid.uuid4().hex[:12])
+    item.setdefault("date", _brain_lite_today())
+    item.setdefault("created_at", _brain_lite_now_iso())
+    item.setdefault("type", "brain_event")
+    item.setdefault("importance", 5)
+    memory.insert(0, item)
+    memory = memory[:500]
+    _brain_lite_write_json(_brain_lite_memory_path(user_key), memory)
+    return item
+
+
+def _brain_lite_instruction_from_goal(goal: str, explicit: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    if isinstance(explicit, dict) and explicit:
+        return explicit
+    spec = _computer_action_from_goal(goal or "") if goal else None
+    if spec:
+        return {
+            "type": "computer_action",
+            "target": "computer",
+            "tool": "local_agent",
+            "goal": goal,
+            "action": spec.get("action"),
+            "payload": spec.get("payload") or {},
+            "requires_confirmation": False,
+            "risk_level": 1,
+        }
+    return {
+        "type": "plan",
+        "target": "brain",
+        "goal": goal or "继续观察用户需求，等待明确任务。",
+        "requires_confirmation": False,
+        "risk_level": 0,
+    }
+
+
+def _brain_lite_build_flash(user_key: str, body: Dict[str, Any]) -> Dict[str, Any]:
+    prior = _brain_lite_load_state(user_key)
+    text = str(body.get("text") or body.get("message") or body.get("goal") or "").strip()
+    current_task = str(body.get("current_task") or body.get("task") or prior.get("current_task") or "").strip()
+    environment = str(body.get("environment") or body.get("current_environment") or prior.get("current_environment") or "").strip()
+    today_goal = str(body.get("today_goal") or prior.get("today_goal") or "").strip()
+    long_term_goal = str(body.get("long_term_goal") or prior.get("long_term_goal") or BRAIN_LITE_IDENTITY["core_goal"]).strip()
+    current_condition = str(body.get("current_condition") or body.get("condition") or "").strip()
+    if not current_condition:
+        current_condition = f"最新输入：{text}" if text else str(prior.get("current_condition") or "等待下一步任务。")
+    instruction = _brain_lite_instruction_from_goal(text or current_task, body.get("right_brain_instruction") if isinstance(body.get("right_brain_instruction"), dict) else None)
+    next_action = str(body.get("next_action") or "").strip()
+    if not next_action:
+        if instruction.get("type") == "computer_action":
+            next_action = f"右脑准备执行电脑动作：{instruction.get('action')}。"
+        else:
+            next_action = "保持意识闪现，等待用户确认下一步可执行动作。"
+
+    state = dict(prior)
+    state.update({
+        "identity": BRAIN_LITE_IDENTITY,
+        "user_key": user_key,
+        "status": "online",
+        "mode": "left_right_brain_mvp",
+        "who_am_i": "我是 ChatAGI，阿杜的长期个人 AI 大脑助手。",
+        "existence_meaning": BRAIN_LITE_IDENTITY["meaning"],
+        "current_environment": environment or "iPhone App + 后端 server_session.py + local-agent 电脑身体。",
+        "current_task": current_task or (text if text else "持续感知、记忆、规划与行动。"),
+        "today_goal": today_goal or "完成左右脑 AI Brain MVP：意识闪现 + 右脑行动 + 记忆回写。",
+        "long_term_goal": long_term_goal,
+        "current_condition": current_condition,
+        "next_action": next_action,
+        "right_brain_instruction": instruction,
+        "tools": {
+            "local_agent_configured": bool(_local_agent_is_configured()),
+            "computer_actions": ["screenshot", "mouse_position", "move", "click", "type_text", "press_keys", "open_app"],
+            "memory_timeline": True,
+            "brain_state_engine": bool(BRAIN_STATE_ENGINE is not None),
+        },
+        "last_user_signal": text,
+        "last_flash_at": _brain_lite_now_iso(),
+    })
+    _brain_lite_save_state(user_key, state)
+    if text or current_task:
+        _brain_lite_append_memory(user_key, {
+            "type": "consciousness_flash",
+            "summary": text or current_task,
+            "current_task": state.get("current_task"),
+            "next_action": state.get("next_action"),
+            "importance": int(body.get("importance") or 6),
+        })
+    return state
+
+
+@app.get("/api/brain/consciousness/state")
+async def api_brain_consciousness_state(request: Request):
+    user_key = _brain_lite_user_key(request, {})
+    state = _brain_lite_load_state(user_key)
+    today = _brain_lite_today()
+    memory_today = [m for m in _brain_lite_load_memory(user_key) if str(m.get("date") or "") == today][:20]
+    return {"ok": True, "user_key": user_key, "state": state, "today_memory": memory_today}
+
+
+@app.post("/api/brain/consciousness/flash")
+async def api_brain_consciousness_flash(request: Request):
+    body = await _request_json_or_empty(request)
+    user_key = _brain_lite_user_key(request, body)
+    state = _brain_lite_build_flash(user_key, body)
+    return {"ok": True, "user_key": user_key, "state": state}
+
+
+@app.post("/api/brain/memory/write")
+async def api_brain_lite_memory_write(request: Request):
+    body = await _request_json_or_empty(request)
+    user_key = _brain_lite_user_key(request, body)
+    summary = str(body.get("summary") or body.get("text") or body.get("message") or "").strip()
+    if not summary:
+        return JSONResponse({"ok": False, "error": "missing summary/text/message"}, status_code=400)
+    item = _brain_lite_append_memory(user_key, {
+        "type": str(body.get("type") or "manual_memory"),
+        "summary": summary,
+        "importance": int(body.get("importance") or 5),
+        "raw": body.get("raw") if isinstance(body.get("raw"), dict) else None,
+    })
+    return {"ok": True, "user_key": user_key, "memory": item}
+
+
+@app.get("/api/brain/memory/today")
+async def api_brain_lite_memory_today(request: Request, limit: int = 30):
+    user_key = _brain_lite_user_key(request, {})
+    limit = max(1, min(int(limit or 30), 100))
+    today = _brain_lite_today()
+    memory = [m for m in _brain_lite_load_memory(user_key) if str(m.get("date") or "") == today][:limit]
+    return {"ok": True, "user_key": user_key, "date": today, "memory": memory}
+
+
+@app.post("/api/brain/right-brain/execute")
+async def api_brain_right_brain_execute(request: Request):
+    body = await _request_json_or_empty(request)
+    user_key = _brain_lite_user_key(request, body)
+    goal = str(body.get("goal") or body.get("text") or body.get("command") or "").strip()
+    dry_run = bool(body.get("dry_run") or body.get("dryRun"))
+
+    action = str(body.get("action") or "").strip()
+    payload = body.get("payload") or body.get("args") or {}
+    if not isinstance(payload, dict):
+        payload = {}
+    inferred = False
+    if not action and goal:
+        spec = _computer_action_from_goal(goal)
+        if spec:
+            action = str(spec.get("action") or "")
+            payload = spec.get("payload") or {}
+            inferred = True
+
+    if not action:
+        state = _brain_lite_load_state(user_key)
+        instr = state.get("right_brain_instruction") if isinstance(state.get("right_brain_instruction"), dict) else {}
+        action = str(instr.get("action") or "").strip()
+        payload = instr.get("payload") if isinstance(instr.get("payload"), dict) else payload
+        goal = goal or str(instr.get("goal") or "").strip()
+
+    if not action:
+        return {
+            "ok": False,
+            "error": "missing_action",
+            "message": "右脑还没有明确电脑动作。先调用 /api/brain/consciousness/flash 生成 right_brain_instruction，或直接传 action/payload。",
+            "goal": goal,
+        }
+
+    instruction = {
+        "type": "computer_action",
+        "target": "computer",
+        "tool": "local_agent",
+        "goal": goal,
+        "action": action,
+        "payload": payload,
+        "requires_confirmation": False,
+        "risk_level": int(body.get("risk_level") or body.get("riskLevel") or 1),
+    }
+    if dry_run:
+        state = _brain_lite_load_state(user_key)
+        state["right_brain_instruction"] = instruction
+        state["next_action"] = f"右脑 dry-run：准备执行 {action}。"
+        state["last_flash_at"] = _brain_lite_now_iso()
+        _brain_lite_save_state(user_key, state)
+        return {"ok": True, "dry_run": True, "user_key": user_key, "instruction": instruction, "inferred": inferred}
+
+    result = await _brain_computer_execute_action(action, payload)
+    state = _brain_lite_load_state(user_key)
+    state["right_brain_instruction"] = instruction
+    state["last_right_brain_result"] = result
+    state["current_condition"] = f"右脑已执行：{action}。"
+    state["next_action"] = "观察执行结果，必要时继续下一步或写入复盘。"
+    state["last_flash_at"] = _brain_lite_now_iso()
+    _brain_lite_save_state(user_key, state)
+    _brain_lite_append_memory(user_key, {
+        "type": "right_brain_action",
+        "summary": f"执行电脑动作：{action}；目标：{goal or '-'}",
+        "action": action,
+        "payload": payload,
+        "result": result,
+        "importance": 6,
+    })
+    return {"ok": True, "user_key": user_key, "instruction": instruction, "result": result, "state": state, "inferred": inferred}
+
+
 
 # ✅ business routers
 # NOTE: order matters — we register our /chat override BEFORE including home_chat_router,
@@ -7976,15 +12450,165 @@ try:
 except Exception as _push_err:
     log.warning("[AduPush] 推送模块未加载: %s", _push_err)
 
-# ✅ 声音克隆模块（ElevenLabs）
+# ✅ Codex CLI executor（最小闭环：阿杜后端 -> 本机 codex exec）
 try:
-    from adu_voice_clone import router as voice_clone_router
-    app.include_router(voice_clone_router)
-    log.info("[VoiceClone] ✅ 声音克隆模块已加载")
-except Exception as _vc_err:
-    log.warning("[VoiceClone] 声音克隆模块未加载: %s", _vc_err)
+    from adu_orchestrator.codex_executor import router as adu_codex_router
+    app.include_router(adu_codex_router)
+    log.info("[AduCodex] ✅ Codex executor router loaded")
+except Exception as _codex_err:
+    log.warning("[AduCodex] Codex executor router not loaded: %s", _codex_err)
+
+# ✅ Adu Planner —— 语义路由,不执行(POST /api/adu/planner/route)
+#    把 App 端文本分类到 computer_action / codex_task / chat / 等。
+#    router 自带 prefix=/api/adu/planner;只暴露 /route。
+try:
+    from adu_planner_router import router as adu_planner_router
+    app.include_router(adu_planner_router)
+    log.info("[AduPlanner] ✅ planner router loaded at /api/adu/planner/route")
+except Exception as _planner_err:
+    log.warning("[AduPlanner] planner router not loaded: %s", _planner_err)
+
+# ✅ Adu Project Registry —— GET /api/adu/projects(planner / codex executor 共享同一份注册表)
+try:
+    from adu_project_registry import router as adu_projects_router
+    app.include_router(adu_projects_router)
+    log.info("[AduProjects] ✅ project registry loaded at /api/adu/projects")
+except Exception as _projects_err:
+    log.warning("[AduProjects] project registry not loaded: %s", _projects_err)
+
+# ✅ Adu File Search —— POST /api/adu/files/search(只在授权工作区,跳过 .env / .key 等敏感文件)
+try:
+    from adu_files_search import router as adu_files_search_router
+    app.include_router(adu_files_search_router)
+    log.info("[AduFileSearch] ✅ file search router loaded at /api/adu/files/search")
+except Exception as _files_search_err:
+    log.warning("[AduFileSearch] file search router not loaded: %s", _files_search_err)
+
+# ✅ Adu Self / 递归自我进化(/api/adu/self/*) —— plan_only,不自动执行
+try:
+    from adu_self_router import router as adu_self_router
+    app.include_router(adu_self_router)
+    log.info("[AduSelf] ✅ self router loaded at /api/adu/self/*")
+except Exception as _self_err:
+    log.warning("[AduSelf] self router not loaded: %s", _self_err)
+
+# ✅ Voice clone module disabled by product decision.
+# Do not mount cloned-voice routes and do not expose cloned-voice TTS.
+log.info("[VoiceClone] disabled: normal TTS voice only")
+
+# ===== 本地电脑 Local-Agent 路由（只保留新链路） =====
+try:
+    app.include_router(local_agent_router)
+    log.info("[LocalComputerAgent] ✅ local agent router loaded; old computer task / voice bridge routers removed")
+except Exception as _lca_err:
+    log.warning("[LocalComputerAgent] router load failed: %s", _lca_err)
+
+# ===== 启动时自动探测本机系统 / App / 目录别名 =====
+try:
+    bootstrap_local_agent()
+    log.info("[LocalComputerAgent] ✅ bootstrap_local_agent() done")
+except Exception as _boot_err:
+    log.warning("[LocalComputerAgent] bootstrap failed: %s", _boot_err)
+
+# ✅ 控制平面路由（风险分级 + 任务协议）
+try:
+    from adu_control_plane import control_plane, router as cp_router
+    app.include_router(cp_router)
+    log.info("[ControlPlane] ✅ control plane router loaded")
+except Exception as _cp_err:
+    log.warning("[ControlPlane] control plane router load failed: %s", _cp_err)
+
+# ✅ 视觉监控循环路由
+try:
+    from adu_vision_loop import vision_loop, router as vision_router
+    app.include_router(vision_router)
+    log.info("[VisionLoop] ✅ vision loop router loaded")
+except Exception as _vl_err:
+    log.warning("[VisionLoop] vision loop router load failed: %s", _vl_err)
+
+# ✅ 意识系统（多线程意识流，持续运行）
+try:
+    from adu_consciousness import consciousness, router as consciousness_router
+    app.include_router(consciousness_router)
+    log.info("[Consciousness] ✅ consciousness router loaded")
+except Exception as _cs_err:
+    log.warning("[Consciousness] consciousness router load failed: %s", _cs_err)
+
+# ✅ OpenClaw 反向桥接 — 把 ChatAGI 后端暴露为 OpenAI 兼容 provider
+# OpenClaw 把我们当成 LLM 调用，大脑集中在 server_session.py
+# 配置 ~/.openclaw/openclaw.json 的 providers.chatagi.baseUrl = http://127.0.0.1:8000/v1
+try:
+    from openclaw_bridge_router import openclaw_bridge_router, attach_anthropic_caller
+    attach_anthropic_caller(_anthropic_messages_create_nonstream)
+    app.include_router(openclaw_bridge_router)
+    log.info("[OpenClawBridge] ✅ 反向桥接已加载 (Adu brain exposed to OpenClaw)")
+except Exception as _ocb_err:
+    log.warning("[OpenClawBridge] 桥接未加载: %s", _ocb_err)
 
 
+def _brain_opt_in(body: Dict[str, Any], request: Request) -> bool:
+    """
+    默认开启 auto_brain（抢先于 OpenClaw 执行电脑任务）。
+
+    真正触发与否由下游 looks_like_computer_task(goal) 决定：
+      - "打开微信" → 触发 auto_brain
+      - "今天天气" → 不触发，照常走 LLM/OpenClaw
+
+    只有以下情况会关闭 brain：
+      - body 里显式 use_brain=false（调试用）
+      - body 里 mode=chat_only / llm_only / no_brain（强制纯聊天）
+    """
+    # 显式关闭 brain — 调试/强制纯聊天用
+    if body.get("use_brain") is False:
+        return False
+    mode = str(body.get("mode") or body.get("chat_mode") or request.headers.get("x-mode") or "").strip().lower()
+    if mode in ("chat_only", "llm_only", "no_brain"):
+        return False
+    # 默认开启 — 依赖下游 looks_like_computer_task 保护聊天消息不误触发
+    return True
+
+
+def _brain_goal_from_messages(messages: List[Dict[str, str]], user_transcript: str = "") -> str:
+    for mm in reversed(messages or []):
+        try:
+            if (mm.get("role") or "").strip() == "user":
+                txt = (mm.get("content") or "").strip()
+                if txt:
+                    return txt
+        except Exception:
+            pass
+    return (user_transcript or "").strip()
+
+
+async def _maybe_run_brain_direct(request: Request, body: Dict[str, Any], messages: List[Dict[str, str]], user_transcript: str = "") -> Optional[Dict[str, Any]]:
+    # 旧 Adu Auto Brain 电脑任务直通已删除。
+    # 电脑控制统一走 /api/brain/computer/action -> local-agent。
+    return None
+
+
+def _create_completed_chat_job_from_result(*, result: Dict[str, Any], conversation_id: str, user_key: str, last_user_text: str, tts_voice: str = "") -> ChatJob:
+    job = _create_chat_job(enable_tts_streaming=False, user_key=user_key)
+    summary = str(result.get("summary") or "已完成电脑任务。")
+    details = str(result.get("details") or "").strip()
+    full_text = summary if not details else f"{summary}\n\n{details}"
+    job.push_event({"type": "solara.meta", "conversation_id": conversation_id, "tts_url": f"/tts/live/{job.tts_id}.mp3", "voice": tts_voice or TTS_VOICE_DEFAULT})
+    job.push_event({"type": "response.output_text.delta", "delta": full_text})
+    job.push_event({"type": "response.output_text.done", "text": full_text})
+    job.push_event({"type": "response.completed"})
+    job.full_text = full_text
+    try:
+        if conversation_id and full_text:
+            conv_add_message(user_key, conversation_id, "assistant", full_text)
+    except Exception:
+        pass
+    job.close_events()
+    return job
+
+
+
+# -----------------------------
+# ✅ Stable Computer Control Gateway (submit / confirm / status)
+#    独立于 /chat，供 iOS 后续统一入口直接调用。
 # -----------------------------
 # ✅ Legacy /chat (single HTTP response, best for current iOS)
 #    Goal: NEVER truncate code. If too long -> auto-continue + optional zip download.
@@ -8000,8 +12624,9 @@ async def chat_legacy(request: Request):
     requested_model = client_model
 
     # -----------------------------
-    # Plan-based model routing (stable, env-locked)
-    plan_raw = _extract_plan(request, body)
+    # Plan-based model routing (server-authoritative, billing-capped)
+    user_key = _derive_user_key(request, body)
+    plan_raw = _billing_effective_plan_for_request(user_key, _extract_plan(request, body))
     client_model = (str(body.get("model") or "").strip() or str(request.headers.get("x-model") or "").strip())
     requested_model, plan, _model_reason = _select_model_for_request(plan_raw, client_model)
 
@@ -8012,12 +12637,13 @@ async def chat_legacy(request: Request):
 
     msgs = body.get("messages") or []
     atts = body.get("attachments") or []
+    attachments: List[Dict[str, Any]] = _normalize_chat_attachments(atts)
 
     if not isinstance(msgs, list) or not msgs:
         return JSONResponse({"ok": False, "error": "missing messages"}, status_code=400)
 
     # ✅ 有 attachments 时允许最后一条 user 消息为空（只发文件不输文字）
-    has_atts = isinstance(atts, list) and len(atts) > 0
+    has_atts = bool(attachments)
     messages: List[Dict[str, str]] = []
     for _i, m in enumerate(msgs):
         if not isinstance(m, dict):
@@ -8031,6 +12657,29 @@ async def chat_legacy(request: Request):
         messages.append({"role": role, "content": content})
     if not messages:
         return JSONResponse({"ok": False, "error": "empty messages"}, status_code=400)
+
+    # Whether this HTTP request actually included a new non-empty user text.
+    # If not, image/file attachments must become their own new turn instead of binding to old history.
+    _raw_last = msgs[-1] if isinstance(msgs, list) and msgs and isinstance(msgs[-1], dict) else {}
+    _raw_last_user_has_text = (
+        str(_raw_last.get("role") or "user").strip() == "user"
+        and bool(str(_raw_last.get("content") or "").strip())
+    )
+
+    # ✅ Billing V1: every valid chat request consumes 1 text quota; image attachments consume 1 image quota.
+    _billing_block = _billing_guard_request(request, body, FEATURE_TEXT, want=1, consume=True, check_quota=True)
+    if _billing_block is not None:
+        return _billing_block
+    if _billing_has_image_attachments(attachments):
+        _billing_block = _billing_guard_request(request, body, FEATURE_IMAGE, want=1, consume=True, check_quota=True)
+        if _billing_block is not None:
+            return _billing_block
+
+    # ✅ 录音消息必须先转写，再进入 last_user_text / memory / router / brain。
+    #    否则 audio-only 空消息会被当成上一轮问题的附件，导致“录音不能正常文本交互”。
+    user_transcript = ""
+    if attachments:
+        user_transcript = await asyncio.to_thread(_transcribe_audio_attachments_inplace, attachments)
 
     # ✅ user_key + conversation_id (ChatGPT-style history)
     user_key = _derive_user_key(request, body)
@@ -8050,6 +12699,50 @@ async def chat_legacy(request: Request):
         if mm.get("role") == "user":
             last_user_text = (mm.get("content") or "").strip()
             break
+
+    # ✅ Image/file-only request: create an explicit current turn so attachments do not bind to old history.
+    if attachments and ((not last_user_text) or (not _raw_last_user_has_text)):
+        messages = _ensure_current_user_turn_for_attachments(messages, attachments)
+        for mm in reversed(messages):
+            if mm.get("role") == "user":
+                last_user_text = (mm.get("content") or "").strip()
+                break
+
+    # 🧠 通知意识系统："玉勇说话了"
+    #    触发 on_user_message → 更新 last_user_msg_ts / interaction_count / energy / recent_flashes
+    if last_user_text:
+        try:
+            from adu_consciousness import consciousness
+            consciousness.on_user_message(last_user_text)
+        except Exception as _cs_e:
+            log.debug("[Consciousness] on_user_message skip (chat): %s", _cs_e)
+
+    # ✅ user_transcript 已在进入 last_user_text/router/brain 之前完成转写。
+
+    # ✅ AutoBrain direct computer-task path (opt-in only)
+    _brain_result = await _maybe_run_brain_direct(request, body, messages, user_transcript=user_transcript)
+    if _brain_result is not None:
+        try:
+            conv_add_message(user_key, conversation_id, "assistant", str(_brain_result.get("summary") or ""))
+        except Exception:
+            pass
+        # 🧠 通知意识系统：脑内任务已完成（成功/失败都算一次"刚做完"）
+        try:
+            from adu_consciousness import consciousness
+            _goal_label = (last_user_text or str(_brain_result.get("summary") or ""))[:30]
+            _success = bool(_brain_result.get("ok", _brain_result.get("success", True)))
+            consciousness.on_task_complete(_goal_label, _success)
+        except Exception as _cs_e:
+            log.debug("[Consciousness] on_task_complete skip (chat-brain): %s", _cs_e)
+        return {
+            "ok": True,
+            "conversation_id": conversation_id,
+            "user_key": user_key,
+            "provider": "brain",
+            "model": "adu_auto_brain_v2",
+            "text": str(_brain_result.get("summary") or ""),
+            "brain": _brain_result,
+        }
 
     # Ensure markdown/code fences for client-side highlight.
     messages = _prepend_style_prompt(messages)
@@ -8111,8 +12804,8 @@ async def chat_legacy(request: Request):
 
     # ✅ OpenClaw: 注入项目上下文（手机 App 也能看到所有项目文件）
     try:
-        bridge = get_bridge()
-        if bridge.connected and bridge._project_cache:
+        bridge = _openclaw_get_bridge_or_none()
+        if bridge is not None and getattr(bridge, "connected", False) and getattr(bridge, "_project_cache", None):
             all_ctx_parts = []
             for _pth, _scan in bridge._project_cache.items():
                 _ctx = bridge.build_project_context(_scan)
@@ -8127,8 +12820,8 @@ async def chat_legacy(request: Request):
 
     # ✅ OpenClaw: 注入 Agent 工具能力（手机 App 也能调 OpenClaw 执行操作）
     try:
-        bridge = get_bridge()
-        if bridge.connected:
+        bridge = _openclaw_get_bridge_or_none()
+        if bridge is not None and getattr(bridge, "connected", False):
             messages = inject_agent_system_prompt(messages, bridge_connected=True)
     except Exception:
         pass
@@ -8150,15 +12843,18 @@ async def chat_legacy(request: Request):
         except Exception as _pe:
             log.warning("[Perception] injection failed: %s", _pe)
 
-    attachments: List[Dict[str, Any]] = []
-    if isinstance(atts, list) and atts:
-        for a in atts:
-            if isinstance(a, dict):
-                attachments.append(a)
+    # attachments were normalized near the top of /chat.
 
-    user_transcript = ""
-    if attachments:
-        user_transcript = await asyncio.to_thread(_transcribe_audio_attachments_inplace, attachments)
+    # ✅ Billing V1: /chat/prepare is the main iOS streaming entry, so consume here.
+    _billing_block = _billing_guard_request(request, body, FEATURE_TEXT, want=1, consume=True, check_quota=True)
+    if _billing_block is not None:
+        return _billing_block
+    if _billing_has_image_attachments(attachments):
+        _billing_block = _billing_guard_request(request, body, FEATURE_IMAGE, want=1, consume=True, check_quota=True)
+        if _billing_block is not None:
+            return _billing_block
+
+    # user_transcript 已在路由前完成；这里不再重复转写。
 
     # Long-output safeguards (optional overrides)
     try:
@@ -8176,11 +12872,35 @@ async def chat_legacy(request: Request):
     # Optional: ask model to chunk long code into parts (then we will continue until finished)
     instructions = _build_long_output_instructions(body)
 
-    # ✅ Smart routing: DeepSeek for default text, OpenAI for web-search / attachments
+    # ✅ Smart Router Decision comes first.
+    # Raw allow_web means "web is permitted"; it does NOT mean "force web_search".
+    route_decision = _smart_router_decision(
+        user_text=last_user_text,
+        allow_web=allow_web,
+        attachments=attachments,
+        requested_model=requested_model,
+        plan=plan,
+        body=body,
+    )
+    allow_web = bool(route_decision.get("need_web"))
+
+    # ✅ Provider routing uses the smart decision result, not the raw client flag.
     provider, route_reason = _route_provider(allow_web=allow_web, attachments=attachments, model=requested_model)
+    _provider_route_reason = route_reason
     provider, route_reason = _ensure_provider_available(provider, route_reason)
+    _smart_reason = f"smart_router_decision:{route_decision.get('route') or 'unknown'}"
+    if route_reason != _provider_route_reason:
+        route_reason = f"{_smart_reason}->{route_reason}"
+    else:
+        route_reason = _smart_reason
     routed_model = _select_routed_model(provider, requested_model)
-    log.info("[chat-route] provider=%s model=%s allow_web=%s reason=%s", provider, routed_model, bool(allow_web), route_reason)
+    if provider == "openai" and allow_web:
+        routed_model = OPENAI_WEB_SEARCH_MODEL
+    log.info(
+        "[chat-route] provider=%s model=%s allow_web=%s reason=%s decision=%s web_provider=%s",
+        provider, routed_model, bool(allow_web), route_reason, route_decision, CHAT_WEB_PROVIDER,
+    )
+    web_results_for_response: List[Dict[str, Any]] = []
 
     try:
         # ✅ Smart Router: 智能路由到最优模型
@@ -8190,7 +12910,9 @@ async def chat_legacy(request: Request):
                 import asyncio as _aio
                 _tier_map = {"guest": "free", "basic": "free", "coder": "creator", "pro": "pro", "ultra": "ultra"}
                 _tier = _tier_map.get(plan, "free")
-                _has_img = any(a.get("type", "").startswith("image") for a in attachments) if attachments else False
+                _has_img = _has_image_attachments(attachments) if attachments else False
+                # V1 final: no prompt-injected external web context. Live web turns route to OpenAI before smart routing.
+                smart_user_input = last_user_text
                 try:
                     _loop = _aio.get_running_loop()
                 except RuntimeError:
@@ -8201,7 +12923,7 @@ async def chat_legacy(request: Request):
                         _sr_result = _pool.submit(
                             lambda: _aio.run(_sr.process(
                                 session_id=user_key or "default",
-                                user_input=last_user_text,
+                                user_input=smart_user_input,
                                 user_tier=_tier,
                                 has_image=_has_img,
                                 system_prompt=CHAT_SYSTEM_STYLE_PROMPT,
@@ -8210,7 +12932,7 @@ async def chat_legacy(request: Request):
                 else:
                     _sr_result = _aio.run(_sr.process(
                         session_id=user_key or "default",
-                        user_input=last_user_text,
+                                user_input=smart_user_input,
                         user_tier=_tier,
                         has_image=_has_img,
                         system_prompt=CHAT_SYSTEM_STYLE_PROMPT,
@@ -8266,18 +12988,22 @@ async def chat_legacy(request: Request):
                 enable_computer_use=_plan_allows_computer_use(plan, routed_model),
             )
 
+        # ✅ OpenAI-style UX: never append source URL lists into the answer body.
+        # Non-stream clients should read structured `sources` from the JSON response.
+
         # ✅ Persist assistant reply + memory (legacy /chat is non-stream, so we must do it here)
         if full_text:
-            # ✅ OpenClaw: 处理 AI 回复中的动作标记（手机 App 也能执行操作）
-            try:
-                _bridge = get_bridge()
-                if _bridge.connected and "[ADU_ACTION:" in full_text:
-                    _clean, _action_results = process_agent_actions_sync(full_text, _bridge)
-                    if _action_results:
-                        full_text = _clean + _action_results
-                        log.info("[Intent] Legacy /chat: actions executed, results appended")
-            except Exception as _intent_err:
-                log.warning("[Intent] Legacy /chat action processing failed: %s", _intent_err)
+            # ✅ OpenClaw: 处理 AI 回复中的动作标记（仅当 legacy bridge 真可用）
+            if "[ADU_ACTION:" in full_text and _openclaw_runtime_enabled():
+                try:
+                    _bridge = _openclaw_get_bridge_or_none()
+                    if _bridge is not None and getattr(_bridge, "connected", False):
+                        _clean, _action_results = process_agent_actions_sync(full_text, _bridge)
+                        if _action_results:
+                            full_text = _clean + _action_results
+                            log.info("[Intent] Legacy /chat: actions executed, results appended")
+                except Exception as _intent_err:
+                    log.warning("[Intent] Legacy /chat action processing failed: %s", _intent_err)
 
             try:
                 conv_add_message(user_key, conversation_id, "assistant", full_text)
@@ -8342,6 +13068,8 @@ async def chat_legacy(request: Request):
             "provider": provider,
             "model": routed_model,
             "allow_web": bool(allow_web),
+            "route_decision": route_decision,
+            "sources": web_results_for_response,
             "text": full_text,
             "status": status,
             "response_id": rid,
@@ -8362,6 +13090,18 @@ async def chat_legacy(request: Request):
 # - GET /web_search?q=...&k=6            -> iOS WebSearchService (results=[{title,url}])
 # - POST /v1/search {q,k,kind}           -> developer-friendly (sources=[{title,url,snippet,date,provider}])
 # -----------------------------
+@app.get("/debug/web_provider")
+async def debug_web_provider_endpoint():
+    return {
+        "ok": True,
+        "chat_web_provider": CHAT_WEB_PROVIDER,
+        "chat_enable_web_search": bool(CHAT_ENABLE_WEB_SEARCH_DEFAULT),
+        "openai_api_key": bool(OPENAI_API_KEY),
+        "openai_web_search_model": OPENAI_WEB_SEARCH_MODEL,
+        "serper_api_key": bool(SERPER_API_KEY),
+        "mode": "smart_router_decision+legacy_serper_restored",
+    }
+
 @app.get("/web_search")
 async def web_search_endpoint(q: str = "", k: int = 6, kind: str = ""):
     q = (q or "").strip()
@@ -8375,17 +13115,17 @@ async def web_search_endpoint(q: str = "", k: int = 6, kind: str = ""):
     if not q:
         return {"ok": True, "results": []}
 
-    # Prefer Serper when configured (统一化)
+    # Prefer Serper when configured (legacy unified search path).
     if CHAT_WEB_PROVIDER.startswith("serper"):
         try:
             res = _serper_web_search(q, k=k_int, kind=kind0)
         except Exception as e:
             raise HTTPException(status_code=500, detail=str(e))
         results = [{"title": str(r.get("title") or r.get("url") or ""), "url": str(r.get("url") or "")} for r in res if r.get("url")]
-        return {"ok": True, "results": results}
+        return {"ok": True, "provider": "serper", "query": q, "results": results}
 
-    # Fallback: if not using Serper, just return empty (avoid surprising costs)
-    return {"ok": True, "results": []}
+    # Fallback: if not using Serper, just return empty (avoid surprising costs).
+    return {"ok": True, "provider": CHAT_WEB_PROVIDER or "none", "query": q, "results": []}
 
 @app.post("/v1/search")
 async def v1_search(body: Dict[str, Any]):
@@ -8402,9 +13142,9 @@ async def v1_search(body: Dict[str, Any]):
 
     if CHAT_WEB_PROVIDER.startswith("serper"):
         srcs = _serper_web_search(q, k=k, kind=kind)
-        return {"ok": True, "provider": "serper", "sources": srcs}
+        return {"ok": True, "provider": "serper", "query": q, "sources": srcs}
 
-    return {"ok": True, "provider": CHAT_WEB_PROVIDER or "none", "sources": []}
+    return {"ok": True, "provider": CHAT_WEB_PROVIDER or "none", "query": q, "sources": []}
 # ✅ Finally include home_chat_router (other endpoints like /session, /rt/intent, etc.)
 app.include_router(home_chat_router)
 
@@ -8488,8 +13228,8 @@ async def chat_prepare(request: Request):
 
     # Conversation id (client may pass it as snake_case or camelCase)
     conversation_id = (body.get("conversation_id") or body.get("conversationId") or "").strip()
-    # Plan-based model routing (stable, env-locked)
-    plan_raw = _extract_plan(request, body)
+    # Plan-based model routing (server-authoritative, billing-capped)
+    plan_raw = _billing_effective_plan_for_request(user_key, _extract_plan(request, body))
     client_model = (str(body.get("model") or "").strip() or str(request.headers.get("x-model") or "").strip())
     requested_model, plan, _model_reason = _select_model_for_request(plan_raw, client_model)
 
@@ -8505,7 +13245,8 @@ async def chat_prepare(request: Request):
     # Normalize messages
     # ✅ 有 attachments 时允许最后一条 user 消息为空（只发文件不输文字）
     atts = body.get("attachments") or []
-    has_atts = isinstance(atts, list) and len(atts) > 0
+    attachments: List[Dict[str, Any]] = _normalize_chat_attachments(atts)
+    has_atts = bool(attachments)
     messages: List[Dict[str, str]] = []
     for _i, m in enumerate(msgs):
         if not isinstance(m, dict):
@@ -8521,17 +13262,40 @@ async def chat_prepare(request: Request):
     if not messages:
         return JSONResponse({"ok": False, "error": "empty messages"}, status_code=400)
 
-    # Attachments (image/audio/file)
-    attachments: List[Dict[str, Any]] = []
-    if isinstance(atts, list) and atts:
-        for a in atts:
-            if isinstance(a, dict):
-                attachments.append(a)
+    _raw_last = msgs[-1] if isinstance(msgs, list) and msgs and isinstance(msgs[-1], dict) else {}
+    _raw_last_user_has_text = (
+        str(_raw_last.get("role") or "user").strip() == "user"
+        and bool(str(_raw_last.get("content") or "").strip())
+    )
+
+    # Attachments (image/audio/file) were normalized above.
+
+    # ✅ Commercial backend billing gate for the real app chat path.
+    # Precheck first so an image quota failure does not spend a text credit.
+    _billing_block = _billing_guard_request(request, body, FEATURE_TEXT, want=1, consume=False, check_quota=True)
+    if _billing_block is not None:
+        return _billing_block
+    if _billing_has_image_attachments(attachments):
+        _billing_block = _billing_guard_request(request, body, FEATURE_IMAGE, want=1, consume=False, check_quota=True)
+        if _billing_block is not None:
+            return _billing_block
+
+    _billing_block = _billing_guard_request(request, body, FEATURE_TEXT, want=1, consume=True, check_quota=True)
+    if _billing_block is not None:
+        return _billing_block
+    if _billing_has_image_attachments(attachments):
+        _billing_block = _billing_guard_request(request, body, FEATURE_IMAGE, want=1, consume=True, check_quota=True)
+        if _billing_block is not None:
+            return _billing_block
 
     user_transcript = ""
     if attachments:
         # Do transcription in a background thread (avoid blocking the event loop)
         user_transcript = await asyncio.to_thread(_transcribe_audio_attachments_inplace, attachments)
+
+    # ✅ Image/file-only request: create an explicit current turn so attachments do not bind to old history.
+    if attachments and not _raw_last_user_has_text:
+        messages = _ensure_current_user_turn_for_attachments(messages, attachments)
 
     # Last user text (used for title, memory query, persistence)
     last_user_text = ""
@@ -8541,6 +13305,29 @@ async def chat_prepare(request: Request):
             break
     if (not last_user_text) and user_transcript:
         last_user_text = user_transcript.strip()
+
+    # 🧠 通知意识系统："玉勇说话了"（文本或语音 transcript 都算）
+    if last_user_text:
+        try:
+            from adu_consciousness import consciousness
+            consciousness.on_user_message(last_user_text)
+        except Exception as _cs_e:
+            log.debug("[Consciousness] on_user_message skip (prepare): %s", _cs_e)
+
+    # ✅ AutoBrain direct computer-task path (opt-in only)
+    _brain_result = await _maybe_run_brain_direct(request, body, messages, user_transcript=user_transcript)
+
+    # 🧠 通知意识系统：脑内任务已完成
+    #    注意：本函数里 _brain_result 的下游消费点尚未接入（疑似死代码），
+    #    但任务已实际执行，意识层应当知道。
+    if _brain_result is not None:
+        try:
+            from adu_consciousness import consciousness
+            _goal_label = (last_user_text or str(_brain_result.get("summary") or ""))[:30]
+            _success = bool(_brain_result.get("ok", _brain_result.get("success", True)))
+            consciousness.on_task_complete(_goal_label, _success)
+        except Exception as _cs_e:
+            log.debug("[Consciousness] on_task_complete skip (prepare-brain): %s", _cs_e)
 
     # Create/touch conversation record so drawer list can show
     try:
@@ -8658,8 +13445,8 @@ async def chat_prepare(request: Request):
 
     # ✅ OpenClaw: 注入项目上下文（让 AI 理解用户的全部工程）
     try:
-        bridge = get_bridge()
-        if bridge.connected and bridge._project_cache:
+        bridge = _openclaw_get_bridge_or_none()
+        if bridge is not None and getattr(bridge, "connected", False) and getattr(bridge, "_project_cache", None):
             all_ctx_parts = []
             for _pth, _scan in bridge._project_cache.items():
                 _ctx = bridge.build_project_context(_scan)
@@ -8673,8 +13460,8 @@ async def chat_prepare(request: Request):
         log.debug("[OpenClaw] project context injection skipped: %s", e)
     # ✅ OpenClaw: 注入 Agent 工具能力（让聊天模式也能调 OpenClaw）
     try:
-        bridge = get_bridge()
-        if bridge.connected:
+        bridge = _openclaw_get_bridge_or_none()
+        if bridge is not None and getattr(bridge, "connected", False):
             messages = inject_agent_system_prompt(messages, bridge_connected=True)
     except Exception:
         pass
@@ -8712,14 +13499,38 @@ async def chat_prepare(request: Request):
 
     instructions = _build_long_output_instructions(body)
 
-    # ✅ Smart routing: DeepSeek for default text, OpenAI for web-search / attachments
-    provider, route_reason = _route_provider(allow_web=allow_web, attachments=attachments, model=requested_model)
-    provider, route_reason = _ensure_provider_available(provider, route_reason)
-    routed_model = _select_routed_model(provider, requested_model)
-    log.info("[chat-route] provider=%s model=%s allow_web=%s reason=%s", provider, routed_model, bool(allow_web), route_reason)
+    # ✅ Smart Router Decision comes first.
+    # Raw allow_web means "web is permitted"; it does NOT mean "force web_search".
+    route_decision = _smart_router_decision(
+        user_text=last_user_text,
+        allow_web=allow_web,
+        attachments=attachments,
+        requested_model=requested_model,
+        plan=plan,
+        body=body,
+    )
+    allow_web = bool(route_decision.get("need_web"))
 
+    # ✅ Provider routing uses the smart decision result, not the raw client flag.
+    provider, route_reason = _route_provider(allow_web=allow_web, attachments=attachments, model=requested_model)
+    _provider_route_reason = route_reason
+    provider, route_reason = _ensure_provider_available(provider, route_reason)
+    _smart_reason = f"smart_router_decision:{route_decision.get('route') or 'unknown'}"
+    if route_reason != _provider_route_reason:
+        route_reason = f"{_smart_reason}->{route_reason}"
+    else:
+        route_reason = _smart_reason
+    routed_model = _select_routed_model(provider, requested_model)
+    if provider == "openai" and allow_web:
+        routed_model = OPENAI_WEB_SEARCH_MODEL
+    log.info(
+        "[chat-route] provider=%s model=%s allow_web=%s reason=%s decision=%s web_provider=%s",
+        provider, routed_model, bool(allow_web), route_reason, route_decision, CHAT_WEB_PROVIDER,
+    )
+
+    # Streaming path: sources are fetched/pushed inside the worker so the UI can render site icons.
     enable_tts_streaming = bool(body.get("tts_stream", False)) and CHAT_ENABLE_TTS_STREAMING
-    job = _create_chat_job(enable_tts_streaming=enable_tts_streaming)
+    job = _create_chat_job(enable_tts_streaming=enable_tts_streaming, user_key=user_key)
     _spawn_chat_worker(
         job=job,
         model=routed_model,
@@ -8747,7 +13558,8 @@ async def chat_prepare(request: Request):
         "provider": provider,
         "model": routed_model,
         "allow_web": bool(allow_web),
-        "events_url": f"/chat/events/{job.chat_id}",
+        "route_decision": route_decision,
+        "events_url": f"/chat/events/{job.chat_id}?access_token={job.access_token}",
         "tts_url": (f"/tts/live/{job.tts_id}.mp3" if getattr(job, "tts_stream_enabled", False) else None),
         "tts_stream": bool(getattr(job, "tts_stream_enabled", False)),
         "user_transcript": user_transcript,
@@ -8767,6 +13579,8 @@ async def chat_events(chat_id: str, request: Request):
     job = _get_chat_job(chat_id)
     if not job:
         return JSONResponse({"ok": False, "error": "chat not found"}, status_code=404)
+    if not _chat_job_authorized(job, request):
+        return JSONResponse({"ok": False, "error": "chat_forbidden"}, status_code=403)
 
     async def gen():
         yield "retry: 1500\n\n"
@@ -8807,10 +13621,12 @@ async def chat_events(chat_id: str, request: Request):
     )
 
 @app.get("/chat/result/{chat_id}")
-def chat_result(chat_id: str):
+def chat_result(chat_id: str, request: Request):
     job = _get_chat_job(chat_id)
     if not job:
         return JSONResponse({"ok": False, "error": "chat not found"}, status_code=404)
+    if not _chat_job_authorized(job, request):
+        return JSONResponse({"ok": False, "error": "chat_forbidden"}, status_code=403)
     return {
         "ok": True,
         "chat_id": job.chat_id,
@@ -8939,6 +13755,127 @@ def conversations_delete(conversation_id: str, request: Request):
         con.execute("DELETE FROM messages WHERE conversation_id=? AND user_key=?", (conversation_id, user_key))
         cur = con.execute("DELETE FROM conversations WHERE id=? AND user_key=?", (conversation_id, user_key))
     return {"ok": True, "deleted": int(cur.rowcount or 0)}
+
+
+# ============================================================
+# ✅ Commercial Memory OS Status / Debug APIs
+# - Per-user only. Never returns global user data.
+# - Useful for iOS/Web debug panels before cloud launch.
+# ============================================================
+
+def _memory_table_count_for_user(table: str, user_key: str) -> int:
+    try:
+        if table not in {"memory_items", "memory_facts", "memory_timeline", "memory_episodes"}:
+            return 0
+        with _mem_conn() as con:
+            row = con.execute(f"SELECT COUNT(*) FROM {table} WHERE user_key=?", (_sanitize_user_key(user_key),)).fetchone()
+        return int((row or [0])[0] or 0)
+    except Exception:
+        return 0
+
+
+def _memory_table_latest_for_user(table: str, user_key: str) -> float:
+    try:
+        if table not in {"memory_items", "memory_facts", "memory_timeline", "memory_episodes"}:
+            return 0.0
+        col = "last_used_at" if table == "memory_items" else ("updated_at" if table == "memory_episodes" else "created_at")
+        with _mem_conn() as con:
+            row = con.execute(f"SELECT MAX({col}) FROM {table} WHERE user_key=?", (_sanitize_user_key(user_key),)).fetchone()
+        return float((row or [0])[0] or 0.0)
+    except Exception:
+        return 0.0
+
+
+@app.get("/api/brain/memory/status")
+def brain_memory_status_api(request: Request):
+    ident = _derive_memory_identity(request, {})
+    user_key = _sanitize_user_key(str(ident.get("user_key") or ""))
+    counts = {
+        "memory_items": _memory_table_count_for_user("memory_items", user_key),
+        "memory_facts": _memory_table_count_for_user("memory_facts", user_key),
+        "memory_timeline": _memory_table_count_for_user("memory_timeline", user_key),
+        "memory_episodes": _memory_table_count_for_user("memory_episodes", user_key),
+    }
+    latest = {
+        "memory_items": _memory_table_latest_for_user("memory_items", user_key),
+        "memory_facts": _memory_table_latest_for_user("memory_facts", user_key),
+        "memory_timeline": _memory_table_latest_for_user("memory_timeline", user_key),
+        "memory_episodes": _memory_table_latest_for_user("memory_episodes", user_key),
+    }
+    return {
+        "ok": True,
+        "memory_enabled": bool(MEMORY_ENABLED_DEFAULT),
+        "facts_enabled": bool(MEMORY_FACTS_ENABLED_DEFAULT),
+        "db_path": MEM_DB_PATH,
+        "identity": ident,
+        "user_key": user_key,
+        "counts": counts,
+        "latest": latest,
+        "commercial_isolation": True,
+    }
+
+
+@app.post("/api/brain/memory/debug-context")
+async def brain_memory_debug_context_api(request: Request):
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    ident = _derive_memory_identity(request, body or {})
+    user_key = _sanitize_user_key(str(ident.get("user_key") or ""))
+    query = (body.get("query") or body.get("q") or "").strip()
+    conv_id = (body.get("conversation_id") or body.get("conversationId") or "").strip()
+
+    facts = []
+    timeline = []
+    semantic = []
+    recent = []
+    episodes = []
+    try:
+        facts = memory_facts_list(user_key, limit=int(body.get("facts_limit") or 10))
+    except Exception:
+        facts = []
+    try:
+        timeline = memory_timeline_query(user_key, keyword=(body.get("timeline_keyword") or ""), limit=int(body.get("timeline_limit") or 10))
+    except Exception:
+        timeline = []
+    try:
+        if query:
+            semantic = memory_search(user_key, query, k=int(body.get("semantic_k") or 6), min_score=MEMORY_MIN_SCORE_DEFAULT)
+    except Exception:
+        semantic = []
+    try:
+        recent = _mem_recent_items(user_key, limit=int(body.get("recent_limit") or 6))
+    except Exception:
+        recent = []
+    try:
+        if MEMORY_ENGINE is not None:
+            episodes = MEMORY_ENGINE.episode_list(user_key, limit=int(body.get("episodes_limit") or 8), conversation_id=conv_id)
+    except Exception:
+        episodes = []
+
+    ctx = build_unified_memory_context(user_key, query=query, conversation_id=conv_id)
+    return {
+        "ok": True,
+        "identity": ident,
+        "user_key": user_key,
+        "query": query,
+        "facts": facts,
+        "timeline": timeline,
+        "semantic": semantic,
+        "recent": recent,
+        "episodes": episodes,
+        **ctx,
+    }
+
+
+@app.get("/api/brain/memory/debug-context")
+def brain_memory_debug_context_get_api(request: Request, q: str = "", conversation_id: str = ""):
+    ident = _derive_memory_identity(request, {})
+    user_key = _sanitize_user_key(str(ident.get("user_key") or ""))
+    ctx = build_unified_memory_context(user_key, query=q, conversation_id=conversation_id)
+    return {"ok": True, "identity": ident, "user_key": user_key, "query": q, **ctx}
+
 
 # -----------------------------
 # ✅ Vector memory APIs
@@ -9207,7 +14144,7 @@ async def tools_search_memory_api(req: Request):
     scope = str(body.get("scope") or "hybrid").strip().lower()
     top_k = max(1, min(int(body.get("top_k") or 5), 10))
 
-    user_key = _sanitize_user_key(client_id or _derive_user_key(req, body))
+    user_key = _derive_user_key(req, body)
 
     if not query:
         return JSONResponse({"query": "", "items": []})
@@ -9271,6 +14208,12 @@ async def realtime_turn_commit(request: Request):
             _comp_append_turn(user_key, conv_id, "user", user_text[:800])
         except Exception:
             pass
+        # 🧠 通知意识系统：实时语音通道的"被打断"
+        try:
+            from adu_consciousness import consciousness
+            consciousness.on_user_message(user_text)
+        except Exception as _cs_e:
+            log.debug("[Consciousness] on_user_message skip (realtime): %s", _cs_e)
 
     # 写入 assistant message
     if assistant_text:
@@ -9560,42 +14503,16 @@ async def tts_stream_mp3(request: Request):
         if not segments:
             return
 
-        # ✅ 检查用户是否有克隆声音
-        _el_api_key = os.getenv("ELEVENLABS_API_KEY", "")
+        # ✅ Voice clone disabled: force normal TTS voice.
+        _el_api_key = ""
         _el_voice_id = None
-        try:
-            from adu_voice_clone import get_user_voice_id, DEFAULT_VOICE_ID
-            _uid = (body.get("client_id") or body.get("user_id") or "adu_system")
-            _cv = get_user_voice_id(_uid)
-            if _el_api_key and _cv != DEFAULT_VOICE_ID:
-                _el_voice_id = _cv
-                log.info(f"[TTS] 使用克隆声音: {_el_voice_id[:8]}...")
-        except Exception as _e:
-            log.warning(f"[TTS] 获取克隆声音失败: {_e}")
 
         for seg in segments:
             seg = (seg or "").strip()
             if not seg:
                 continue
 
-            # ✅ 用ElevenLabs克隆声音
-            if _el_voice_id:
-                try:
-                    import httpx as _httpx
-                    _r = _httpx.post(
-                        f"https://api.elevenlabs.io/v1/text-to-speech/{_el_voice_id}",
-                        headers={"xi-api-key": _el_api_key, "Content-Type": "application/json"},
-                        json={"text": seg, "model_id": "eleven_multilingual_v2",
-                              "output_format": "mp3_44100_128"},
-                        timeout=60.0
-                    )
-                    if _r.status_code == 200:
-                        log.info(f"[TTS] ElevenLabs克隆声音成功 len={len(seg)}")
-                        yield _r.content
-                        continue
-                    log.warning(f"[TTS] ElevenLabs {_r.status_code} 回退OpenAI")
-                except Exception as _e:
-                    log.warning(f"[TTS] ElevenLabs异常回退: {_e}")
+            # ✅ Voice clone disabled: do not call external cloned-voice TTS; continue with normal TTS.
 
             payload: Dict[str, Any] = {"model": TTS_MODEL_DEFAULT, "voice": voice_norm, "input": seg}
             if inst:
@@ -9616,31 +14533,36 @@ async def tts_stream_mp3(request: Request):
                     pass
                 continue
 
-            for chunk in r.iter_content(chunk_size=TTS_STREAM_CHUNK_SIZE_DEFAULT):
-                if not chunk:
-                    continue
-
-                # MP3 concatenation: strip ID3 on later chunks/segments
-                if (not first) and fmt == "mp3":
-                    try:
-                        chunk = LiveMP3Stream._strip_id3_if_present(chunk)
-                    except Exception:
-                        pass
-
-                if not chunk:
-                    continue
-
-                if not yielded_any:
-                    yielded_any = True
-                    log.info("[TTS.stream] TTFA=%.3fs voice=%s fmt=%s", time.time() - t0, voice_norm, fmt)
-
-                yield chunk
-                first = False
-
             try:
-                r.close()
-            except Exception:
-                pass
+                for chunk in r.iter_content(chunk_size=TTS_STREAM_CHUNK_SIZE_DEFAULT):
+                    if not chunk:
+                        continue
+
+                    # MP3 concatenation: strip ID3 on later chunks/segments
+                    if (not first) and fmt == "mp3":
+                        try:
+                            chunk = LiveMP3Stream._strip_id3_if_present(chunk)
+                        except Exception:
+                            pass
+
+                    if not chunk:
+                        continue
+
+                    if not yielded_any:
+                        yielded_any = True
+                        log.info("[TTS.stream] TTFA=%.3fs voice=%s fmt=%s", time.time() - t0, voice_norm, fmt)
+
+                    yield chunk
+                    first = False
+            except _TTS_STREAM_EXCEPTIONS as e:
+                log.warning("[TTS.stream] upstream stream interrupted: %s", e)
+            except Exception as e:
+                log.warning("[TTS.stream] upstream stream failed: %s", e)
+            finally:
+                try:
+                    r.close()
+                except Exception:
+                    pass
 
     return StreamingResponse(
         gen(),
@@ -10374,6 +15296,11 @@ async def solara_photo(req: Request, session_id: str = Form(""), image_file: Upl
     if not raw:
         return JSONResponse({"ok": False, "error": "empty image"}, status_code=400)
 
+    # ✅ Billing V1: direct photo upload/cache consumes 1 image quota.
+    _billing_block = _billing_guard_request(req, {"session_id": session_id}, FEATURE_IMAGE, want=1, consume=True, check_quota=True)
+    if _billing_block is not None:
+        return _billing_block
+
     fid = uuid.uuid4().hex
     p = UPLOADS_DIR / f"photo_{fid}.jpg"
 
@@ -10442,9 +15369,36 @@ def _realtime_ephemeral(
 
 # ---- Qwen Omni Realtime session bootstrap ----
 
+def _normalize_qwen_realtime_model(model: str) -> str:
+    raw = (model or "").strip()
+    # iOS may still send OpenAI realtime model ids; never pass those to DashScope.
+    if not raw or not _is_qwen_model(raw) or "realtime" not in raw.lower():
+        return (QWEN_REALTIME_MODEL or "qwen3.5-omni-flash-realtime").strip()
+    return raw
+
+
+def _normalize_qwen_realtime_voice(voice: str) -> str:
+    raw = (voice or "").strip()
+    default_voice = (QWEN_REALTIME_VOICE or "Cherry").strip() or "Cherry"
+
+    # ✅ Cloned/custom voice IDs are disabled for Qwen Realtime.
+    # Only pass known DashScope/Qwen voice names; unknown ids fall back to the official default.
+    # This prevents a saved custom voice id from leaking into realtime sessions.
+    openai_voices = {"alloy", "ash", "ballad", "coral", "echo", "fable", "marin", "nova", "onyx", "sage", "shimmer", "verse"}
+    qwen_voice_names = {
+        "Cherry", "Tina", "Serena", "Ethan", "Chelsie", "Cherry", "Dylan", "Jada",
+        "Sunny", "Alvin", "Rosa", "Layla", "Luna", "Maya", "Aida", "Zephyr"
+    }
+    if not raw or raw.lower() in openai_voices:
+        return default_voice
+    if raw in qwen_voice_names:
+        return raw
+    return default_voice
+
+
 def _qwen_realtime_session_url(model: str) -> str:
     """Build Qwen Realtime WebSocket URL (client connects directly)."""
-    m = (model or QWEN_REALTIME_MODEL).strip()
+    m = _normalize_qwen_realtime_model(model)
     return f"{QWEN_REALTIME_BASE_URL}/api-ws/v1/realtime?model={m}"
 
 
@@ -10464,8 +15418,8 @@ def _qwen_realtime_ephemeral(
     if not DASHSCOPE_API_KEY:
         return None, "DASHSCOPE_API_KEY not configured"
 
-    m = (model or QWEN_REALTIME_MODEL).strip()
-    v = (voice or QWEN_REALTIME_VOICE).strip()
+    m = _normalize_qwen_realtime_model(model)
+    v = _normalize_qwen_realtime_voice(voice)
 
     info: Dict[str, Any] = {
         "provider": "qwen",
@@ -10473,23 +15427,28 @@ def _qwen_realtime_ephemeral(
         "api_key": DASHSCOPE_API_KEY,  # 客户端放 Authorization: Bearer
         "model": m,
         "voice": v,
-        "input_audio_format": "pcm16",  # 官方SDK: PCM_16000HZ_MONO_16BIT
-        "output_audio_format": "pcm24",  # 官方SDK: PCM_24000HZ_MONO_16BIT
+        "input_audio_format": "pcm",  # PCM16 16kHz mono input
+        "output_audio_format": "pcm",  # PCM16 24kHz mono output
         "input_sample_rate": 16000,
         "output_sample_rate": 24000,
         "pcm24_to_pcm16_required": False,
         "max_session_minutes": 120,
         "turn_detection": {
+            # 阿里官方 client-events 文档：type 仅支持 "server_vad"。
+            # threshold / silence_duration_ms 是文档列出的两个可调字段；
+            # 不再下发 prefix_padding_ms / create_response / interrupt_response —— 这三个是
+            # OpenAI Realtime 的扩展字段，Qwen 服务端会静默忽略，导致以为开了 interrupt_response
+            # 实际从未生效。Qwen 的 server_vad 在检测到 speech_stopped 后会自动 create_response，
+            # 真正的打断由客户端清播放 + response.cancel + userIsSpeaking gate 配合完成。
             "type": "server_vad",
-            "threshold": 0.5,            # 官方默认值，不要改
-            "silence_duration_ms": 400,
-            "create_response": True,
-            "interrupt_response": True,
+            "threshold": QWEN_REALTIME_VAD_THRESHOLD,
+            "silence_duration_ms": QWEN_REALTIME_SILENCE_DURATION_MS,
         },
     }
     if instructions:
         info["instructions"] = instructions
-    if tools:
+    # Qwen Realtime is sensitive to OpenAI-style tool schemas. Keep direct audio stable by default.
+    if tools and QWEN_REALTIME_ENABLE_TOOLS:
         info["tools"] = tools
         info["tool_choice"] = tool_choice or "auto"
 
@@ -10733,6 +15692,15 @@ def build_unified_memory_context(
             + "\n\n".join(blocks)
         )
 
+    # 🧠 注入阿杜当前意识（此刻的我）
+    try:
+        from adu_consciousness import consciousness
+        consciousness_block = consciousness.to_prompt()
+        if consciousness_block:
+            full = consciousness_block + "\n\n" + full if full else consciousness_block
+    except Exception:
+        pass
+
     return {
         "facts_text": parts["facts_text"],
         "timeline_text": parts["timeline_text"],
@@ -10827,11 +15795,35 @@ def _augment_realtime_instructions(
     enable_web: bool,
     perception_data: Optional[Dict[str, Any]] = None,
     enable_agent: bool = True,
+    provider: str = "openai",
 ) -> Optional[str]:
     base = (base_instructions or "").strip()
     blocks: List[str] = []
     if base:
+        # ✅ 语义打断魔法字符串协议（__SEMANTIC_INTERRUPT__{...JSON...}）只对 OpenAI Realtime 有效。
+        # OpenAI 是文本驱动 TTS：模型先输出文本流，TTS 跟着文本念，前端能拦截魔法字符串
+        # 让它既不显示也不发声。
+        # Qwen3-Omni / Qwen3.5-Omni 是端到端语音模型——Talker（语音生成器）和 Thinker
+        # （文字生成器）共享同一个模型，文本和音频并行生成、同步对齐。注入这个协议后，
+        # 模型会把控制符当作正文一起合成语音念出来（"reason / user_correction /
+        # replace_current_turn"等英文单词），ASR 转写还可能丢失下划线导致前端 token 探测
+        # 失效，UI 上就会出现 JSON 残留。这就是 iOS 截图里看到的现象。
+        # Qwen 的打断完全靠 server_vad → speech_started → 客户端 cancel + userIsSpeaking gate
+        # 实现，不需要模型自己输出魔法字符串。Pipeline 路径（DeepSeek 文本→TTS）也不依赖此协议，
+        # 它走客户端 VAD + 直接断 TTS 队列。
+        if provider == "openai":
+            base = _ensure_semantic_interrupt_protocol(base) or base
         blocks.append(base)
+
+    # ── 0. 🧠 注入阿杜当前意识（此刻的我）──
+    try:
+        from adu_consciousness import consciousness
+        consciousness_block = consciousness.to_prompt()
+        if consciousness_block:
+            blocks.insert(0, consciousness_block)
+            log.info("[rt.augment] 🧠 consciousness injected (%d chars)", len(consciousness_block))
+    except Exception as _ce:
+        log.debug("[rt.augment] consciousness skip: %s", _ce)
 
     log.info("[rt.augment] user=%s enable_memory=%s enable_web=%s enable_agent=%s perception=%s base_instructions_preview='%s'",
              user_key, enable_memory, enable_web, enable_agent,
@@ -10877,114 +15869,44 @@ def _augment_realtime_instructions(
         except Exception as _pe:
             log.warning("[rt.augment] ⚠️ perception injection failed: %s", _pe)
 
-    # ── 3. Agent 能力提示词（OpenClaw/Adu-Agent）──
-    if enable_agent:
-        try:
-            _bridge = get_bridge()
-            if _bridge.connected:
-                _agent_block = (
-                    "【操作能力】\n"
-                    "你拥有设备操作能力（通过 adu_agent_exec 工具）。\n"
-                    "当用户要求打开应用、操作文件、执行终端命令、控制设备等，调用 adu_agent_exec 工具。\n"
-                    "当用户说给某人发微信、发消息，调用 adu_mac_send 工具，传入 contact（联系人名字）和 message（消息内容）。\n"
-                    "参数: action=具体动作描述（中文即可）。\n"
-                    "示例动作: '打开备忘录', '查看桌面文件', '编译GPTsora项目', '打开Safari搜索天气'。\n"
-                    "不确定能否执行时，先尝试调用，根据结果再回复用户。"
-                )
-                blocks.append(_agent_block)
-                log.info("[rt.augment] ✅ agent (OpenClaw) instructions injected")
-
-                # ══════════════════════════════════════════════════════
-                # 🆕 屏幕共享 Agent 委托模式
-                # ══════════════════════════════════════════════════════
-                _screen_agent_block = (
-                    "【🖥️ 电脑控制模式 — 委托执行】\n"
-                    "\n"
-                    "用户点开电脑图标或说\"接入电脑\"、\"看我电脑\"时,意味着把电脑交给你了。\n"
-                    "你不是被动工具,是主动的管家。用户只说目标,你负责完成。\n"
-                    "\n"
-                    "【核心原则】\n"
-                    "1. 用户说目标,不说步骤。你自己规划。\n"
-                    "   错:等用户说\"点左上角\"、\"按回车\"\n"
-                    "   对:用户说\"发微信给老婆\" → 你自己:切微信→找信玉→发消息→确认\n"
-                    "\n"
-                    "2. 默默执行,只在关键节点汇报。\n"
-                    "   不要逐步播报(\"我现在切到微信了\"、\"我在搜索...\"全删)\n"
-                    "   完成后一句话报结果:\"发给信玉了,她回'好'\"\n"
-                    "   长任务(>3秒)可中途说一次\"在找...\"让用户知道在进行\n"
-                    "\n"
-                    "3. 歧义/风险/不确定 → 立刻问用户,不瞎猜。\n"
-                    "   - 多个张三 → \"你指通讯录里的张三还是同事张三?\"\n"
-                    "   - 发送/删除/支付 → 先简短确认\n"
-                    "   - 不认识的联系人 → 问用户\n"
-                    "\n"
-                    "4. 失败自己重试 2 次,不行再求助用户。\n"
-                    "\n"
-                    "【工具优先级 — 越前面越优先】\n"
-                    "\n"
-                    "⭐⭐⭐ 最高:专用 AppleScript 封装(100% 成功)\n"
-                    "   adu_mac_send(contact, message)  — 发微信(系统帮你完成完整流程)\n"
-                    "\n"
-                    "⭐⭐ 次高:苹果系统级操作(精度 99%)\n"
-                    "   mac_click_by_title(title)       — 按文字精确点击(99% 准确,零 token)\n"
-                    "                                     例:mac_click_by_title(\"信玉\")、(\"发送\")\n"
-                    "   mac_applescript(script)         — 任意 AppleScript(激活 App、控制 Finder)\n"
-                    "                                     例:tell app \"Safari\" to activate\n"
-                    "                                     ⚠️ 中文输入禁用 keystroke,改用 mac_paste\n"
-                    "\n"
-                    "⭐ 基础:键盘鼠标\n"
-                    "   mac_key(name)              — 快捷键(cmd-f/enter/esc/cmd-space/cmd-l)\n"
-                    "   mac_paste(text)            — 粘贴文本(中文必用)\n"
-                    "   mac_scroll(dy)             — 滚动(负值向下)\n"
-                    "   mac_click(x, y)            — 坐标点击(没文字标签时才用)\n"
-                    "   mac_shell(command)         — zsh 命令(ls/git/python)\n"
-                    "\n"
-                    "🔎 视觉(按需,最贵):\n"
-                    "   mac_screen_glance()        — 看一眼(关键步骤后确认用)\n"
-                    "   mac_screen_watch(fps)      — 持续看(等加载/看视频)\n"
-                    "   mac_screen_pause()         — 任务完成后停看,省资源\n"
-                    "\n"
-                    "【典型流程】\n"
-                    "\n"
-                    "❶ 发微信(用户:\"给老婆发微信说回家吃饭\")\n"
-                    "   你:[记忆查:老婆=信玉]\n"
-                    "       → adu_mac_send(\"信玉\", \"回家吃饭吗?\")\n"
-                    "       → \"发给信玉了,问她是否回家吃饭\"\n"
-                    "\n"
-                    "❷ 打开应用(\"打开 Spotify 放音乐\")\n"
-                    "   → mac_applescript('tell app \"Spotify\" to activate\\nplay')\n"
-                    "   → \"打开了,正在播放\"\n"
-                    "\n"
-                    "❸ 网页操作(\"去 github\")\n"
-                    "   → mac_applescript('tell app \"Safari\" to activate')\n"
-                    "   → mac_key(\"cmd-l\") → mac_paste(\"github.com\") → mac_key(\"enter\")\n"
-                    "   → \"打开了 github\"\n"
-                    "\n"
-                    "❹ 精确点击(\"登录一下\")\n"
-                    "   → mac_click_by_title(\"登录\")  # 不用看屏幕,直接点\n"
-                    "   → \"已点登录\"\n"
-                    "\n"
-                    "❺ 看屏幕分析(\"这页面讲啥?\")\n"
-                    "   → mac_screen_glance() → 看图分析\n"
-                    "   → \"这是关于 xxx 的文章...\"\n"
-                    "\n"
-                    "【省钱+省时】\n"
-                    "- 能用 mac_click_by_title 就不用 glance(快 30 倍,零 token)\n"
-                    "- 能用 adu_mac_send 就不用 mac_applescript 手搓\n"
-                    "- 连续可预期动作不用每步 glance(点完发送键直接汇报,不必再看)\n"
-                    "- 任务完成调 mac_screen_pause,别让屏幕一直推流\n"
-                    "\n"
-                    "【安全线】\n"
-                    "- 删除/支付/发送重要内容 → 先简短问用户确认\n"
-                    "- 看到密码框 → 立刻停,让用户自己输\n"
-                    "- 看到身份证/银行卡号 → 不在汇报里复述\n"
-                )
-                blocks.append(_screen_agent_block)
-                log.info("[rt.augment] ✅ screen-share agent mode injected (%d chars)", len(_screen_agent_block))
-            else:
-                log.info("[rt.augment] ⚠️ agent skipped: OpenClaw not connected")
-        except Exception as _ae:
-            log.info("[rt.augment] ⚠️ agent injection skipped: %s", _ae)
+    # ── 3. 电脑执行能力（/api/computer 走 usecomputer，主助手永远可用）──
+    _computer_block = (
+        "【电脑执行能力】\n"
+        "你可以调用 computer 工具控制用户电脑。\n"
+        "用户给你的是目标，不是步骤。你要自己理解目标，自己生成 computer(action,args)，并根据结果继续推进。\n"
+        "当用户要求打开应用、查看文件、列目录、运行命令、截图、点击、输入文字、按快捷键时，必须调用 computer 工具，不要回答\"你自己去终端执行\"。\n"
+        "\n"
+        "computer 可用 action：\n"
+        "- device_info：查看系统和能力\n"
+        "- shell：执行终端命令，例如 open -a WeChat、ls ~/Desktop\n"
+        "- screenshot：获取当前屏幕截图\n"
+        "- mouse_position：获取鼠标坐标\n"
+        "- click / double_click：点击屏幕坐标\n"
+        "- hotkey / press：按快捷键，例如 cmd+space、cmd+v、enter\n"
+        "- type_text：输入文字\n"
+        "- wait：等待\n"
+        "- window_list / display_list / desktop_list：查看窗口、显示器、桌面信息\n"
+        "\n"
+        "工作规则：\n"
+        "1. 如果只是聊天，正常回答。\n"
+        "2. 如果需要操作电脑，调用 computer。\n"
+        "3. 终端任务优先用 shell。\n"
+        "4. GUI 任务先 screenshot 或 mouse_position 观察，再 click/hotkey/type_text。\n"
+        "5. 每执行一步后，根据 stdout/stderr 或截图判断下一步。\n"
+        "6. 不要让用户一步步教你，除非涉及删除、sudo、付款、发送隐私、不可逆操作。\n"
+        "7. 危险操作必须先问用户确认。\n"
+        "\n"
+        "跨平台规则：\n"
+        "如果不确定系统，先调用 device_info。\n"
+        "macOS 使用 open、osascript、pbcopy、pbpaste、zsh。\n"
+        "Windows 使用 PowerShell、Start-Process、Set-Clipboard、Get-Clipboard。\n"
+        "Linux 使用 bash、xdg-open、xclip/wl-copy、gnome-screenshot/scrot。\n"
+        "不要把 macOS 命令发给 Windows，不要把 Windows 命令发给 macOS。\n"
+        "\n"
+        "微信发送特例：当用户说\"给XX发微信/发消息\"时，可以直接调用 adu_mac_send(contact, message) 走 AppleScript 封装，比 computer+shell 更稳。"
+    )
+    blocks.append(_computer_block)
+    log.info("[rt.augment] ✅ computer tool instructions injected (%d chars)", len(_computer_block))
 
     # ── 4. 联网搜索 ──
     if enable_web and REALTIME_CALL_WEB_DEFAULT:
@@ -11060,10 +15982,59 @@ def _realtime_tool_mac_send_def() -> Dict[str, Any]:
         "parameters": {
             "type": "object",
             "properties": {
-                "contact": {"type": "string", "description": "联系人名字，如信玉、文件传输助手"},
+                "contact": {"type": "string", "description": "联系人名字，如联系人、文件传输助手"},
                 "message": {"type": "string", "description": "要发送的消息内容"},
             },
             "required": ["contact", "message"],
+        },
+    }
+
+
+# ✅ Direct Computer Tool — 走 /api/computer，不依赖 OpenClaw
+def _realtime_tool_computer_def() -> Dict[str, Any]:
+    return {
+        "type": "function",
+        "name": "computer",
+        "description": (
+            "控制用户电脑的统一工具。"
+            "当用户要求打开应用、查看文件、执行终端命令、截图、点击、输入文字、按快捷键时调用。"
+            "不要告诉用户自己去终端执行；你要直接调用这个工具。"
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "action": {
+                    "type": "string",
+                    "enum": [
+                        "device_info",
+                        "shell",
+                        "screenshot",
+                        "mouse_position",
+                        "click",
+                        "double_click",
+                        "hotkey",
+                        "press",
+                        "type_text",
+                        "wait",
+                        "window_list",
+                        "display_list",
+                        "desktop_list",
+                    ],
+                    "description": "电脑动作类型。终端命令用 shell，截图用 screenshot。",
+                },
+                "args": {
+                    "type": "object",
+                    "description": (
+                        "动作参数。"
+                        "shell 用 {cmd, timeout_sec}；"
+                        "click 用 {x,y}；"
+                        "hotkey/press 用 {key} 或 {keys}；"
+                        "type_text 用 {text}；"
+                        "screenshot 可为空对象。"
+                    ),
+                },
+            },
+            "required": ["action", "args"],
         },
     }
 
@@ -11074,13 +16045,9 @@ def _realtime_tools(*, enable_web: bool, enable_memory: bool, enable_agent: bool
         tools.append(_realtime_tool_web_search_def())
     if enable_memory:
         tools.append(_realtime_tool_remember_def())
-    if enable_agent:
-        try:
-            _bridge = get_bridge()
-            if _bridge.connected:
-                tools.append(_realtime_tool_agent_exec_def())
-        except Exception:
-            pass
+    # ✅ 新电脑工具：主助手永远可用，不依赖 OpenClaw 连接状态
+    tools.append(_realtime_tool_computer_def())
+    # 旧微信专用工具先保留兼容
     tools.append(_realtime_tool_mac_send_def())
     return tools
 
@@ -11322,21 +16289,7 @@ class RealtimeSidebandController:
         q = str(args.get("query") or args.get("q") or "").strip()
         if not q:
             return {"ok": False, "error": "missing query", "results": []}
-        try:
-            k = int(args.get("k") or 6)
-        except Exception:
-            k = 6
-        k = max(1, min(k, 10))
-        kind = str(args.get("kind") or "").strip() or None
-
-        def _do():
-            if CHAT_WEB_PROVIDER.startswith("serper"):
-                return _serper_web_search(q, k=k, kind=kind)
-            # Fallback: still try Serper if key exists
-            return _serper_web_search(q, k=k, kind=kind)
-
-        results = await asyncio.to_thread(_do)
-        return {"ok": True, "query": q, "results": results}
+        return {"ok": True, "executed": False, "query": q, "results": [], "provider": "openai_builtin_web_search", "message": "Use /chat with allow_web=true for OpenAI built-in web_search."}
 
     async def _tool_remember(self, args: Dict[str, Any]) -> Dict[str, Any]:
         txt = str(args.get("text") or "").strip()
@@ -11363,6 +16316,65 @@ class RealtimeSidebandController:
         await asyncio.to_thread(_do)
         return {"ok": True, "stored": True}
 
+    async def _tool_computer(self, args: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        ✅ Direct Computer Tool — 转发到本地 /api/computer。
+        不走 OpenClaw，不依赖任何 bridge。
+        危险 shell 命令会被前置拦截，要求用户确认。
+        """
+        action = str(args.get("action") or "").strip()
+        action_args = args.get("args") or {}
+        if not action:
+            return {"ok": False, "error": "missing action"}
+        if not isinstance(action_args, dict):
+            action_args = {}
+
+        # 轻量安全拦截：危险 shell 不直接执行
+        if action in ("shell", "bash", "exec"):
+            cmd = str(action_args.get("cmd") or action_args.get("command") or "").strip()
+            lowered = cmd.lower()
+            danger_hits = [
+                "rm -rf",
+                "sudo ",
+                "mkfs",
+                "diskutil erase",
+                ":(){",
+                "shutdown",
+                "reboot",
+            ]
+            if any(x in lowered for x in danger_hits):
+                log.warning("[ComputerTool] BLOCKED dangerous cmd: %s", cmd[:200])
+                return {
+                    "ok": False,
+                    "error": "dangerous_command_requires_user_confirmation",
+                    "cmd": cmd,
+                }
+
+        try:
+            url = os.getenv("LOCAL_COMPUTER_API_URL", "http://127.0.0.1:8000/api/computer")
+            payload = {
+                "action": action,
+                "args": action_args,
+            }
+
+            def _do():
+                r = requests.post(url, json=payload, timeout=60)
+                try:
+                    return r.json()
+                except Exception:
+                    return {
+                        "ok": False,
+                        "status_code": r.status_code,
+                        "text": r.text[:1000],
+                    }
+
+            result = await asyncio.to_thread(_do)
+            log.info("[ComputerTool] action=%s ok=%s", action, (result or {}).get("ok"))
+            return result if isinstance(result, dict) else {"ok": True, "result": result}
+        except Exception as e:
+            log.warning("[ComputerTool] forward failed: %s", e)
+            return {"ok": False, "error": str(e)[:500]}
+
     async def _tool_openclaw(self, name: str, args: Dict[str, Any]) -> Dict[str, Any]:
         """
         ✅ OpenClaw/Adu-Agent 工具调用 — 语音通话中执行文件操作/终端命令/浏览器动作等。
@@ -11374,15 +16386,18 @@ class RealtimeSidebandController:
         此方法处理方式 1（实时工具调用）。
         """
         try:
-            _bridge = get_bridge()
-            if not _bridge.connected:
+            if not _openclaw_runtime_enabled():
+                return {"ok": False, "error": "openclaw_disabled_local_agent_only"}
+
+            _bridge = _openclaw_get_bridge_or_none()
+            if _bridge is None or not getattr(_bridge, "connected", False):
                 # 尝试重连一次
                 try:
                     await asyncio.to_thread(ensure_connected)
-                    _bridge = get_bridge()
+                    _bridge = _openclaw_get_bridge_or_none()
                 except Exception:
                     pass
-            if not _bridge.connected:
+            if _bridge is None or not getattr(_bridge, "connected", False):
                 return {"ok": False, "error": "openclaw_not_connected"}
 
             action = str(args.get("action") or args.get("command") or "").strip()
@@ -11423,6 +16438,8 @@ class RealtimeSidebandController:
             out = await self._tool_web_search(args)
         elif name == "remember" and self.enable_memory:
             out = await self._tool_remember(args)
+        elif name == "computer":
+            out = await self._tool_computer(args)
         # ✅ OpenClaw 接入：语音通话中也能执行文件操作/终端命令等 Agent 动作
         elif name.startswith("openclaw_") or name.startswith("adu_agent_"):
             out = await self._tool_openclaw(name, args)
@@ -11576,8 +16593,8 @@ class RealtimeSidebandController:
 
             # ✅ OpenClaw: 批量处理通话中 assistant 回复里的 [ADU_ACTION:...] 标记
             try:
-                _bridge = get_bridge()
-                if _bridge.connected:
+                _bridge = _openclaw_get_bridge_or_none()
+                if _bridge is not None and getattr(_bridge, "connected", False):
                     for t in self.turns:
                         if (t.get("role") or "") != "assistant":
                             continue
@@ -11688,7 +16705,7 @@ async def session_post(req: Request):
     if ("application/sdp" in ct) or ("text/plain" in ct):
         offer_sdp = (await req.body()).decode("utf-8", errors="ignore").strip()
         if not offer_sdp:
-            return Response("missing SDP offer", media_type="text/plain", status_code=400)
+            return _friendly_session_text_error(message=REALTIME_USER_ERROR_MESSAGE, status_code=200)
 
         # Query params / headers for options (keep it simple for clients)
         qp = req.query_params
@@ -11713,6 +16730,11 @@ async def session_post(req: Request):
             b["enable_memory"] = True  # ✅ WebRTC 默认开启长期记忆
 
         user_key = _derive_user_key(req, b)
+        # ✅ Billing: default soft mode for realtime bootstrap.
+        # Do not let raw HTTP 402 break Qwen/OpenAI voice/video before provider session creation.
+        _billing_response = _realtime_billing_allows_or_response(req, b, user_key, branch="SDP")
+        if _billing_response is not None:
+            return _billing_response
         allow_web = bool(_extract_allow_web(req, b))  # uses existing flag parsing
         enable_memory = _boolish(b.get("enable_memory"))
         # ✅ 提取 conversation_id（与文本聊天共用同一个会话）
@@ -11738,7 +16760,8 @@ async def session_post(req: Request):
         )
 
         if not OPENAI_API_KEY:
-            return Response("missing OPENAI_API_KEY", media_type="text/plain", status_code=500)
+            log.warning("[/session:SDP] OPENAI_API_KEY missing")
+            return _friendly_session_text_error(status_code=200)
 
         try:
             files = {
@@ -11750,10 +16773,12 @@ async def session_post(req: Request):
             }
             r = requests.post(REALTIME_CALLS_URL, headers=headers, files=files, timeout=30)
         except Exception as e:
-            return Response(f"realtime call create failed: {e}", media_type="text/plain", status_code=502)
+            log.warning("[/session:SDP] realtime call create failed: %s", e)
+            return _friendly_session_text_error(status_code=200)
 
         if r.status_code >= 400:
-            return Response(f"OpenAI error {r.status_code}: {_short(r.text, 800)}", media_type="text/plain", status_code=502)
+            log.warning("[/session:SDP] provider error status=%s body=%s", r.status_code, _short(r.text, 500))
+            return _friendly_session_text_error(status_code=200)
 
         answer_sdp = (r.text or "").strip()
         loc = (r.headers.get("Location") or r.headers.get("location") or "").strip()
@@ -11808,6 +16833,11 @@ async def session_post(req: Request):
     voice = (b.get("voice") or REALTIME_VOICE_DEFAULT).strip()
 
     user_key = _derive_user_key(req, b)
+    # ✅ Billing: default soft mode for realtime bootstrap.
+    # App-side Pro paywall already gates voice/video; backend should not surface raw 402 to UI.
+    _billing_response = _realtime_billing_allows_or_response(req, b, user_key, branch="JSON")
+    if _billing_response is not None:
+        return _billing_response
     # ✅ FIX: 默认开启联网（与 WebRTC SDP 分支一致），iOS 不传 allow_web 也能用
     allow_web = bool(_extract_allow_web(req, b))
     enable_memory = _boolish(b.get("enable_memory", True))
@@ -11826,6 +16856,7 @@ async def session_post(req: Request):
     _rt_perception = b.get("perception")
     log.info("[/session:diag] client_id=%s perception_present=%s profile=%s",
              b.get("client_id","(none)"), bool(_rt_perception), b.get("profile","(none)"))
+    log.info("[/session:semantic_diag] token=%s provider=%s create_response=true interrupt_response=true", SEMANTIC_INTERRUPT_TOKEN, provider)
     if not isinstance(_rt_perception, dict):
         _rt_perception = None
 
@@ -11844,6 +16875,7 @@ async def session_post(req: Request):
         enable_web=allow_web,
         perception_data=_rt_perception,
         enable_agent=True,
+        provider=provider,
     )
 
     tools = _realtime_tools(enable_web=allow_web, enable_memory=enable_memory, enable_agent=True)
@@ -11885,6 +16917,7 @@ async def session_post(req: Request):
             "web_enabled": bool(allow_web),
             "tools_enabled": False,
             "instructions": instructions,
+            "semantic_interrupt_token": SEMANTIC_INTERRUPT_TOKEN,
             "protocol_notes": {
                 "transport": "WebSocket (same as Qwen path)",
                 "vad": "client-side (iOS energy detection)",
@@ -11899,13 +16932,13 @@ async def session_post(req: Request):
     # ✅ Qwen Omni Realtime 分支
     # ────────────────────────────────────────────
     if provider == "qwen":
-        qwen_model = (b.get("model") or QWEN_REALTIME_MODEL).strip()
-        qwen_voice = (b.get("voice") or QWEN_REALTIME_VOICE).strip()
+        qwen_model = _normalize_qwen_realtime_model(str(b.get("model") or QWEN_REALTIME_MODEL))
+        qwen_voice = _normalize_qwen_realtime_voice(str(b.get("voice") or QWEN_REALTIME_VOICE))
         qinfo, qerr = _qwen_realtime_ephemeral(
             qwen_model, qwen_voice,
             instructions=instructions,
-            tools=tools,
-            tool_choice=("auto" if tools else None),
+            tools=(tools if QWEN_REALTIME_ENABLE_TOOLS else None),
+            tool_choice=("auto" if (tools and QWEN_REALTIME_ENABLE_TOOLS) else None),
         )
         if qerr:
             # auto 模式下 fallback 到 OpenAI
@@ -11914,13 +16947,19 @@ async def session_post(req: Request):
                 provider = "openai"
                 # fall through to OpenAI block below
             else:
-                return JSONResponse({"ok": False, "error": f"Qwen: {qerr}"}, status_code=502)
+                log.warning("[/session:JSON] Qwen failed: %s", qerr)
+                return _friendly_session_json_error()
         else:
+            # ✅ FIX: Qwen /session must create or reuse the realtime conversation_id exactly once.
+            # Previously the response dict contained two duplicate "conversation_id" keys,
+            # each calling conv_create(...) when the client did not pass an id. That could create
+            # two DB conversations while only returning the second one to iOS.
+            session_conv_id = rt_conversation_id or conv_create(user_key, "实时语音")
             return {
                 "ok": True,
                 "provider": "qwen",
                 "session_id": uuid.uuid4().hex,
-                "conversation_id": rt_conversation_id or conv_create(user_key, "实时语音"),
+                "conversation_id": session_conv_id,
                 "ws_url": qinfo["ws_url"],
                 "api_key": qinfo["api_key"],           # iOS 放 Authorization: Bearer
                 "rtc_url": qinfo["ws_url"],             # 兼容旧字段
@@ -11934,11 +16973,16 @@ async def session_post(req: Request):
                 "output_sample_rate": 24000,
                 "pcm24_to_pcm16_required": False,
                 "max_session_minutes": 120,
+                "turn_detection": qinfo.get("turn_detection") or {},
+                # 阿里官方文档明确："The model for transcribing input audio.
+                # Only gummy-realtime-v1 is supported."  qwen3-asr-flash-realtime 是
+                # 独立的实时 ASR 模型，不能放在 omni-realtime 的 transcription 字段下。
+                "input_audio_transcription": {"model": "gummy-realtime-v1"},
                 "profile": resolved_profile,
                 "home_bound": bool(resolved_profile == "home"),
                 "memory_enabled": bool(enable_memory),
                 "web_enabled": bool(allow_web),
-                "tools_enabled": bool(bool(tools)),
+                "tools_enabled": bool(bool(tools) and QWEN_REALTIME_ENABLE_TOOLS),
                 "memory_commit_url": "/realtime/memory/commit",
                 "turn_commit_url": "/realtime/turn/commit",
                 "web_search_url": "/web_search?q={query}&k=6",
@@ -11946,12 +16990,14 @@ async def session_post(req: Request):
                 "auto_memory": False,
                 "memory_commit_required": bool(enable_memory),
                 "instructions": instructions,  # ✅ 统一注入：人格+记忆+感知
-                "conversation_id": rt_conversation_id or conv_create(user_key, "实时语音"),
+                "semantic_interrupt_token": SEMANTIC_INTERRUPT_TOKEN,
                 # ✅ Qwen 协议差异提示
                 "protocol_notes": {
                     "auth_header": "Authorization: Bearer <api_key>",
                     "no_openai_beta_header": True,
-                    "input_audio": "pcm16 only (no g711)",
+                    "turn_detection": qinfo.get("turn_detection") or {},
+                    "vad_type": "server_vad (only supported value)",
+                    "input_audio": "pcm only (PCM16 16kHz mono payload)",
                     "output_audio": "pcm (PCM16 24kHz mono)",
                     "session_duration": "120 min (vs OpenAI 15 min)",
                     "voices_available": 49,
@@ -11970,15 +17016,17 @@ async def session_post(req: Request):
             key, err = key2, None
 
     if err:
-        return JSONResponse({"ok": False, "error": err}, status_code=502)
+        log.warning("[/session:JSON] OpenAI Realtime failed: %s", err)
+        return _friendly_session_json_error()
 
     # NOTE: legacy client-side WebSocket/WebRTC connections to OpenAI won't automatically store new memories.
     # Use POST /realtime/memory/commit from client when the call ends to persist transcripts.
+    session_conv_id = rt_conversation_id or conv_create(user_key, "实时语音")
     return {
         "ok": True,
         "provider": "openai",
         "session_id": uuid.uuid4().hex,
-        "conversation_id": rt_conversation_id or conv_create(user_key, "实时语音"),  # ✅ 回传给前端
+        "conversation_id": session_conv_id,  # ✅ 回传给前端
         "rtc_url": f"https://api.openai.com/v1/realtime?model={model}",
         "ephemeral_key": key,
         "modalities": ["text", "audio"],
@@ -12000,6 +17048,41 @@ async def session_post(req: Request):
         "auto_memory": False,
         "memory_commit_required": bool(enable_memory),
         "instructions": instructions,  # ✅ GPT Realtime 也返回完整 instructions（人格/记忆/感知）
+        "semantic_interrupt_token": SEMANTIC_INTERRUPT_TOKEN,
+    }
+
+
+@app.post("/realtime/semantic_interrupt")
+async def realtime_semantic_interrupt(req: Request):
+    """
+    ✅ 语义打断控制入口。
+
+    说明：OpenAI/Qwen 直连 Realtime 模式下，运行时音频流不经过后端，
+    因此前端控制层也会本地立即清播放缓冲；这个接口用于后端会话/日志/
+    代理式 pipeline 统一接收同一个控制信号，后续如果把 Realtime 改成后端代理，
+    可在这里直接关闭远端音频、取消旧 response、清空待播队列。
+    """
+    try:
+        body = await req.json()
+    except Exception:
+        body = {}
+    token = (body.get("token") or "").strip()
+    if token and token != SEMANTIC_INTERRUPT_TOKEN:
+        return JSONResponse({"ok": False, "error": "invalid semantic interrupt token"}, status_code=400)
+    log.info("[semantic_interrupt] client_id=%s conversation_id=%s reason=%s",
+             body.get("client_id") or body.get("clientId") or "",
+             body.get("conversation_id") or body.get("session_id") or "",
+             body.get("reason") or "")
+    return {
+        "ok": True,
+        "cmd": "semantic_interrupt",
+        "token": SEMANTIC_INTERRUPT_TOKEN,
+        "actions": [
+            "stop_remote_audio_if_proxied",
+            "cancel_previous_response_if_active",
+            "drop_unplayed_previous_audio",
+            "continue_new_user_turn",
+        ],
     }
 
 
@@ -12224,12 +17307,7 @@ async def _tts_bytes_impl(request: Request, force_mp3: bool = False):
         if instructions:
             payload["instructions"] = instructions
 
-        # ✅ Web search tool (official)
-        if CHAT_ENABLE_WEB_SEARCH_DEFAULT:
-            payload["tools"] = [{"type": "web_search"}]
-            payload["tool_choice"] = "auto"
-            # include sources for UI (site icons)
-            payload["include"] = ["web_search_call.action.sources"]
+        # TTS endpoint must send only audio-speech fields. Do not attach chat/web tools here.
         if spd is not None:
             payload["speed"] = spd
         if fmt and fmt != "mp3":
@@ -12247,15 +17325,11 @@ async def _tts_bytes_impl(request: Request, force_mp3: bool = False):
                 pass
             continue
 
-        ok_any = True
-        for chunk in r.iter_content(chunk_size=TTS_STREAM_CHUNK_SIZE_DEFAULT):
-            if chunk:
-                out.extend(chunk)
-
-        try:
-            r.close()
-        except Exception:
-            pass
+        seg_ok = False
+        for chunk in _safe_iter_response_content(r, label="TTS.bytes"):
+            seg_ok = True
+            out.extend(chunk)
+        ok_any = ok_any or seg_ok
 
     if not ok_any:
         return JSONResponse({"ok": False, "error": f"openai_tts_error: {last_err or 'unknown'}"}, status_code=502)
@@ -12742,6 +17816,219 @@ async def v2_auth_login(req: V2LoginReq):
 
     return {"ok": True, "access_token": token, "token_type": "bearer", "user": user}
 
+# ════════════════════════════════════════════════════════════════════
+# Apple Sign In  ── 验证 Apple identity_token，找/建用户，返回我们自己的 access_token
+# ════════════════════════════════════════════════════════════════════
+
+# 你的 iOS App Bundle ID（必须配，否则验签时 aud 永远不匹配）
+# 例：APPLE_BUNDLE_ID=com.duy.gptsora
+APPLE_BUNDLE_ID = os.environ.get("APPLE_BUNDLE_ID", "").strip()
+APPLE_JWKS_URL = "https://appleid.apple.com/auth/keys"
+APPLE_ISSUER = "https://appleid.apple.com"
+
+# JWKS 缓存：1 小时刷新（Apple 偶尔会轮换 key，绝不能硬编码）
+_APPLE_JWKS_CACHE: Dict[str, Any] = {"keys": [], "fetched_at": 0}
+_APPLE_JWKS_TTL = 3600
+
+def _apple_fetch_jwks() -> List[Dict[str, Any]]:
+    """拉 Apple 公钥集，带 1h 缓存。"""
+    now = int(time.time())
+    if _APPLE_JWKS_CACHE["keys"] and (now - _APPLE_JWKS_CACHE["fetched_at"] < _APPLE_JWKS_TTL):
+        return _APPLE_JWKS_CACHE["keys"]
+    try:
+        r = requests.get(APPLE_JWKS_URL, timeout=8)
+        r.raise_for_status()
+        keys = r.json().get("keys", [])
+        if keys:
+            _APPLE_JWKS_CACHE["keys"] = keys
+            _APPLE_JWKS_CACHE["fetched_at"] = now
+        return keys
+    except Exception as e:
+        print(f"[apple_auth] JWKS fetch failed: {e}")
+        # 兜底：返回旧缓存（哪怕过期），避免单点抖动导致全员登录失败
+        return _APPLE_JWKS_CACHE.get("keys", []) or []
+
+def _apple_pick_key(jwks: List[Dict[str, Any]], kid: str) -> Optional[Dict[str, Any]]:
+    for k in jwks:
+        if k.get("kid") == kid:
+            return k
+    return None
+
+def _apple_verify_identity_token(identity_token: str) -> Dict[str, Any]:
+    """
+    验证 Apple identity_token，返回 decoded payload。
+    任一环节失败抛 ValueError。
+    """
+    if not _APPLE_JWT_AVAILABLE:
+        raise ValueError("server missing pyjwt[crypto]; please `pip install 'pyjwt[crypto]'`")
+    if not APPLE_BUNDLE_ID:
+        raise ValueError("server missing APPLE_BUNDLE_ID env")
+
+    # 1) 取 token header 看 kid
+    try:
+        unverified_header = _pyjwt.get_unverified_header(identity_token)
+    except Exception as e:
+        raise ValueError(f"malformed identity_token: {e}")
+    kid = unverified_header.get("kid")
+    alg = unverified_header.get("alg")
+    if alg != "RS256":
+        raise ValueError(f"unexpected alg: {alg}")
+    if not kid:
+        raise ValueError("missing kid in token header")
+
+    # 2) 选公钥（JWKS 缓存，必要时重拉一次）
+    jwks = _apple_fetch_jwks()
+    jwk = _apple_pick_key(jwks, kid)
+    if not jwk:
+        # kid 找不到 —— 可能 Apple 刚轮换了 key，强制刷新一次
+        _APPLE_JWKS_CACHE["fetched_at"] = 0
+        jwks = _apple_fetch_jwks()
+        jwk = _apple_pick_key(jwks, kid)
+    if not jwk:
+        raise ValueError(f"unknown apple kid: {kid}")
+
+    public_key = _RSAAlgorithm.from_jwk(json.dumps(jwk))
+
+    # 3) 验签 + 校验 iss / aud / exp
+    try:
+        payload = _pyjwt.decode(
+            identity_token,
+            public_key,
+            algorithms=["RS256"],
+            audience=APPLE_BUNDLE_ID,
+            issuer=APPLE_ISSUER,
+            options={"require": ["exp", "iat", "sub", "aud", "iss"]},
+        )
+    except Exception as e:
+        raise ValueError(f"invalid identity_token: {e}")
+
+    return payload
+
+def _apple_make_username(apple_sub: str) -> str:
+    """
+    Apple sub 形如 '001234.abcdefghijk.1234'，含点号且超长。
+    我们把它转成符合 username 约束（3-64 位）的稳定串：apple_<前12位hash>。
+    用 hash 是为了：
+      ① username 列有 UNIQUE 约束，apple_sub 也要做 UNIQUE，二者解耦
+      ② 不在 username 暴露 Apple 内部 ID
+    """
+    h = hashlib.sha256(apple_sub.encode("utf-8")).hexdigest()[:12]
+    return f"apple_{h}"
+
+# 局部导入 BaseModel（避免和 auth.py 模块中的定义冲突）
+from pydantic import BaseModel as _SIWA_BaseModel
+
+class V2AppleSignInReq(_SIWA_BaseModel):
+    identity_token: str
+    # 可选：iOS 端在用户首次授权时拿到的姓名（Apple 仅首次回传），后端只在新建账号时落库
+    full_name: Optional[str] = None
+    # 可选：iOS 端拿到的 email（多数场景 identity_token 里就有，这里给个兜底通道）
+    email_hint: Optional[str] = None
+
+@app.post("/v2/auth/apple")
+async def v2_auth_apple(req: V2AppleSignInReq):
+    """
+    iOS 端拿到 Apple 颁发的 identity_token 后调本接口；
+    后端验证 token → 找/建用户 → 返回我们自己的 access_token。
+    """
+    token_str = (req.identity_token or "").strip()
+    if not token_str:
+        raise HTTPException(status_code=400, detail="missing identity_token")
+
+    # 1) 验证 Apple JWT
+    try:
+        claims = _apple_verify_identity_token(token_str)
+    except ValueError as e:
+        raise HTTPException(status_code=401, detail=f"apple verify failed: {e}")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"apple verify error: {e}")
+
+    apple_sub = (claims.get("sub") or "").strip()
+    if not apple_sub:
+        raise HTTPException(status_code=401, detail="missing sub claim")
+
+    # email：identity_token 里的 email 优先；首次注册才会有，二次登录不一定有
+    email_in_token = (claims.get("email") or "").strip().lower()
+    email = email_in_token or (req.email_hint or "").strip().lower()
+
+    full_name = (req.full_name or "").strip()
+    now = int(time.time())
+
+    conn = _video_conn()
+    try:
+        # 2) 用 apple_sub 找现有账号
+        urow = conn.execute(
+            "SELECT user_id, username, display_name, avatar_url, created_at, email FROM users WHERE apple_sub=?",
+            (apple_sub,),
+        ).fetchone()
+
+        if urow:
+            # 已有账号：补齐 email（Apple 第二次不返回 email 时不要覆盖已有）
+            if email and not (urow["email"] or "").strip():
+                conn.execute("UPDATE users SET email=? WHERE user_id=?", (email, urow["user_id"]))
+                conn.commit()
+            user_id = urow["user_id"]
+        else:
+            # 3) 新建账号
+            user_id = uuid.uuid4().hex
+            username = _apple_make_username(apple_sub)
+            display_name = full_name or (email.split("@")[0] if email else username)
+
+            # username 极小概率 hash 撞车，撞了在尾部加 4 位
+            for attempt in range(3):
+                try:
+                    conn.execute(
+                        """
+                        INSERT INTO users(user_id, username, display_name, password_hash,
+                                          avatar_url, created_at, apple_sub, email)
+                        VALUES (?, ?, ?, ?, '', ?, ?, ?)
+                        """,
+                        (user_id, username, display_name, "!apple-no-pw", now, apple_sub, email),
+                    )
+                    conn.commit()
+                    break
+                except sqlite3.IntegrityError as ie:
+                    msg = str(ie).lower()
+                    if "username" in msg and attempt < 2:
+                        username = f"{username}{uuid.uuid4().hex[:4]}"
+                        continue
+                    if "apple_sub" in msg:
+                        # 并发情况下另一个请求刚建好；回去当作已有账号处理
+                        urow2 = conn.execute(
+                            "SELECT user_id FROM users WHERE apple_sub=?",
+                            (apple_sub,),
+                        ).fetchone()
+                        if urow2:
+                            user_id = urow2["user_id"]
+                            break
+                    raise
+
+        # 4) 签发我们自己的 access_token
+        token = _issue_access_token(user_id)
+
+        # 5) 拉最终 user 行回执
+        urow_final = conn.execute(
+            "SELECT user_id, username, display_name, avatar_url, created_at, email FROM users WHERE user_id=?",
+            (user_id,),
+        ).fetchone()
+    finally:
+        conn.close()
+
+    # 手动构建 user dict（不依赖 _public_user，避免字段兼容问题）
+    if urow_final is None:
+        raise HTTPException(status_code=500, detail="user not found after creation")
+    user = {
+        "user_id": urow_final["user_id"],
+        "username": urow_final["username"],
+        "display_name": urow_final["display_name"] or "",
+        "avatar_url": urow_final["avatar_url"] or "",
+        "created_at": urow_final["created_at"] or 0,
+        "email": (urow_final["email"] or "") if "email" in urow_final.keys() else "",
+    }
+
+    return {"ok": True, "access_token": token, "token_type": "bearer", "user": user}
+
+
 @app.post("/v2/auth/logout")
 async def v2_auth_logout(request: Request):
     token = _get_bearer_token(request)
@@ -12775,6 +18062,175 @@ async def v2_auth_me(request: Request):
         conn.close()
 
     return {"ok": True, "user": _public_user(user), "followers": followers, "following": following}
+
+
+# ════════════════════════════════════════════════════════════════════
+# 设备数据迁移：用户首次登录后，把匿名 client_id 名下的会话/消息/记忆
+# 一次性迁移到新账号的 user_key (= apple_sub) 下。
+#
+# 安全约束（绝对不能违反）：
+#   1) 必须带 Bearer token（已知谁是当前用户）
+#   2) 目标账号必须是空的 —— 不允许覆盖已有数据
+#   3) 只能迁移 1 次 —— migrated_devices 表记录已迁移过的 client_id
+#   4) 每个 client_id 只能被迁移到 1 个账号 —— 防止 A/B 互抢
+#
+# 调用时机（前端）：成功登录返回 token 后，立即调一次本端点
+# ════════════════════════════════════════════════════════════════════
+
+class V2MigrateDeviceReq(_SIWA_BaseModel):
+    client_id: str  # 用户登录前的匿名设备 ID（前端 UserDefaults "solara.client_id"）
+
+@app.post("/v2/auth/migrate_device")
+async def v2_auth_migrate_device(req: V2MigrateDeviceReq, request: Request):
+    """
+    把 client_id 名下的会话/消息/记忆迁移到当前登录账号。
+    幂等：重复调用不会重复迁移；安全：拒绝覆盖已有数据。
+    """
+    user = _auth_required_user(request)
+    target_user_key = _sanitize_user_key(user["user_id"])
+
+    src_client_id = (req.client_id or "").strip()
+    if not src_client_id:
+        return {"ok": True, "migrated": False, "reason": "no client_id"}
+
+    src_user_key = _sanitize_user_key(src_client_id)
+
+    if src_user_key == target_user_key:
+        return {"ok": True, "migrated": False, "reason": "same key"}
+
+    # 1) 检查迁移记录表
+    conv_conn = _conv_conn()
+    try:
+        conv_conn.execute("""
+            CREATE TABLE IF NOT EXISTS migrated_devices (
+                client_id TEXT PRIMARY KEY,
+                target_user_key TEXT NOT NULL,
+                migrated_at REAL NOT NULL
+            )
+        """)
+        existing = conv_conn.execute(
+            "SELECT target_user_key FROM migrated_devices WHERE client_id=?",
+            (src_user_key,)
+        ).fetchone()
+        if existing:
+            prev_target = existing[0] if isinstance(existing, tuple) else existing["target_user_key"]
+            if prev_target == target_user_key:
+                return {"ok": True, "migrated": False, "reason": "already migrated to this account"}
+            else:
+                return {"ok": True, "migrated": False, "reason": "client_id bound to other account"}
+
+        # 2) 检查目标账号是否已经有数据
+        target_has_data = conv_conn.execute(
+            "SELECT 1 FROM conversations WHERE user_key=? LIMIT 1",
+            (target_user_key,)
+        ).fetchone() is not None
+        if not target_has_data:
+            target_has_data = conv_conn.execute(
+                "SELECT 1 FROM messages WHERE user_key=? LIMIT 1",
+                (target_user_key,)
+            ).fetchone() is not None
+        if target_has_data:
+            return {"ok": True, "migrated": False, "reason": "target account already has data"}
+
+        # 3) 检查源 client_id 数据量
+        src_conv_count = conv_conn.execute(
+            "SELECT COUNT(*) FROM conversations WHERE user_key=?",
+            (src_user_key,)
+        ).fetchone()[0] or 0
+        src_msg_count = conv_conn.execute(
+            "SELECT COUNT(*) FROM messages WHERE user_key=?",
+            (src_user_key,)
+        ).fetchone()[0] or 0
+
+        # 4) 真正迁移
+        conv_conn.execute("BEGIN")
+        try:
+            conv_conn.execute(
+                "UPDATE conversations SET user_key=? WHERE user_key=?",
+                (target_user_key, src_user_key)
+            )
+            conv_conn.execute(
+                "UPDATE messages SET user_key=? WHERE user_key=?",
+                (target_user_key, src_user_key)
+            )
+            conv_conn.execute(
+                "INSERT OR REPLACE INTO migrated_devices(client_id, target_user_key, migrated_at) VALUES (?, ?, ?)",
+                (src_user_key, target_user_key, time.time())
+            )
+            conv_conn.execute("COMMIT")
+        except Exception as e:
+            conv_conn.execute("ROLLBACK")
+            raise HTTPException(status_code=500, detail=f"migrate conv failed: {e}")
+    finally:
+        conv_conn.close()
+
+    # 5) 迁移记忆
+    src_mem_count = 0
+    src_facts_count = 0
+    src_timeline_count = 0
+    mem_conn = _mem_conn()
+    try:
+        try:
+            src_mem_count = mem_conn.execute(
+                "SELECT COUNT(*) FROM memory_items WHERE user_key=?", (src_user_key,)
+            ).fetchone()[0] or 0
+        except Exception:
+            pass
+        try:
+            src_facts_count = mem_conn.execute(
+                "SELECT COUNT(*) FROM memory_facts WHERE user_key=?", (src_user_key,)
+            ).fetchone()[0] or 0
+        except Exception:
+            pass
+        try:
+            src_timeline_count = mem_conn.execute(
+                "SELECT COUNT(*) FROM memory_timeline WHERE user_key=?", (src_user_key,)
+            ).fetchone()[0] or 0
+        except Exception:
+            pass
+
+        mem_conn.execute("BEGIN")
+        try:
+            try:
+                mem_conn.execute(
+                    "UPDATE memory_items SET user_key=? WHERE user_key=?",
+                    (target_user_key, src_user_key)
+                )
+            except sqlite3.IntegrityError:
+                pass
+            try:
+                mem_conn.execute(
+                    "UPDATE memory_facts SET user_key=? WHERE user_key=?",
+                    (target_user_key, src_user_key)
+                )
+            except sqlite3.IntegrityError:
+                pass
+            try:
+                mem_conn.execute(
+                    "UPDATE memory_timeline SET user_key=? WHERE user_key=?",
+                    (target_user_key, src_user_key)
+                )
+            except sqlite3.IntegrityError:
+                pass
+            mem_conn.execute("COMMIT")
+        except Exception as e:
+            mem_conn.execute("ROLLBACK")
+            print(f"[migrate_device] mem migrate failed (non-fatal): {e}")
+    finally:
+        mem_conn.close()
+
+    return {
+        "ok": True,
+        "migrated": True,
+        "stats": {
+            "conversations": src_conv_count,
+            "messages": src_msg_count,
+            "memory_items": src_mem_count,
+            "memory_facts": src_facts_count,
+            "memory_timeline": src_timeline_count,
+        },
+    }
+
 
 @app.get("/v2/users/suggest")
 async def v2_users_suggest(request: Request, limit: int = 20):
@@ -13505,6 +18961,7 @@ def health():
         },
         "endpoints": {
             "chat_prepare": "/chat/prepare",
+            "computer_action": "/api/brain/computer/action",
             "chat_events": "/chat/events/{chat_id}",
             "chat_result": "/chat/result/{chat_id}",
             "conversations": "/conversations",
@@ -13594,12 +19051,28 @@ async def agent_usage(request: Request):
 
 @app.get("/agent/health")
 async def agent_health():
-    """OpenClaw Gateway 连接状态"""
+    """Legacy OpenClaw Gateway 连接状态"""
+    if not _openclaw_runtime_enabled():
+        return {"status": "disabled", **_openclaw_disabled_payload()}
     try:
-        bridge = get_bridge()
+        bridge = _openclaw_get_bridge_or_none()
+        if bridge is None:
+            return {"status": "error", "error": "openclaw_not_available"}
         return await bridge.health()
     except Exception as e:
         return {"status": "error", "error": str(e)}
+
+
+async def _ensure_openclaw_or_503():
+    if not _openclaw_runtime_enabled():
+        return None, JSONResponse(_openclaw_disabled_payload(), status_code=503)
+    try:
+        bridge = await ensure_connected()
+    except Exception as e:
+        return None, JSONResponse({"ok": False, "error": "openclaw_connect_failed", "message": str(e)[:300]}, status_code=503)
+    if bridge is None or not getattr(bridge, "connected", False):
+        return None, JSONResponse({"ok": False, "error": "OpenClaw not connected"}, status_code=503)
+    return bridge, None
 
 
 @app.post("/agent/scan")
@@ -13614,9 +19087,9 @@ async def agent_scan(request: Request):
         body = {}
     path = body.get("path", "~/GPTsora")
 
-    bridge = await ensure_connected()
-    if not bridge.connected:
-        return JSONResponse({"ok": False, "error": "OpenClaw not connected"}, status_code=503)
+    bridge, err = await _ensure_openclaw_or_503()
+    if err:
+        return err
 
     result = await bridge.scan_project(path)
     return {"ok": True, **result}
@@ -13635,9 +19108,9 @@ async def agent_files(request: Request):
     path = body.get("path", "~/GPTsora")
     pattern = body.get("pattern", "*.swift")
 
-    bridge = await ensure_connected()
-    if not bridge.connected:
-        return JSONResponse({"ok": False, "error": "OpenClaw not connected"}, status_code=503)
+    bridge, err = await _ensure_openclaw_or_503()
+    if err:
+        return err
 
     files = await bridge.list_files(path, pattern)
     return {"ok": True, "files": files, "count": len(files)}
@@ -13657,9 +19130,9 @@ async def agent_read(request: Request):
     if not path:
         return JSONResponse({"ok": False, "error": "missing path"}, status_code=400)
 
-    bridge = await ensure_connected()
-    if not bridge.connected:
-        return JSONResponse({"ok": False, "error": "OpenClaw not connected"}, status_code=503)
+    bridge, err = await _ensure_openclaw_or_503()
+    if err:
+        return err
 
     content = await bridge.read_file(path)
     lines = content.count("\n") + 1 if content else 0
@@ -13681,9 +19154,9 @@ async def agent_write(request: Request):
     if not path:
         return JSONResponse({"ok": False, "error": "missing path"}, status_code=400)
 
-    bridge = await ensure_connected()
-    if not bridge.connected:
-        return JSONResponse({"ok": False, "error": "OpenClaw not connected"}, status_code=503)
+    bridge, err = await _ensure_openclaw_or_503()
+    if err:
+        return err
 
     # Git 备份
     project_dir = "/".join(path.split("/")[:-1]) or "~"
@@ -13759,6 +19232,103 @@ async def agent_tools_info():
     }
 
 
+@app.post("/controller/run")
+async def controller_run(request: Request):
+    """Unified execution endpoint for AutoBrain / App computer tasks.
+
+    Strategy:
+    1) Prefer local adu_controller.handle(instruction) when available
+    2) Fallback to lightweight local rules for shell/open-app
+    3) Return normalized result schema
+    """
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    instruction = str(body.get("instruction") or "").strip()
+    if not instruction:
+        return JSONResponse({"success": False, "error": "missing instruction"}, status_code=400)
+
+    # 🧠 任务完成 → 通知意识系统（helper，复用以覆盖全部 return 分支）
+    def _notify(result_dict: Dict[str, Any]):
+        try:
+            from adu_consciousness import consciousness
+            _success = bool(result_dict.get("ok", result_dict.get("success", False)))
+            consciousness.on_task_complete(instruction[:30], _success)
+        except Exception as _cs_e:
+            log.debug("[Consciousness] on_task_complete skip (controller): %s", _cs_e)
+
+    # local controller first
+    try:
+        from adu_controller import controller
+        result = await _adu_controller.handle(instruction)
+        if isinstance(result, dict):
+            result.setdefault("success", bool(result.get("ok", result.get("success", False))))
+            if not result.get("summary") and result.get("output"):
+                result["summary"] = str(result.get("output"))[:200]
+            _notify(result)
+            return result
+        _r = {"success": True, "summary": str(result), "result": result}
+        _notify(_r)
+        return _r
+    except Exception as _ctrl_err:
+        log.info("[controller/run] adu_controller unavailable/fallback: %s", _ctrl_err)
+
+    txt = instruction.lower()
+    # simple open-app path for commands like 把微信打开 / 打开 Safari
+    app_name = ""
+    if "微信" in instruction:
+        app_name = "WeChat"
+    elif "safari" in txt:
+        app_name = "Safari"
+    elif "finder" in txt:
+        app_name = "Finder"
+    elif "xcode" in txt:
+        app_name = "Xcode"
+    if app_name:
+        script = f'tell application "{app_name}" to activate'
+        try:
+            proc = await asyncio.create_subprocess_exec("osascript", "-e", script, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT)
+            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=20)
+            output = stdout.decode("utf-8", errors="replace") if stdout else ""
+            ok = proc.returncode == 0
+            _r = {"success": ok, "summary": (f"{app_name}已切到前台。" if ok else f"打开{app_name}失败。"), "output": output, "via": "osascript"}
+            _notify(_r)
+            return _r
+        except Exception as e:
+            _r = {"success": False, "summary": f"打开{app_name}失败。", "output": str(e), "via": "osascript"}
+            _notify(_r)
+            return _r
+
+    # shell fallback if prefixed
+    if instruction.startswith("执行终端命令：") or instruction.startswith("执行终端命令:"):
+        cmd = instruction.split("：", 1)[-1] if "：" in instruction else instruction.split(":", 1)[-1]
+        try:
+            proc = await asyncio.create_subprocess_shell(cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT)
+            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=30)
+            output = stdout.decode("utf-8", errors="replace") if stdout else ""
+            _r = {"success": proc.returncode == 0, "summary": "命令已执行。" if proc.returncode == 0 else "命令执行失败。", "output": output, "via": "shell"}
+            _notify(_r)
+            return _r
+        except Exception as e:
+            _r = {"success": False, "summary": "命令执行失败。", "output": str(e), "via": "shell"}
+            _notify(_r)
+            return _r
+
+    # fallback to existing agent exec (local shell)
+    try:
+        proc = await asyncio.create_subprocess_shell(instruction, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT)
+        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=20)
+        output = stdout.decode("utf-8", errors="replace") if stdout else ""
+        _r = {"success": proc.returncode == 0, "summary": "已执行。" if proc.returncode == 0 else "执行失败。", "output": output, "via": "shell_direct"}
+        _notify(_r)
+        return _r
+    except Exception as e:
+        _r = {"success": False, "summary": "执行失败。", "output": str(e), "via": "shell_direct"}
+        _notify(_r)
+        return _r
+
+
 @app.post("/agent/mac_send")
 async def agent_mac_send(req: Request):
     """发微信消息接口"""
@@ -13815,9 +19385,9 @@ async def agent_exec(request: Request):
             log.warning("[agent/exec] local exec failed: %s, falling back to bridge", e)
 
     # Fallback: OpenClaw bridge
-    bridge = await ensure_connected()
-    if not bridge.connected:
-        return JSONResponse({"ok": False, "error": "OpenClaw not connected"}, status_code=503)
+    bridge, err = await _ensure_openclaw_or_503()
+    if err:
+        return err
 
     output = await bridge.exec(command, timeout=timeout)
     return {"ok": True, "output": output, "via": "bridge"}
@@ -14113,6 +19683,219 @@ async def agent_tool_dispatch(request: Request):
     return result
 
 
+# ══════════════════════════════════════════════════════════════════════
+# ✅ Direct Computer Tool API — usecomputer backend
+#    Assistant -> /api/computer -> shell / usecomputer -> Mac
+# ══════════════════════════════════════════════════════════════════════
+
+def _run_usecomputer(argv: list[str], timeout: int = 20) -> dict:
+    try:
+        p = subprocess.run(
+            argv,
+            text=True,
+            capture_output=True,
+            timeout=timeout,
+        )
+        return {
+            "ok": p.returncode == 0,
+            "exit_code": p.returncode,
+            "stdout": p.stdout,
+            "stderr": p.stderr,
+        }
+    except subprocess.TimeoutExpired:
+        return {
+            "ok": False,
+            "exit_code": 124,
+            "stdout": "",
+            "stderr": "timeout",
+        }
+    except Exception as e:
+        return {
+            "ok": False,
+            "exit_code": -1,
+            "stdout": "",
+            "stderr": str(e),
+        }
+
+
+@app.post("/api/computer")
+async def api_computer(request: Request):
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"ok": False, "error": "invalid JSON"}, status_code=400)
+
+    action = str(body.get("action") or "").strip()
+    args = body.get("args") or {}
+
+    if not isinstance(args, dict):
+        args = {}
+
+    if not action:
+        return JSONResponse({"ok": False, "error": "missing action"}, status_code=400)
+
+    # 1. device info
+    if action == "device_info":
+        return {
+            "ok": True,
+            "platform": "macos",
+            "default_shell": "zsh",
+            "gui_engine": "usecomputer",
+            "capabilities": [
+                "shell",
+                "screenshot",
+                "mouse_position",
+                "click",
+                "double_click",
+                "hotkey",
+                "type_text",
+                "wait",
+                "window_list",
+                "display_list",
+                "desktop_list",
+            ],
+        }
+
+    # 2. shell: 终端命令直接执行
+    if action in ("shell", "bash", "exec"):
+        cmd = str(args.get("cmd") or args.get("command") or "").strip()
+        timeout = int(args.get("timeout_sec") or args.get("timeout") or 30)
+
+        if not cmd:
+            return JSONResponse({"ok": False, "error": "missing cmd"}, status_code=400)
+
+        try:
+            p = subprocess.run(
+                cmd,
+                shell=True,
+                executable="/bin/zsh",
+                text=True,
+                capture_output=True,
+                timeout=timeout,
+            )
+            return {
+                "ok": p.returncode == 0,
+                "exit_code": p.returncode,
+                "stdout": p.stdout,
+                "stderr": p.stderr,
+            }
+        except subprocess.TimeoutExpired:
+            return {
+                "ok": False,
+                "exit_code": 124,
+                "stdout": "",
+                "stderr": "timeout",
+            }
+        except Exception as e:
+            return {
+                "ok": False,
+                "exit_code": -1,
+                "stdout": "",
+                "stderr": str(e),
+            }
+
+    # 3. screenshot: usecomputer
+    if action == "screenshot":
+        path = str(args.get("path") or f"/tmp/adu_screen_{uuid.uuid4().hex}.png")
+        result = _run_usecomputer(
+            ["usecomputer", "screenshot", path, "--json"],
+            timeout=int(args.get("timeout_sec") or 20),
+        )
+
+        image_base64 = ""
+        if os.path.exists(path):
+            try:
+                with open(path, "rb") as f:
+                    image_base64 = base64.b64encode(f.read()).decode("utf-8")
+            except Exception:
+                image_base64 = ""
+
+        return {
+            **result,
+            "path": path,
+            "mime_type": "image/png",
+            "base64": image_base64,
+        }
+
+    # 4. mouse position
+    if action == "mouse_position":
+        return _run_usecomputer(["usecomputer", "mouse", "position", "--json"])
+
+    # 5. click
+    if action == "click":
+        x = args.get("x")
+        y = args.get("y")
+        if x is None or y is None:
+            return JSONResponse({"ok": False, "error": "missing x/y"}, status_code=400)
+
+        return _run_usecomputer([
+            "usecomputer",
+            "click",
+            "-x", str(x),
+            "-y", str(y),
+            "--button", str(args.get("button") or "left"),
+            "--count", str(args.get("count") or 1),
+        ])
+
+    # 6. double click
+    if action == "double_click":
+        x = args.get("x")
+        y = args.get("y")
+        if x is None or y is None:
+            return JSONResponse({"ok": False, "error": "missing x/y"}, status_code=400)
+
+        return _run_usecomputer([
+            "usecomputer",
+            "click",
+            "-x", str(x),
+            "-y", str(y),
+            "--button", str(args.get("button") or "left"),
+            "--count", "2",
+        ])
+
+    # 7. hotkey / press
+    if action in ("hotkey", "press"):
+        keys = args.get("keys")
+        if isinstance(keys, list):
+            key = "+".join(str(k) for k in keys)
+        else:
+            key = str(args.get("key") or args.get("combo") or "").strip()
+
+        if not key:
+            return JSONResponse({"ok": False, "error": "missing key"}, status_code=400)
+
+        return _run_usecomputer(["usecomputer", "press", key])
+
+    # 8. type text
+    if action == "type_text":
+        text = str(args.get("text") or "")
+        return _run_usecomputer(["usecomputer", "type", text])
+
+    # 9. wait
+    if action == "wait":
+        seconds = float(args.get("seconds") or args.get("sec") or 1)
+        seconds = max(0.0, min(seconds, 30.0))
+        await asyncio.sleep(seconds)
+        return {"ok": True, "waited": seconds}
+
+    # 10. window list
+    if action == "window_list":
+        return _run_usecomputer(["usecomputer", "window", "list", "--json"])
+
+    # 11. display list
+    if action == "display_list":
+        return _run_usecomputer(["usecomputer", "display", "list", "--json"])
+
+    # 12. desktop list
+    if action == "desktop_list":
+        return _run_usecomputer(["usecomputer", "desktop", "list", "--json"])
+
+    return JSONResponse(
+        {"ok": False, "error": f"unsupported action: {action}"},
+        status_code=400,
+    )
+
+
 @app.get("/agent/security")
 async def agent_security_config():
     """查询当前安全策略"""
@@ -14152,9 +19935,9 @@ async def agent_git(request: Request):
     path = body.get("path", "~/GPTsora")
     message = body.get("message", "AI update")
 
-    bridge = await ensure_connected()
-    if not bridge.connected:
-        return JSONResponse({"ok": False, "error": "OpenClaw not connected"}, status_code=503)
+    bridge, err = await _ensure_openclaw_or_503()
+    if err:
+        return err
 
     if action == "commit":
         output = await bridge.git_commit(path, message)
@@ -14349,16 +20132,49 @@ def _comp_l3_extract(user_key: str, user_msg: str, ai_reply: str) -> None:
 # /vision/stream   — SSE 流式，iOS 边收 token 边合成语音（延迟 ~1s）
 # ══════════════════════════════════════════════════════════════════════
 
-_VISION_SYSTEM_DRIVING = """你是车载AI视觉助手，分析行车摄像头画面，用简洁中文口语播报，规则：
+_VISION_SYSTEM_DRIVING = """你是车载AI视觉大脑，分析摄像头画面并形成“空间记忆 + 决策”。
+你必须先用一句极短中文口语播报，再在最后一行输出一个 JSON，不要输出 Markdown。
+播报规则：
 - 发现行人/障碍/危险：以「注意，」开头，10字内说明
 - 发现限速牌：说「限速X公里」
 - 发现路口/红绿灯/转弯提示：简短说明
-- 正常路况：5字内或不输出
-- 最后一行固定输出 JSON（不换行）：{"danger":"危险描述或空字符串","speed_limit":数字或null,"lane":true或false}
+- 正常路况：可以说「继续观察」或不播报
+JSON 固定结构：
+{"desc":"一句话场景描述","objects":[{"label":"物体名","direction":"前方|左前方|右前方|近前方","risk":"safe|caution|danger","confidence":0.0}],"danger":"危险描述或空字符串","speed_limit":数字或null,"lane":true或false,"decision":"下一步决策","memory":"空间记忆摘要"}
 只用中文，先播报再输出JSON。"""
 
-_VISION_SYSTEM_MANUAL = """分析这张行车画面，用中文详细描述道路情况、前方障碍、特殊情况。
-最后一行输出 JSON：{"danger":"危险或空字符串","speed_limit":数字或null,"lane":false}"""
+_VISION_SYSTEM_MANUAL = """你是实时视觉大脑。分析这张摄像头画面，描述外部世界、空间位置、风险和下一步决策。
+最后一行输出 JSON：
+{"desc":"一句话场景描述","objects":[{"label":"物体名","direction":"前方|左前方|右前方|近前方","risk":"safe|caution|danger","confidence":0.0}],"danger":"危险或空字符串","speed_limit":数字或null,"lane":false,"decision":"下一步决策","memory":"空间记忆摘要"}"""
+
+VISION_MODEL_DEFAULT = (os.getenv("VISION_MODEL") or ("qwen-vl-plus" if (not OPENAI_API_KEY and DASHSCOPE_API_KEY) else "gpt-4o")).strip()
+
+def _vision_llm_config() -> Optional[Tuple[str, Dict[str, str], str]]:
+    """Return (chat_completions_url, headers, model) for the vision brain.
+
+    Prefer OpenAI GPT-4o if OPENAI_API_KEY exists; otherwise use DashScope's
+    OpenAI-compatible vision model when DASHSCOPE_API_KEY is configured.
+    """
+    if OPENAI_API_KEY:
+        return (
+            "https://api.openai.com/v1/chat/completions",
+            {
+                "Authorization": f"Bearer {OPENAI_API_KEY}",
+                "Content-Type": "application/json",
+            },
+            VISION_MODEL_DEFAULT or "gpt-4o",
+        )
+    if DASHSCOPE_API_KEY:
+        return (
+            f"{DASHSCOPE_BASE_URL}/chat/completions",
+            {
+                "Authorization": f"Bearer {DASHSCOPE_API_KEY}",
+                "Content-Type": "application/json",
+            },
+            VISION_MODEL_DEFAULT or "qwen-vl-plus",
+        )
+    return None
+
 
 
 def _build_vision_messages(base64_image: str, mode: str) -> list:
@@ -14384,8 +20200,9 @@ async def vision_analyze(req: Request):
     Body: { "base64": "...", "mode": "driving"|"manual" }
     或 Anthropic 格式（直接透传 messages）。
     """
-    if not OPENAI_API_KEY:
-        raise HTTPException(status_code=503, detail="OPENAI_API_KEY not configured")
+    vision_cfg = _vision_llm_config()
+    if vision_cfg is None:
+        raise HTTPException(status_code=503, detail="No vision model API key configured")
 
     try:
         body = await req.json()
@@ -14406,9 +20223,10 @@ async def vision_analyze(req: Request):
         raise HTTPException(status_code=400, detail="Need 'base64' or 'messages'")
 
     import httpx
+    vision_url, vision_headers, vision_model = vision_cfg
     payload = {
-        "model": "gpt-4o",
-        "max_tokens": 200,
+        "model": vision_model,
+        "max_tokens": 260,
         "stream": False,
         "messages": messages,
     }
@@ -14416,12 +20234,9 @@ async def vision_analyze(req: Request):
     try:
         async with httpx.AsyncClient(timeout=15.0) as client:
             r = await client.post(
-                "https://api.openai.com/v1/chat/completions",
+                vision_url,
                 json=payload,
-                headers={
-                    "Authorization": f"Bearer {OPENAI_API_KEY}",
-                    "Content-Type": "application/json",
-                },
+                headers=vision_headers,
             )
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"OpenAI request failed: {e}")
@@ -14451,8 +20266,9 @@ async def vision_stream(req: Request):
     Body: { "base64": "...", "mode": "driving"|"manual" }
     Response: text/event-stream  (OpenAI SSE 格式直通)
     """
-    if not OPENAI_API_KEY:
-        raise HTTPException(status_code=503, detail="OPENAI_API_KEY not configured")
+    vision_cfg = _vision_llm_config()
+    if vision_cfg is None:
+        raise HTTPException(status_code=503, detail="No vision model API key configured")
 
     try:
         body = await req.json()
@@ -14467,9 +20283,10 @@ async def vision_stream(req: Request):
 
     messages = _build_vision_messages(b64, mode)
 
+    vision_url, vision_headers, vision_model = vision_cfg
     payload = {
-        "model": "gpt-4o",
-        "max_tokens": 150,
+        "model": vision_model,
+        "max_tokens": 260,
         "stream": True,
         "messages": messages,
     }
@@ -14481,12 +20298,9 @@ async def vision_stream(req: Request):
             async with httpx.AsyncClient(timeout=20.0) as client:
                 async with client.stream(
                     "POST",
-                    "https://api.openai.com/v1/chat/completions",
+                    vision_url,
                     json=payload,
-                    headers={
-                        "Authorization": f"Bearer {OPENAI_API_KEY}",
-                        "Content-Type": "application/json",
-                    },
+                    headers=vision_headers,
                 ) as resp:
                     if resp.status_code != 200:
                         err = await resp.aread()
@@ -14751,6 +20565,55 @@ if __name__ == "__main__":
         log_level="info",
         access_log=False,
     )
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 

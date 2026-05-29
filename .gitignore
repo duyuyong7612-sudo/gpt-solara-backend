@@ -38,3 +38,21 @@ SSE/
 .venv/
 .venv311/
 .DS_Store
+
+# === 防御性兜底(2026-05-28 上 Render 公网测试新增)===
+# .env 任意后缀都不允许进库(.env.bak / .env.production / .env.backup_xxx 等)
+.env.*
+# 任何 .bak 系列(包括 .bak2 / .bak3 / .bak.before_xxx)
+*.bak
+*.bak[0-9]*
+*.bak.*
+# SQLite *.db 文件 —— 真实用户聊天/记忆/会话数据,不准上仓
+*.db
+# 运行时日志
+logs/
+*.log
+# 误入的 npm lockfile 等(我们项目不是 Node)
+package-lock.json
+# Adu 进化记忆 / session JSON 已经在 data/ 下,数据目录上面已挡;再加一道防线
+adu_evolution_memory.json
+adu_self_upgrade_sessions.json
