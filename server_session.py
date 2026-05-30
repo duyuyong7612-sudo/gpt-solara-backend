@@ -572,6 +572,22 @@ PLAN_TO_MODEL: Dict[str, str] = {
     "advanced": CHAT_MODEL_CODER,
 }
 
+# ✅ Robot-version display labels. User-facing strings only; never log/return raw model IDs.
+PLAN_DISPLAY_NAME: Dict[str, str] = {
+    "guest":       "机器人 6.0",
+    "basic":       "机器人 6.0",
+    "free":        "机器人 6.0",
+    "pro":         "机器人 6.1",
+    "pro_voice":   "机器人 6.1",
+    "ultra":       "机器人 6.2",
+    "ultra_video": "机器人 6.2",
+    "coder":       "机器人 6.2 Pro",
+    "advanced":    "机器人 6.2 Pro",
+}
+
+def display_robot_version(plan: Optional[str]) -> str:
+    return PLAN_DISPLAY_NAME.get((plan or "").strip().lower(), "机器人 6.0")
+
 # Model -> canonical plan (for inference when client doesn't send plan)
 MODEL_TO_PLAN: Dict[str, str] = {}
 for _p, _m in PLAN_TO_MODEL.items():
