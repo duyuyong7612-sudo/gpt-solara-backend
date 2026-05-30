@@ -554,10 +554,21 @@ def _env_pick(*names: str, default: str = "") -> str:
 #   Pro:        CHAT_MODEL_PRO   / PRO_MODEL       / PRO_TEXT_MODEL
 #   Ultra:      CHAT_MODEL_ULTRA / ULTRA_MODEL     / ULTRA_TEXT_MODEL
 #   Coder:      CHAT_MODEL_CODER / CODER_MODEL     / CODER_TEXT_MODEL / ADVANCED_MODEL
+# ⚠️ 前后端对齐：这四个默认值必须与 iOS PlanOption.modelName 一一对应。
+#   guest -> qwen3.6-plus   pro -> claude-opus-4-7
+#   ultra -> claude-opus-4-8 coder -> gpt-5.5-pro
+# 任何一端改了，另一端也要改；线上可用 env 覆盖到你账号真实可用的模型 ID。
 CHAT_MODEL_GUEST = _env_pick("CHAT_MODEL_GUEST", "CHAT_MODEL_BASIC", "GUEST_MODEL", "BASIC_MODEL", "BASIC_TEXT_MODEL", default="qwen3.6-plus")
-CHAT_MODEL_PRO   = _env_pick("CHAT_MODEL_PRO", "PRO_MODEL", "PRO_TEXT_MODEL", default="qwen3.6-plus")
-CHAT_MODEL_ULTRA = _env_pick("CHAT_MODEL_ULTRA", "ULTRA_MODEL", "ULTRA_TEXT_MODEL", default="qwen3.6-plus")
-CHAT_MODEL_CODER = _env_pick("CHAT_MODEL_CODER", "CODER_MODEL", "CODER_TEXT_MODEL", "ADVANCED_MODEL", default="qwen3.6-plus")
+CHAT_MODEL_PRO   = _env_pick("CHAT_MODEL_PRO", "PRO_MODEL", "PRO_TEXT_MODEL", default="claude-opus-4-7")
+CHAT_MODEL_ULTRA = _env_pick("CHAT_MODEL_ULTRA", "ULTRA_MODEL", "ULTRA_TEXT_MODEL", default="claude-opus-4-8")
+CHAT_MODEL_CODER = _env_pick("CHAT_MODEL_CODER", "CODER_MODEL", "CODER_TEXT_MODEL", "ADVANCED_MODEL", default="gpt-5.5-pro")
+
+# 深度思考（reasoning）模型：iOS 端 thinkingMode == .deep 时使用。与前端 selectedTextModel 的 deep 分支对齐。
+CHAT_MODEL_THINKING = _env_pick("CHAT_MODEL_THINKING", "THINKING_MODEL", "REASONING_MODEL", default="gpt-5.4-pro")
+
+# ✅ 兜底模型：当所选模型在上游不可用（模型不存在/无权限/区域/欠费）时，自动降级到这个模型，
+#   保证用户始终拿到回答，而不是 "网络问题，稍后再试。"。默认走最稳的 OpenAI 通用模型。
+CHAT_MODEL_FALLBACK = _env_pick("CHAT_MODEL_FALLBACK", "FALLBACK_MODEL", default=(CHAT_MODEL_DEFAULT or "gpt-4o-mini"))
 
 # Backward-compatible plan aliases (app/UI may send any of these).
 PLAN_TO_MODEL: Dict[str, str] = {
@@ -589,6 +600,8 @@ def display_robot_version(plan: Optional[str]) -> str:
     return PLAN_DISPLAY_NAME.get((plan or "").strip().lower(), "机器人 6.0")
 
 # Model -> canonical plan (for inference when client doesn't send plan)
+# ✅ 前后端对齐：把四个套餐的真实模型 ID 都登记进来，后端才能
+#    (a) 校验 client 传来的 model 是否“已知”，(b) 准确回报档位（机器人 6.x）。
 MODEL_TO_PLAN: Dict[str, str] = {}
 for _p, _m in PLAN_TO_MODEL.items():
     if _p not in ("guest", "pro", "ultra", "coder"):
@@ -596,6 +609,12 @@ for _p, _m in PLAN_TO_MODEL.items():
     if _m and _m not in MODEL_TO_PLAN:
         MODEL_TO_PLAN[_m] = _p
 
+# 深度思考模型按 ultra 档位上报（仅用于 tier 推断，不影响计费/路由）。
+if CHAT_MODEL_THINKING and CHAT_MODEL_THINKING not in MODEL_TO_PLAN:
+    MODEL_TO_PLAN[CHAT_MODEL_THINKING] = "ultra"
+
+# 已知/允许的对话模型集合：client model 只有命中这里才会被信任覆盖，
+# 否则回退到服务端 plan 映射，避免把臆造的 model ID 直接转发到错误的供应商。
 ALLOWED_CHAT_MODELS = set(MODEL_TO_PLAN.keys())
 
 
@@ -638,18 +657,25 @@ def _infer_plan_from_model(model: str) -> str:
     return MODEL_TO_PLAN.get(m, "")
 
 
-def _select_model_for_request(plan_raw: str, client_model: str) -> Tuple[str, str, str]:
+def _select_model_for_request(plan_raw: str, client_model: str, thinking: bool = False) -> Tuple[str, str, str]:
     """Return (model, canonical_plan, reason).
 
-    Four-plan unlocked mode:
-    - The app may send both `plan` and `model`.
-    - When CHAT_ALLOW_CLIENT_MODEL=1 (default in this build), the explicit client model wins.
-    - If no explicit model is supplied, fall back to the server-side plan mapping.
+    前后端对齐后的优先级：
+    1) thinking（深度思考）由服务端权威决定 -> CHAT_MODEL_THINKING。
+    2) client_model 命中 ALLOWED_CHAT_MODELS 才信任覆盖（已知模型）。
+    3) 否则用服务端 plan -> model 映射（server-side truth）。
+    4) 兜底 guest 模型。
+
+    这样即使 App 传来过期/臆造的 model ID，也不会被盲目转发到错误供应商，
+    而是落回 plan 映射；真正不可用时再由 worker 层做 CHAT_MODEL_FALLBACK 降级。
     """
     plan = _normalize_plan(plan_raw) or "guest"
     cm = (client_model or "").strip()
 
-    if CHAT_ALLOW_CLIENT_MODEL and cm:
+    if thinking and CHAT_MODEL_THINKING:
+        return CHAT_MODEL_THINKING, plan, "thinking_mode"
+
+    if CHAT_ALLOW_CLIENT_MODEL and cm and cm in ALLOWED_CHAT_MODELS:
         return cm, (_infer_plan_from_model(cm) or plan or "guest"), "client_model_override"
 
     if plan in PLAN_TO_MODEL:
@@ -5676,6 +5702,11 @@ def _route_provider(*, allow_web: bool, attachments: List[Dict[str, Any]], model
 
 def _select_routed_model(provider: str, requested_model: str = "") -> str:
     req = (requested_model or "").strip()
+    if provider == "anthropic":
+        # Keep the explicit claude-* id; fall back to a sane Claude default if missing.
+        if _is_claude_model(req):
+            return req
+        return (CHAT_MODEL_ULTRA if _is_claude_model(CHAT_MODEL_ULTRA) else (CHAT_MODEL_PRO if _is_claude_model(CHAT_MODEL_PRO) else req)) or req
     if provider == "dashscope":
         if _is_qwen_model(req):
             return req
@@ -8719,6 +8750,20 @@ def _dashscope_complete_full_text(
     return full, status, response_id, incomplete_details, continuations
 
 
+def _guard_stream(it: Iterator[Dict[str, Any]]) -> Iterator[Dict[str, Any]]:
+    """Wrap a provider stream so an upstream failure (bad model / missing key /
+    region / billing) surfaces as a sentinel event instead of propagating.
+
+    The worker turns this sentinel into a one-time CHAT_MODEL_FALLBACK retry so the
+    user always gets an answer rather than the generic "网络问题，稍后再试。"。
+    """
+    try:
+        for ev in it:
+            yield ev
+    except Exception as e:
+        yield {"type": "solara._stream_error", "message": str(e)}
+
+
 def _spawn_chat_worker(
     job: ChatJob,
     model: str,
@@ -8898,9 +8943,11 @@ def _spawn_chat_worker(
                     log.warning("[web-search] serper failed: %s", e)
 
             current_messages = base_messages
+            used_fallback = False  # CHAT_MODEL_FALLBACK 只用一次
 
             while True:
                 need_continue = False
+                need_fallback_retry = False
                 marker_seen = False
                 last_rid: Optional[str] = None
                 incomplete_reason: Optional[str] = None
@@ -8981,8 +9028,37 @@ def _spawn_chat_worker(
                         enable_computer_use=_plan_allows_computer_use(plan, model),
                     )
 
+                # ✅ 兜底：把上游异常转成哨兵事件，便于一次性降级到 CHAT_MODEL_FALLBACK
+                stream_iter = _guard_stream(stream_iter)
+
                 for ev in stream_iter:
                     typ = ev.get("type") if isinstance(ev, dict) else None
+
+                    # 上游失败哨兵：首字未产出且未降级过 -> 切到兜底模型重试一次
+                    if typ == "solara._stream_error":
+                        _err_msg = str(ev.get("message") or "stream_error")
+                        _already_fallback = (provider_norm == "openai" and (model or "") == (CHAT_MODEL_FALLBACK or ""))
+                        if (not full_parts) and (not used_fallback) and (not _already_fallback) and CHAT_MODEL_FALLBACK:
+                            used_fallback = True
+                            need_fallback_retry = True
+                            log.warning(
+                                "[chat-worker] primary stream failed (provider=%s model=%s): %s -> fallback openai/%s",
+                                provider_norm, model, _err_msg, CHAT_MODEL_FALLBACK,
+                            )
+                            provider_norm = "openai"
+                            model = CHAT_MODEL_FALLBACK
+                            prev_rid = None
+                            current_messages = base_messages
+                            current_attachments = attachments
+                            job.push_event({
+                                "type": "solara.meta",
+                                "model": model,
+                                "provider": provider_norm,
+                                "route_reason": "fallback_after_error",
+                            })
+                            break
+                        # 已经降级过或已有输出 -> 当作真实错误抛出
+                        raise RuntimeError(_err_msg)
 
                     # DeepSeek internal done marker
                     if typ == "solara._provider_done":
@@ -9020,6 +9096,27 @@ def _spawn_chat_worker(
                             msg = str(err_obj.get("message") or "")
                         if not msg:
                             msg = str(ev.get("message") or "unknown_error")
+                        # ✅ 上游内联 error：首字未产出且未降级过 -> 走一次性兜底降级
+                        _already_fallback = (provider_norm == "openai" and (model or "") == (CHAT_MODEL_FALLBACK or ""))
+                        if (not full_parts) and (not used_fallback) and (not _already_fallback) and CHAT_MODEL_FALLBACK:
+                            used_fallback = True
+                            need_fallback_retry = True
+                            log.warning(
+                                "[chat-worker] inline error (provider=%s model=%s): %s -> fallback openai/%s",
+                                provider_norm, model, msg, CHAT_MODEL_FALLBACK,
+                            )
+                            provider_norm = "openai"
+                            model = CHAT_MODEL_FALLBACK
+                            prev_rid = None
+                            current_messages = base_messages
+                            current_attachments = attachments
+                            job.push_event({
+                                "type": "solara.meta",
+                                "model": model,
+                                "provider": provider_norm,
+                                "route_reason": "fallback_after_error",
+                            })
+                            break
                         raise RuntimeError(msg)
 
                     if typ == "response.output_text.delta":
@@ -9058,6 +9155,10 @@ def _spawn_chat_worker(
 
                     if isinstance(ev, dict) and typ:
                         job.push_event(ev)
+
+                # ✅ 触发了兜底降级 -> 用 CHAT_MODEL_FALLBACK 重跑一轮（不进入续写逻辑）
+                if need_fallback_retry:
+                    continue
 
                 # Decide whether to continue:
                 if marker_seen:
@@ -13253,7 +13354,9 @@ async def chat_prepare(request: Request):
     # Plan-based model routing (server-authoritative, billing-capped)
     plan_raw = _billing_effective_plan_for_request(user_key, _extract_plan(request, body))
     client_model = (str(body.get("model") or "").strip() or str(request.headers.get("x-model") or "").strip())
-    requested_model, plan, _model_reason = _select_model_for_request(plan_raw, client_model)
+    # 深度思考开关：App 端 thinkingMode == .deep 时为 true（接受 thinking / deep / reasoning 任一别名）
+    _thinking_flag = _boolish(body.get("thinking") or body.get("deep") or body.get("reasoning"))
+    requested_model, plan, _model_reason = _select_model_for_request(plan_raw, client_model, thinking=_thinking_flag)
 
     allow_web = _extract_allow_web(request, body)
 
@@ -13545,6 +13648,15 @@ async def chat_prepare(request: Request):
     routed_model = _select_routed_model(provider, requested_model)
     if provider == "openai" and allow_web:
         routed_model = OPENAI_WEB_SEARCH_MODEL
+    # ✅ 前后端对齐：把后端真实生效的 model/plan 回传到 route_decision，
+    #    让 iOS 的 RouteTier.fromDecision 拿到准确档位（机器人 6.x）。
+    try:
+        if isinstance(route_decision, dict):
+            route_decision["model"] = routed_model
+            route_decision["plan"] = plan
+            route_decision["robot_version"] = display_robot_version(plan)
+    except Exception:
+        pass
     log.info(
         "[chat-route] provider=%s model=%s allow_web=%s reason=%s decision=%s web_provider=%s",
         provider, routed_model, bool(allow_web), route_reason, route_decision, CHAT_WEB_PROVIDER,
@@ -20587,6 +20699,7 @@ if __name__ == "__main__":
         log_level="info",
         access_log=False,
     )
+
 
 
 
