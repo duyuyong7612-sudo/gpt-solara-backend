@@ -5634,6 +5634,12 @@ def _route_provider(*, allow_web: bool, attachments: List[Dict[str, Any]], model
     if _attachments_require_openai(attachments, model=model):
         return "openai", "attachments_force_openai"
 
+    # ✅ Claude models always route to Anthropic.
+    # Native vision + native web_search tool — never detour through OpenAI, so the
+    # log/route reason stays accurate and any Anthropic errors surface cleanly.
+    if _is_claude_model(model):
+        return "anthropic", "explicit_claude_model"
+
     # ✅ Restored behavior: `allow_web` arriving here is no longer the raw client flag.
     # It is the smart-router decision result. Only an intent-approved web turn uses
     # OpenAI built-in web_search; normal chat like “你是谁” stays on Qwen/DashScope.
