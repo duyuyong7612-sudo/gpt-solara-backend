@@ -40,6 +40,7 @@ import threading
 import subprocess
 import queue
 import zipfile
+import shutil
 import sqlite3
 import math
 from array import array
@@ -119,7 +120,7 @@ try:
 except Exception:  # pragma: no cover
     BrainStateEngine = None  # type: ignore
 from fastapi import FastAPI, UploadFile, File, Form, Request, Header, HTTPException, WebSocket, WebSocketDisconnect
-from fastapi.responses import JSONResponse, StreamingResponse, Response, FileResponse
+from fastapi.responses import JSONResponse, StreamingResponse, Response, FileResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles  # ✅ Studio 网页版
 from fastapi.middleware.cors import CORSMiddleware
 from dotenv import load_dotenv
@@ -12581,6 +12582,14 @@ try:
 except Exception as _codex_err:
     log.warning("[AduCodex] Codex executor router not loaded: %s", _codex_err)
 
+# ✅ Automation engine (default: Claude Code; fallback via AUTOMATION_ENGINE=codex)
+try:
+    from adu_orchestrator.claude_executor import router as adu_automation_router
+    app.include_router(adu_automation_router)
+    log.info("[AduAutomation] ✅ automation router loaded at /api/adu/automation/*")
+except Exception as _autom_err:
+    log.warning("[AduAutomation] automation router not loaded: %s", _autom_err)
+
 # ✅ Adu Planner —— 语义路由,不执行(POST /api/adu/planner/route)
 #    把 App 端文本分类到 computer_action / codex_task / chat / 等。
 #    router 自带 prefix=/api/adu/planner;只暴露 /route。
@@ -17892,6 +17901,45 @@ async def file_download(file_id: str, filename: str):
     )
 
 
+# ════════════════════════════════════════════════════════════════════
+# v2 社交/视频 请求体模型（注册/登录/评论/分享/推荐/私信）
+# ⚠️ 这批模型曾在一次提交中被误删，导致对应 v2 路由在请求时
+#    NameError -> 500（model_rebuild 被 try/except 吞掉，故进程能起、
+#    /health 与语音正常，仅这些 v2 接口挂）。此处按各 handler 实际
+#    字段用法还原；全部 Optional 以匹配代码中的 `req.x or ""` 防御写法。
+# ════════════════════════════════════════════════════════════════════
+from pydantic import BaseModel as _V2_BaseModel  # 局部导入，避免与 auth.py 的 BaseModel 冲突
+
+
+class V2RegisterReq(_V2_BaseModel):
+    username: Optional[str] = None
+    password: Optional[str] = None
+    display_name: Optional[str] = None
+
+
+class V2LoginReq(_V2_BaseModel):
+    username: Optional[str] = None
+    password: Optional[str] = None
+
+
+class V2CommentReq(_V2_BaseModel):
+    text: Optional[str] = None
+
+
+class V2ShareReq(_V2_BaseModel):
+    channel: Optional[str] = None
+
+
+class V2RecoEventReq(_V2_BaseModel):
+    event_type: Optional[str] = None
+    video_id: Optional[str] = None
+    meta: Optional[Dict[str, Any]] = None
+
+
+class V2DMMessageReq(_V2_BaseModel):
+    text: Optional[str] = None
+
+
 @app.post("/v2/auth/register")
 async def v2_auth_register(req: V2RegisterReq):
     username = (req.username or "").strip().lower()
@@ -20699,6 +20747,7 @@ if __name__ == "__main__":
         log_level="info",
         access_log=False,
     )
+
 
 
 
