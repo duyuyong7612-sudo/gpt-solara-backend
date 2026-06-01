@@ -8796,6 +8796,12 @@ def _spawn_chat_worker(
     """
 
     def run():
+        # `model` is the routed model passed into _spawn_chat_worker. The fallback
+        # paths below reassign it (model = CHAT_MODEL_FALLBACK), which would otherwise
+        # make `model` a run()-local for the whole body and raise UnboundLocalError on
+        # the first read (the [chat-worker] log). Bind to the enclosing parameter so the
+        # log and all dispatch use the real, already-assigned model variable.
+        nonlocal model
         tts_enabled = bool(getattr(job, "tts_stream_enabled", False)) and bool(getattr(job, "tts_id", ""))
         live = _get_live_tts(job.tts_id) if tts_enabled else None
         if tts_enabled and not live:
@@ -9325,7 +9331,25 @@ def _spawn_chat_worker(
         finally:
             job.close_events()
 
-    threading.Thread(target=run, daemon=True).start()
+    def _run_guarded():
+        # Safety net: the setup region before run()'s inner try (e.g. the
+        # [chat-worker] log) is unprotected. If anything there raises, surface a
+        # real error event on the SSE queue and close it so the client doesn't
+        # wait out the 30s no-token timeout.
+        try:
+            run()
+        except Exception as e:
+            try:
+                job.error = str(e)
+                job.push_event({"type": "error", "error": {"message": str(e)}})
+            except Exception:
+                pass
+            try:
+                job.close_events()
+            except Exception:
+                pass
+
+    threading.Thread(target=_run_guarded, daemon=True).start()
 
 
 def _sse_data(data_obj: Any) -> str:
