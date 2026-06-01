@@ -15489,7 +15489,66 @@ async def solara_photo(req: Request, session_id: str = Form(""), image_file: Upl
 # ================================
 # Realtime session + voice intent -> Sora job
 # ================================
+# ✅ GA endpoint to mint a Realtime ephemeral client secret.
+#    The beta POST /v1/realtime/sessions has been removed for current accounts
+#    (returns 404 "Invalid URL"); the GA endpoint nests config under {"session": {...}}.
+REALTIME_CLIENT_SECRETS_URL = "https://api.openai.com/v1/realtime/client_secrets"
+# Legacy beta endpoint kept ONLY as a compatibility fallback for older accounts.
 REALTIME_SESS_URL = "https://api.openai.com/v1/realtime/sessions"
+
+
+def _extract_ephemeral_key(data: Dict[str, Any]) -> Optional[str]:
+    """GA: {"value": "ek_..."}; legacy: {"client_secret": {"value": ...}}."""
+    if not isinstance(data, dict):
+        return None
+    v = data.get("value")
+    if isinstance(v, str) and v:
+        return v
+    cs = data.get("client_secret")
+    if isinstance(cs, dict):
+        inner = cs.get("value")
+        if isinstance(inner, str) and inner:
+            return inner
+    return data.get("ephemeral_key") or data.get("token")
+
+
+def _post_realtime_client_secret(
+    openai_url: str,
+    body: Dict[str, Any],
+    headers: Dict[str, str],
+) -> Tuple[Optional[str], Optional[str]]:
+    """
+    POST a Realtime session-create request and return (ephemeral_key, error).
+
+    Logs openai_url / status / error body on failure. NEVER logs the API key or the
+    returned client_secret value.
+    """
+    try:
+        r = requests.post(openai_url, headers=headers, json=body, timeout=20)
+    except Exception as e:
+        log.warning("[realtime.ephemeral] request failed openai_url=%s err_type=%s", openai_url, type(e).__name__)
+        return None, f"request_error:{type(e).__name__}"
+
+    if r.status_code >= 400:
+        # r.text is the OpenAI error JSON (no secret); safe to log a short snippet.
+        log.warning("[realtime.ephemeral] openai_url=%s status=%s err_body=%s",
+                    openai_url, r.status_code, _short(r.text, 300))
+        return None, f"http_{r.status_code}"
+
+    try:
+        data = r.json()
+    except Exception:
+        log.warning("[realtime.ephemeral] openai_url=%s status=%s bad_json", openai_url, r.status_code)
+        return None, "bad_json"
+
+    key = _extract_ephemeral_key(data)
+    if not key:
+        # Do not dump the body (could contain the secret) — only the key names.
+        log.warning("[realtime.ephemeral] openai_url=%s status=%s missing_key keys=%s",
+                    openai_url, r.status_code, list(data.keys())[:8])
+        return None, "missing_key"
+    return key, None
+
 
 def _realtime_ephemeral(
     model: str,
@@ -15501,37 +15560,65 @@ def _realtime_ephemeral(
     session_extra: Optional[Dict[str, Any]] = None,
 ):
     """
-    Create a Realtime session and return an ephemeral key.
+    Create a Realtime session and return an ephemeral key (key, error).
 
-    Backward compatible with legacy clients (keeps model/voice/instructions behavior),
-    but also allows attaching Realtime function tools (e.g. web_search / remember).
+    GA: POST /v1/realtime/client_secrets with {"session": {type:"realtime", model, audio...}}.
+    Falls back to the removed-for-most-accounts beta POST /v1/realtime/sessions only if GA
+    is unavailable (req: 兼容 older accounts). Attaches Realtime function tools when given.
     """
-    body: Dict[str, Any] = {"model": model, "voice": voice}
-    if instructions:
-        body["instructions"] = instructions
-    if tools:
-        body["tools"] = tools
-        body["tool_choice"] = tool_choice or "auto"
-    if session_extra and isinstance(session_extra, dict):
-        # Allow advanced callers to pass additional session config
-        for k, v in session_extra.items():
-            if k not in ("model", "voice"):
-                body[k] = v
+    m = (model or REALTIME_MODEL_DEFAULT).strip() or REALTIME_MODEL_DEFAULT
+    v = (voice or REALTIME_VOICE_DEFAULT).strip() or REALTIME_VOICE_DEFAULT
 
-    headers = {
+    # ---- GA: /v1/realtime/client_secrets (config nested under "session") ----
+    session_cfg: Dict[str, Any] = {
+        "type": "realtime",
+        "model": m,
+        "audio": {"output": {"voice": v}},
+    }
+    if instructions:
+        session_cfg["instructions"] = instructions
+    if tools:
+        session_cfg["tools"] = tools
+        session_cfg["tool_choice"] = tool_choice or "auto"
+    if session_extra and isinstance(session_extra, dict):
+        for k, val in session_extra.items():
+            if k not in ("type", "model"):
+                session_cfg[k] = val
+
+    ga_headers = {
+        "Authorization": f"Bearer {OPENAI_API_KEY}",
+        "Content-Type": "application/json",
+    }
+    key, ga_err = _post_realtime_client_secret(
+        REALTIME_CLIENT_SECRETS_URL, {"session": session_cfg}, ga_headers
+    )
+    if key:
+        return key, None
+
+    # ---- Legacy beta fallback: /v1/realtime/sessions (flat body) ----
+    legacy_body: Dict[str, Any] = {"model": m, "voice": v}
+    if instructions:
+        legacy_body["instructions"] = instructions
+    if tools:
+        legacy_body["tools"] = tools
+        legacy_body["tool_choice"] = tool_choice or "auto"
+    if session_extra and isinstance(session_extra, dict):
+        for k, val in session_extra.items():
+            if k not in ("model", "voice"):
+                legacy_body[k] = val
+
+    legacy_headers = {
         "Authorization": f"Bearer {OPENAI_API_KEY}",
         "Content-Type": "application/json",
         "OpenAI-Beta": "realtime=v1",
     }
-    r = requests.post(REALTIME_SESS_URL, headers=headers, json=body, timeout=20)
-    if r.status_code >= 400:
-        return None, f"OpenAI error {r.status_code}: {r.text}"
+    key2, legacy_err = _post_realtime_client_secret(
+        REALTIME_SESS_URL, legacy_body, legacy_headers
+    )
+    if key2:
+        return key2, None
 
-    data = r.json()
-    key = ((data.get("client_secret") or {}).get("value") or data.get("ephemeral_key") or data.get("token"))
-    if not key:
-        return None, "missing ephemeral key"
-    return key, None
+    return None, f"client_secrets={ga_err}; legacy_sessions={legacy_err}"
 
 
 # ---- Qwen Omni Realtime session bootstrap ----
@@ -17193,9 +17280,15 @@ async def session_post(req: Request):
             key, err = key2, None
 
     if err:
-        # ✅ 自动兜底：OpenAI 不可用且本次还没试过 Qwen（不是从 Qwen 降级来的），
-        #    只要 DASHSCOPE_API_KEY 有凭证就反向降级到 Qwen Omni，保证链路能通。
-        if (not qwen_already_tried) and DASHSCOPE_API_KEY:
+        # ✅ 显式 provider=openai（Ultra/Coder）失败时，必须暴露真实错误，
+        #    不得用 Qwen 兜底掩盖（否则 Ultra/Coder 会拿到 Qwen session）。
+        explicit_openai = (
+            str(b.get("provider") or b.get("realtime_provider") or "").strip().lower()
+            in ("openai", "gpt")
+        )
+        # ✅ 自动兜底：仅当 *非* 显式 openai 请求、且本次还没试过 Qwen（不是从 Qwen 降级来的）、
+        #    且 DASHSCOPE_API_KEY 有凭证时，才反向降级到 Qwen Omni 保证链路能通。
+        if (not explicit_openai) and (not qwen_already_tried) and DASHSCOPE_API_KEY:
             log.warning("[/session:JSON] OpenAI Realtime failed (%s), falling back to Qwen Omni", err)
             qwen_already_tried = True
             q_model = _normalize_qwen_realtime_model(str(b.get("model") or QWEN_REALTIME_MODEL))
@@ -17209,7 +17302,8 @@ async def session_post(req: Request):
             if (not qerr2) and qinfo2:
                 return _build_qwen_session_response(qinfo2)
             log.warning("[/session:JSON] Qwen reverse-fallback also failed: %s", qerr2)
-        log.warning("[/session:JSON] OpenAI Realtime failed: %s", err)
+        log.warning("[/session:JSON] OpenAI Realtime failed (explicit_openai=%s, no Qwen mask): %s",
+                    explicit_openai, err)
         return _friendly_session_json_error()
 
     # NOTE: legacy client-side WebSocket/WebRTC connections to OpenAI won't automatically store new memories.
