@@ -17047,6 +17047,66 @@ async def session_post(req: Request):
 
     tools = _realtime_tools(enable_web=allow_web, enable_memory=enable_memory, enable_agent=True)
 
+    # ✅ 实时音视频链路自动兜底：把 Qwen 成功响应抽成可复用构造器，
+    #    这样 Qwen 主路径、以及 OpenAI 失败后的反向降级都能返回同一份响应。
+    #    qwen_already_tried 防止 Qwen→OpenAI→Qwen 兜底成环。
+    qwen_already_tried = False
+
+    def _build_qwen_session_response(qinfo: Dict[str, Any]) -> Dict[str, Any]:
+        # ✅ FIX: Qwen /session must create or reuse the realtime conversation_id exactly once.
+        # Previously the response dict contained two duplicate "conversation_id" keys,
+        # each calling conv_create(...) when the client did not pass an id. That could create
+        # two DB conversations while only returning the second one to iOS.
+        session_conv_id = rt_conversation_id or conv_create(user_key, "实时语音")
+        return {
+            "ok": True,
+            "provider": "qwen",
+            "session_id": uuid.uuid4().hex,
+            "conversation_id": session_conv_id,
+            "ws_url": qinfo["ws_url"],
+            "api_key": qinfo["api_key"],           # iOS 放 Authorization: Bearer
+            "rtc_url": qinfo["ws_url"],             # 兼容旧字段
+            "ephemeral_key": qinfo["api_key"],      # 兼容旧字段（Qwen 直接用 API Key）
+            "modalities": ["text", "audio"],
+            "model": qinfo["model"],
+            "voice": qinfo["voice"],
+            "input_audio_format": "pcm",
+            "output_audio_format": "pcm",
+            "input_sample_rate": 16000,
+            "output_sample_rate": 24000,
+            "pcm24_to_pcm16_required": False,
+            "max_session_minutes": 120,
+            "turn_detection": qinfo.get("turn_detection") or {},
+            # 阿里官方文档明确："The model for transcribing input audio.
+            # Only gummy-realtime-v1 is supported."  qwen3-asr-flash-realtime 是
+            # 独立的实时 ASR 模型，不能放在 omni-realtime 的 transcription 字段下。
+            "input_audio_transcription": {"model": "gummy-realtime-v1"},
+            "profile": resolved_profile,
+            "home_bound": bool(resolved_profile == "home"),
+            "memory_enabled": bool(enable_memory),
+            "web_enabled": bool(allow_web),
+            "tools_enabled": bool(bool(tools) and QWEN_REALTIME_ENABLE_TOOLS),
+            "memory_commit_url": "/realtime/memory/commit",
+            "turn_commit_url": "/realtime/turn/commit",
+            "web_search_url": "/web_search?q={query}&k=6",
+            "user_key_hint": user_key,
+            "auto_memory": False,
+            "memory_commit_required": bool(enable_memory),
+            "instructions": instructions,  # ✅ 统一注入：人格+记忆+感知
+            "semantic_interrupt_token": SEMANTIC_INTERRUPT_TOKEN,
+            # ✅ Qwen 协议差异提示
+            "protocol_notes": {
+                "auth_header": "Authorization: Bearer <api_key>",
+                "no_openai_beta_header": True,
+                "turn_detection": qinfo.get("turn_detection") or {},
+                "vad_type": "server_vad (only supported value)",
+                "input_audio": "pcm only (PCM16 16kHz mono payload)",
+                "output_audio": "pcm (PCM16 24kHz mono)",
+                "session_duration": "120 min (vs OpenAI 15 min)",
+                "voices_available": 49,
+            },
+        }
+
     # ────────────────────────────────────────────
     # ✅ Pipeline 分支（STT → DeepSeek LLM → TTS）
     # ────────────────────────────────────────────
@@ -17108,68 +17168,18 @@ async def session_post(req: Request):
             tool_choice=("auto" if (tools and QWEN_REALTIME_ENABLE_TOOLS) else None),
         )
         if qerr:
-            # auto 模式下 fallback 到 OpenAI
-            if REALTIME_PROVIDER == "auto":
-                log.warning("[/session:JSON] Qwen failed (%s), falling back to OpenAI", qerr)
+            qwen_already_tried = True
+            # ✅ 自动兜底：只要 OpenAI Realtime 有可用凭证就降级过去，不再要求
+            #    REALTIME_PROVIDER=auto，避免实时音视频链路"只有阿里能通"。
+            if OPENAI_API_KEY:
+                log.warning("[/session:JSON] Qwen failed (%s), falling back to OpenAI Realtime", qerr)
                 provider = "openai"
                 # fall through to OpenAI block below
             else:
-                log.warning("[/session:JSON] Qwen failed: %s", qerr)
+                log.warning("[/session:JSON] Qwen failed and no OpenAI fallback available: %s", qerr)
                 return _friendly_session_json_error()
         else:
-            # ✅ FIX: Qwen /session must create or reuse the realtime conversation_id exactly once.
-            # Previously the response dict contained two duplicate "conversation_id" keys,
-            # each calling conv_create(...) when the client did not pass an id. That could create
-            # two DB conversations while only returning the second one to iOS.
-            session_conv_id = rt_conversation_id or conv_create(user_key, "实时语音")
-            return {
-                "ok": True,
-                "provider": "qwen",
-                "session_id": uuid.uuid4().hex,
-                "conversation_id": session_conv_id,
-                "ws_url": qinfo["ws_url"],
-                "api_key": qinfo["api_key"],           # iOS 放 Authorization: Bearer
-                "rtc_url": qinfo["ws_url"],             # 兼容旧字段
-                "ephemeral_key": qinfo["api_key"],      # 兼容旧字段（Qwen 直接用 API Key）
-                "modalities": ["text", "audio"],
-                "model": qinfo["model"],
-                "voice": qinfo["voice"],
-                "input_audio_format": "pcm",
-                "output_audio_format": "pcm",
-                "input_sample_rate": 16000,
-                "output_sample_rate": 24000,
-                "pcm24_to_pcm16_required": False,
-                "max_session_minutes": 120,
-                "turn_detection": qinfo.get("turn_detection") or {},
-                # 阿里官方文档明确："The model for transcribing input audio.
-                # Only gummy-realtime-v1 is supported."  qwen3-asr-flash-realtime 是
-                # 独立的实时 ASR 模型，不能放在 omni-realtime 的 transcription 字段下。
-                "input_audio_transcription": {"model": "gummy-realtime-v1"},
-                "profile": resolved_profile,
-                "home_bound": bool(resolved_profile == "home"),
-                "memory_enabled": bool(enable_memory),
-                "web_enabled": bool(allow_web),
-                "tools_enabled": bool(bool(tools) and QWEN_REALTIME_ENABLE_TOOLS),
-                "memory_commit_url": "/realtime/memory/commit",
-                "turn_commit_url": "/realtime/turn/commit",
-                "web_search_url": "/web_search?q={query}&k=6",
-                "user_key_hint": user_key,
-                "auto_memory": False,
-                "memory_commit_required": bool(enable_memory),
-                "instructions": instructions,  # ✅ 统一注入：人格+记忆+感知
-                "semantic_interrupt_token": SEMANTIC_INTERRUPT_TOKEN,
-                # ✅ Qwen 协议差异提示
-                "protocol_notes": {
-                    "auth_header": "Authorization: Bearer <api_key>",
-                    "no_openai_beta_header": True,
-                    "turn_detection": qinfo.get("turn_detection") or {},
-                    "vad_type": "server_vad (only supported value)",
-                    "input_audio": "pcm only (PCM16 16kHz mono payload)",
-                    "output_audio": "pcm (PCM16 24kHz mono)",
-                    "session_duration": "120 min (vs OpenAI 15 min)",
-                    "voices_available": 49,
-                },
-            }
+            return _build_qwen_session_response(qinfo)
 
     # ────────────────────────────────────────────
     # ✅ OpenAI Realtime 分支（原有逻辑）
@@ -17183,6 +17193,22 @@ async def session_post(req: Request):
             key, err = key2, None
 
     if err:
+        # ✅ 自动兜底：OpenAI 不可用且本次还没试过 Qwen（不是从 Qwen 降级来的），
+        #    只要 DASHSCOPE_API_KEY 有凭证就反向降级到 Qwen Omni，保证链路能通。
+        if (not qwen_already_tried) and DASHSCOPE_API_KEY:
+            log.warning("[/session:JSON] OpenAI Realtime failed (%s), falling back to Qwen Omni", err)
+            qwen_already_tried = True
+            q_model = _normalize_qwen_realtime_model(str(b.get("model") or QWEN_REALTIME_MODEL))
+            q_voice = _normalize_qwen_realtime_voice(str(b.get("voice") or QWEN_REALTIME_VOICE))
+            qinfo2, qerr2 = _qwen_realtime_ephemeral(
+                q_model, q_voice,
+                instructions=instructions,
+                tools=(tools if QWEN_REALTIME_ENABLE_TOOLS else None),
+                tool_choice=("auto" if (tools and QWEN_REALTIME_ENABLE_TOOLS) else None),
+            )
+            if (not qerr2) and qinfo2:
+                return _build_qwen_session_response(qinfo2)
+            log.warning("[/session:JSON] Qwen reverse-fallback also failed: %s", qerr2)
         log.warning("[/session:JSON] OpenAI Realtime failed: %s", err)
         return _friendly_session_json_error()
 
